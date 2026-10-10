@@ -1,0 +1,497 @@
+#!/usr/bin/env python3
+"""Train OmniPhyl Tier-0: per-fragment FCGR -> multi-rank taxonomy.
+
+Reads fragments.fna + labels.tsv emitted by fetch_refseq_corpus.py.
+FCGRs are computed on the fly in the DataLoader workers (no big tensors
+on disk): sequence -> k-mer counts -> quadtree pixel image [1, 2^k, 2^k].
+
+Splits are by *genome accession* so train/val never share a genome.
+Optional --holdout-genus-frac holds out whole genera entirely (the
+leave-clade-out probe: does the model still call their family/order?).
+
+Deps: torch, numpy. Usage:
+  python train_omniphyl.py --fragments ../data/tier0/fragments.fna \
+      --labels ../data/tier0/labels.tsv --out ../runs/tier0_v1 \
+      --epochs 30 --batch-size 256 --holdout-genus-frac 0.1
+"""
+import argparse
+import csv
+import json
+import math
+import random
+import time
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+
+RANKS = ["domain", "phylum", "class", "order", "family", "genus", "species"]
+CODING_TARGETS = ["coding", "non-coding"]  # legacy binary labels; superseded by fractions
+# Continuous annotation heads (see docs/annotation-cascade.md):
+#   coding_frac  mixture-aware fraction target (replaces binary coding)
+#   boundary     candidacy: derived at loss time as 0 < coding_frac < 1
+#   offset       normalized position of nearest interior CDS edge
+CONT_TARGETS = ["coding_frac", "boundary", "offset"]
+BASE2DIGIT = np.full(256, -1, dtype=np.int8)
+for i, b in enumerate(b"ACGT"):
+    BASE2DIGIT[b] = i
+    BASE2DIGIT[b + 32] = i  # lowercase
+
+# Quadtree pixel layout: digit -> (x,y) step. A=(0,0) C=(0,1) G=(1,0) T=(1,1)
+# x = digit>>1, y = digit&1. Last base of the k-mer is the outermost pixel bit.
+
+
+def build_cell_lut(k: int) -> np.ndarray:
+    """kmer base-4 index -> flattened pixel index (row=y, col=x)."""
+    side = 1 << k
+    lut = np.zeros(4 ** k, dtype=np.int32)
+    idx = np.arange(4 ** k, dtype=np.int64)
+    x = np.zeros_like(idx)
+    y = np.zeros_like(idx)
+    # standard CGR addressing: the most recent base (least significant
+    # base-4 digit) owns the outermost pixel bit — p_i = v_i/2 + v_{i-1}/4...
+    for i in range(k):
+        d = (idx >> (2 * i)) & 3  # base i positions back from the k-mer end
+        x |= (d >> 1) << (k - 1 - i)
+        y |= (d & 1) << (k - 1 - i)
+    lut = (y * side + x).astype(np.int32)
+    return lut
+
+
+# vertex coords for CGR points; index by code+1 so N (-1) -> center pull
+VTX = np.array([[0.5, 0.5],  # invalid/N
+                [0.0, 0.0],  # A
+                [0.0, 1.0],  # C
+                [1.0, 0.0],  # G
+                [1.0, 1.0]], dtype=np.float32)  # T
+
+
+def fcgr_encode(seq: str, k: int, lut: np.ndarray,
+                perm: np.ndarray | None = None,
+                pos: bool = False) -> np.ndarray:
+    """sequence -> FCGR tensor [C, side, side] float32.
+
+    Channel 0 = log-normalized k-mer frequency. With pos=True, channels 1-2
+    hold the mean CGR (x, y) coordinate per cell (PhageCGRNet): within-cell
+    offsets summarize the context preceding each k-mer, extending effective
+    context beyond k. Empty cells get their cell-center coordinate.
+
+    perm: optional permutation of the 4 corner vertices (label-preserving
+    augmentation, Dick & Green 2019) applied as a digit remap.
+    """
+    side = 1 << k
+    codes = BASE2DIGIT[np.frombuffer(seq.encode("ascii", "replace"),
+                                     dtype=np.uint8)]
+    if perm is not None:
+        codes = np.where(codes >= 0, perm[np.clip(codes, 0, 3)], -1)
+    out = np.zeros((3 if pos else 1, side, side), dtype=np.float32)
+    if len(codes) < k:
+        return out
+    freq = np.zeros(side * side, dtype=np.float32)
+    win = np.lib.stride_tricks.sliding_window_view(codes, k)
+    valid = (win >= 0).all(axis=1)
+    if not valid.any():
+        return out
+    w = win[valid]
+    # base-4 index, leftmost base most significant
+    kidx = (w * (4 ** np.arange(k - 1, -1, -1))).sum(axis=1)
+    cells = lut[kidx]
+    np.add.at(freq, cells, 1.0)
+    if pos:
+        # CGR point at each position: p_i = (p_{i-1} + v_i)/2 solved as a
+        # weighted sliding sum truncated at J terms (error <= 2^-J), with
+        # the leftover weight going to the (0.5,0.5) initial point.
+        J = 25
+        weights = 0.5 ** np.arange(1, J + 1)
+        n = len(codes)
+        resid = 0.5 * (0.5 ** (np.arange(n) + 1))
+        px = np.convolve(VTX[codes + 1, 0], weights)[:n] + resid
+        py = np.convolve(VTX[codes + 1, 1], weights)[:n] + resid
+        ends = np.flatnonzero(valid) + (k - 1)  # position of each k-mer's last base
+        sx = np.zeros(side * side, dtype=np.float32)
+        sy = np.zeros(side * side, dtype=np.float32)
+        np.add.at(sx, cells, px[ends])
+        np.add.at(sy, cells, py[ends])
+        ys, xs = np.divmod(np.arange(side * side), side)
+        mx = np.where(freq > 0, sx / (freq + 1e-9), (xs + 0.5) / side)
+        my = np.where(freq > 0, sy / (freq + 1e-9), (ys + 0.5) / side)
+        out[1] = mx.reshape(side, side)
+        out[2] = my.reshape(side, side)
+    img = np.log1p(freq)
+    img /= img.max() + 1e-9
+    out[0] = img.reshape(side, side)
+    return out
+
+
+class FragmentDataset(Dataset):
+    """Line-offset-indexed FASTA -> (FCGR tensor, per-target label ids)."""
+
+    def __init__(self, fasta: Path, labels: dict[str, dict], k: int,
+                 lut: np.ndarray, augment: bool = False, pos: bool = False,
+                 targets: list[str] | None = None,
+                 cont: dict[str, tuple] | None = None):
+        self.fasta = Path(fasta)
+        self.k = k
+        self.lut = lut
+        self.augment = augment
+        self.pos = pos
+        self.labels = labels  # frag_id -> {target: int}
+        self.cont = cont or {}  # frag_id -> (coding_frac, boundary_offset)
+        self.ids = list(labels.keys())
+        self.targets = targets if targets is not None else RANKS
+        idx_path = fasta.with_suffix(fasta.suffix + ".idx.json")
+        if idx_path.exists():
+            self.offsets = json.loads(idx_path.read_text())
+        else:
+            self.offsets = self._build_index(idx_path)
+
+    def _build_index(self, idx_path: Path):
+        offsets = {}
+        with open(self.fasta, "rb") as f:
+            pos = f.tell()
+            line = f.readline()
+            while line:
+                if line.startswith(b">"):
+                    fid = line[1:].strip().decode()
+                    offsets[fid] = pos
+                pos = f.tell()
+                line = f.readline()
+        idx_path.write_text(json.dumps(offsets))
+        print(f"indexed {len(offsets)} records -> {idx_path}")
+        return offsets
+
+    def _read_seq(self, fid: str) -> str:
+        off = self.offsets[fid]
+        with open(self.fasta, "rb") as f:
+            f.seek(off)
+            f.readline()  # header
+            chunks = []
+            for line in f:
+                if line.startswith(b">"):
+                    break
+                chunks.append(line.strip())
+        return b"".join(chunks).decode("ascii")
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, i):
+        fid = self.ids[i]
+        perm = np.random.permutation(4) if self.augment else None
+        img = fcgr_encode(self._read_seq(fid), self.k, self.lut, perm,
+                          self.pos)
+        lab = np.array([self.labels[fid].get(t, 0) for t in self.targets],
+                       dtype=np.int64)
+        c = self.cont.get(fid, (-1.0, -1.0))  # -1 = unlabeled/missing
+        return (torch.from_numpy(img), torch.from_numpy(lab),
+                torch.tensor(c, dtype=torch.float32))
+
+
+class Block(nn.Module):
+    def __init__(self, cin, cout, stride=1):
+        super().__init__()
+        self.c1 = nn.Conv2d(cin, cout, 3, stride, 1, bias=False)
+        self.b1 = nn.BatchNorm2d(cout)
+        self.c2 = nn.Conv2d(cout, cout, 3, 1, 1, bias=False)
+        self.b2 = nn.BatchNorm2d(cout)
+        self.short = (nn.Conv2d(cin, cout, 1, stride, bias=False)
+                      if stride != 1 or cin != cout else nn.Identity())
+
+    def forward(self, x):
+        s = self.short(x)
+        x = F.relu(self.b1(self.c1(x)))
+        x = self.b2(self.c2(x))
+        return F.relu(x + s)
+
+
+class ResNetEncoder(nn.Module):
+    def __init__(self, cin: int, width: int):
+        super().__init__()
+        self.stem = nn.Sequential(nn.Conv2d(cin, width, 5, 2, 2, bias=False),
+                                  nn.BatchNorm2d(width), nn.ReLU())
+        self.stages = nn.Sequential(
+            Block(width, width), Block(width, width),
+            Block(width, width * 2, 2), Block(width * 2, width * 2),
+            Block(width * 2, width * 4, 2), Block(width * 4, width * 4),
+            Block(width * 4, width * 8, 2), Block(width * 8, width * 8),
+        )
+        self.latent = width * 8
+
+    def forward(self, x):
+        return self.stages(self.stem(x)).mean(dim=(2, 3))
+
+
+class ViTEncoder(nn.Module):
+    """Patch-embed + TransformerEncoder + CLS latent (PCVR-style ViT on FCGR).
+
+    Global self-attention mixes distant quadtree regions directly; useful
+    where discriminative k-mers are sparse and spread across the grid.
+    No conv inductive bias -> relies on data scale, which simulated
+    fragments provide for free.
+    """
+
+    def __init__(self, cin: int, side: int, dim: int = 256, depth: int = 6,
+                 heads: int = 8, patch: int = 8):
+        super().__init__()
+        n = (side // patch) ** 2
+        self.patch = nn.Conv2d(cin, dim, patch, patch)
+        self.cls = nn.Parameter(torch.zeros(1, 1, dim))
+        self.pe = nn.Parameter(torch.randn(1, n + 1, dim) * 0.02)
+        layer = nn.TransformerEncoderLayer(dim, heads, dim * 4, dropout=0.1,
+                                           batch_first=True, norm_first=True)
+        self.enc = nn.TransformerEncoder(layer, depth)
+        self.norm = nn.LayerNorm(dim)
+        self.latent = dim
+
+    def forward(self, x):
+        t = self.patch(x).flatten(2).transpose(1, 2)  # B, N, D
+        t = torch.cat([self.cls.expand(t.size(0), -1, -1), t], 1)
+        return self.norm(self.enc(t + self.pe))[:, 0]
+
+
+class OmniPhyl(nn.Module):
+    def __init__(self, n_classes: dict[str, int], width: int = 64,
+                 cin: int = 1, backbone: str = "resnet", side: int = 128,
+                 targets: list[str] | None = None):
+        super().__init__()
+        self.encoder = (ViTEncoder(cin, side, dim=width * 4)
+                        if backbone == "vit" else ResNetEncoder(cin, width))
+        self.latent = self.encoder.latent
+        keys = targets if targets is not None else list(n_classes.keys())
+        self.heads = nn.ModuleDict(
+            {t: nn.Linear(self.latent, n_classes[t]) for t in keys})
+
+    def forward(self, x):
+        z = self.encoder(x)
+        return z, {r: h(z) for r, h in self.heads.items()}
+
+
+def load_labels(path: Path) -> dict[str, dict]:
+    rows = {}
+    with open(path, newline="") as f:
+        for r in csv.DictReader(f, delimiter="\t"):
+            rows[r["frag_id"]] = r
+    return rows
+
+
+def encode_cont_labels(rows: dict[str, dict]) -> dict[str, tuple]:
+    """frag_id -> (coding_frac, boundary_offset), -1.0 when absent.
+
+    Boundary flag is NOT stored: it is derived at loss time as
+    0 < coding_frac < 1, matching the candidacy semantics in
+    docs/annotation-cascade.md. Missing/non-numeric/out-of-range
+    values become -1.0 and are masked out of the loss.
+    """
+    out = {}
+    for fid, m in rows.items():
+        vals = []
+        for col in ("coding_frac", "boundary_offset"):
+            try:
+                v = float(m.get(col, "") or -1.0)
+            except (TypeError, ValueError):
+                v = -1.0
+            vals.append(v if 0 <= v <= 1 else -1.0)
+        out[fid] = tuple(vals)
+    return out
+
+
+def build_split(meta: dict[str, dict], val_frac: float, genus_holdout: float,
+                seed: int):
+    rng = random.Random(seed)
+    accs = sorted({m["accession"] for m in meta.values()})
+    rng.shuffle(accs)
+    n_val = max(1, int(len(accs) * val_frac))
+    val_accs = set(accs[:n_val])
+
+    holdout_genera = set()
+    if genus_holdout > 0:
+        train_genera = sorted({m["genus"] for m in meta.values()
+                               if m["genus"]
+                               and m["accession"] not in val_accs})
+        holdout_genera = set(rng.sample(
+            train_genera, max(1, int(len(train_genera) * genus_holdout))))
+    return val_accs, holdout_genera
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fragments", required=True, type=Path)
+    ap.add_argument("--labels", required=True, type=Path)
+    ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--k", type=int, default=7)
+    ap.add_argument("--width", type=int, default=64)
+    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--batch-size", type=int, default=256)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--val-frac", type=float, default=0.1,
+                    help="fraction of genomes held out for val")
+    ap.add_argument("--holdout-genus-frac", type=float, default=0.0,
+                    help="fraction of train genera moved to val entirely "
+                         "(leave-clade-out probe)")
+    ap.add_argument("--num-workers", type=int, default=8)
+    ap.add_argument("--vertex-permute-augment", action="store_true",
+                    help="randomly permute CGR corner vertices per fragment "
+                         "(label-preserving augmentation)")
+    ap.add_argument("--pos-channels", action="store_true",
+                    help="add mean-CGR-(x,y) channels per cell "
+                         "(PhageCGRNet positional features)")
+    ap.add_argument("--backbone", choices=["resnet", "vit"],
+                    default="resnet",
+                    help="encoder: CNN (proven FCGR default) or ViT "
+                         "(global attention over quadtree, PCVR-style)")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--cpu", action="store_true")
+    args = ap.parse_args()
+
+    device = "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
+    torch.manual_seed(args.seed)
+    args.out.mkdir(parents=True, exist_ok=True)
+
+    meta = load_labels(args.labels)
+    val_accs, holdout_genera = build_split(
+        meta, args.val_frac, args.holdout_genus_frac, args.seed)
+    print(f"{len(val_accs)} val genomes, "
+          f"{len(holdout_genera)} holdout genera")
+
+    def is_val(m):
+        return (m["accession"] in val_accs
+                or m["genus"] in holdout_genera)
+
+    train_meta = {k: v for k, v in meta.items() if not is_val(v)}
+    val_meta = {k: v for k, v in meta.items() if is_val(v)}
+    print(f"frags: {len(train_meta)} train / {len(val_meta)} val")
+
+    # vocab from TRAIN rows only; val rows outside vocab -> -1 (unknown)
+    vocab = {r: {} for r in RANKS}
+    for m in train_meta.values():
+        for r in RANKS:
+            name = m.get(r, "")
+            if name and name not in vocab[r]:
+                vocab[r][name] = len(vocab[r])
+    cls_targets = RANKS
+    all_targets = cls_targets + CONT_TARGETS
+    n_classes = {r: len(vocab[r]) + 1 for r in cls_targets}  # +1 = unknown
+    n_classes.update({t: 1 for t in CONT_TARGETS})  # scalar heads
+
+    def encode_labels(rows):
+        out = {}
+        for fid, m in rows.items():
+            rec = {r: vocab[r].get(m.get(r, ""), -1)
+                   if m.get(r, "") else -1 for r in cls_targets}
+            # +1 offset unknown->0: shift all ids by 1 so 0 = unknown class
+            out[fid] = {r: (v + 1 if v >= 0 else 0) for r, v in rec.items()}
+        return out
+
+    lut = build_cell_lut(args.k)
+    cont_train = encode_cont_labels(train_meta)
+    cont_val = encode_cont_labels(val_meta)
+
+    train_ds = FragmentDataset(args.fragments, encode_labels(train_meta),
+                               args.k, lut,
+                               augment=args.vertex_permute_augment,
+                               pos=args.pos_channels,
+                               targets=cls_targets, cont=cont_train)
+    val_ds = FragmentDataset(args.fragments, encode_labels(val_meta),
+                             args.k, lut, pos=args.pos_channels,
+                             targets=cls_targets, cont=cont_val)
+    train_ld = DataLoader(train_ds, args.batch_size, shuffle=True,
+                          num_workers=args.num_workers, drop_last=True,
+                          persistent_workers=args.num_workers > 0)
+    val_ld = DataLoader(val_ds, args.batch_size, shuffle=False,
+                        num_workers=args.num_workers)
+
+    model = OmniPhyl(n_classes, args.width,
+                     cin=3 if args.pos_channels else 1,
+                     backbone=args.backbone, side=1 << args.k,
+                     targets=all_targets).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                            weight_decay=1e-4)
+    steps = len(train_ld) * args.epochs
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / steps)))
+    amp = device == "cuda"
+
+    def run(loader, train=True):
+        model.train(train)
+        tot_loss, tot_n = 0.0, 0
+        correct = defaultdict(int)
+        total = defaultdict(int)
+        frac_err = frac_n = bnd_ok = bnd_n = off_n = 0
+        off_err = 0.0
+        for x, y, yc in loader:
+            x, y, yc = x.to(device), y.to(device), yc.to(device)
+            with torch.autocast("cuda", dtype=torch.bfloat16,
+                                enabled=amp):
+                _, logits = model(x)
+                terms = [F.cross_entropy(logits[t], y[:, i],
+                                         ignore_index=0)
+                         for i, t in enumerate(cls_targets)]
+                fm = yc[:, 0] >= 0          # coding_frac label present
+                btgt = ((yc[:, 0] > 0) & (yc[:, 0] < 1)).float()
+                if fm.any():
+                    terms.append(F.binary_cross_entropy_with_logits(
+                        logits["coding_frac"][:, 0][fm], yc[fm, 0]))
+                    terms.append(F.binary_cross_entropy_with_logits(
+                        logits["boundary"][:, 0][fm], btgt[fm]))
+                om = yc[:, 1] >= 0          # boundary_offset label present
+                if om.any():
+                    terms.append(F.mse_loss(torch.sigmoid(
+                        logits["offset"][:, 0][om]), yc[om, 1]))
+                loss = torch.stack(terms).mean()
+            if train:
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+                sched.step()
+            tot_loss += loss.item() * len(x)
+            tot_n += len(x)
+            for i, t in enumerate(cls_targets):
+                m = y[:, i] != 0  # unknown/NA labels excluded from accuracy
+                total[t] += int(m.sum())
+                correct[t] += int((logits[t].argmax(1)[m]
+                                   == y[:, i][m]).sum())
+            if fm.any():
+                p_frac = torch.sigmoid(logits["coding_frac"][:, 0][fm])
+                frac_err += float((p_frac - yc[fm, 0]).abs().sum())
+                frac_n += int(fm.sum())
+                p_bnd = torch.sigmoid(logits["boundary"][:, 0][fm]) > 0.5
+                bnd_ok += int((p_bnd == btgt[fm].bool()).sum())
+                bnd_n += int(fm.sum())
+            if om.any():
+                p_off = torch.sigmoid(logits["offset"][:, 0][om])
+                off_err += float((p_off - yc[om, 1]).abs().sum())
+                off_n += int(om.sum())
+        accs = {t: correct[t] / max(total[t], 1) for t in cls_targets}
+        extras = {
+            "frac_mae": frac_err / max(frac_n, 1),
+            "boundary_acc": bnd_ok / max(bnd_n, 1),
+            "offset_mae": off_err / max(off_n, 1),
+        }
+        return tot_loss / max(tot_n, 1), accs, extras
+
+    best = 0.0
+    for ep in range(1, args.epochs + 1):
+        t0 = time.time()
+        tr_loss, _, _ = run(train_ld, train=True)
+        va_loss, accs, extras = run(val_ld, train=False)
+        msg = "  ".join(f"{t}:{a:.3f}" for t, a in accs.items())
+        xmsg = "  ".join(f"{t}:{v:.3f}" for t, v in extras.items())
+        print(f"ep {ep:03d} train {tr_loss:.4f} val {va_loss:.4f} | "
+              f"{msg} | {xmsg} | {time.time()-t0:.0f}s")
+        mean_acc = float(np.mean(list(accs.values())))
+        if mean_acc > best:
+            best = mean_acc
+            torch.save({"model": model.state_dict(), "vocab": vocab,
+                        "k": args.k, "targets": all_targets,
+                        "args": vars(args)},
+                       args.out / "best.pt")
+    (args.out / "vocab.json").write_text(json.dumps(vocab, indent=1))
+    print(f"done. best mean val acc {best:.3f} -> {args.out}/best.pt")
+
+
+if __name__ == "__main__":
+    main()

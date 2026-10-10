@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+
+# fasta seek-index built on first dataset load
+*.idx.json
+
+# downloaded data + corpus products (regenerable via scripts/)
+*.fna
+*.fna.gz
+*.gbff
+*.gbff.gz
+*.gff
+*.gff.gz
+*.veupathGenes.gtf.gz
+*.chromAlias.txt
+*.veupath_genes.json
+*.veupath_meta.json
+labels.tsv
+labels.meta.json
+
+# model + eval outputs
+*.pt
+*.pth
+eval_report.md
+
+# conventional output dirs
+data/
+runs/
