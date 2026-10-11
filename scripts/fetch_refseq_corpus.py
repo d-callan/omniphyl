@@ -595,7 +595,13 @@ def main():
             label_source = "veupathdb" if veu else "refseq_gff"
             cds = load_gff_cds(row["_gff"])
             n_veu_unmatched = 0
+            # --nt-budget is per ACCESSION; each seqid draws a
+            # length-proportional share so every nucleotide position is
+            # equally likely to be sampled regardless of contig count.
+            seq_lens = {s: len(q) for s, q in iter_fasta_gz(row["_fasta"])}
+            total_len = sum(seq_lens.values())
             for seqid, seq in iter_fasta_gz(row["_fasta"]):
+                seq_budget = round(args.nt_budget * len(seq) / total_len)
                 if veu:
                     iv = veupath_intervals(veu, alias_groups, seqid)
                     if iv is None:
@@ -608,7 +614,7 @@ def main():
                 cands = [(s, e, frag, stats_of(s, e))
                          for s, e, frag in slice_fragments(
                              seq, args.frag_len_min, args.frag_len_max,
-                             args.nt_budget, args.max_amb_frac, rng)]
+                             seq_budget, args.max_amb_frac, rng)]
                 # Boundary stratification: mixed windows (0 < frac < 1)
                 # are rare under uniform sampling but carry the candidacy
                 # signal; subsample each bucket to hit --boundary-frac.

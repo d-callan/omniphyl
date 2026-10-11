@@ -12,7 +12,7 @@
 #   OUTDIR          result tarball dir         (default: $PWD/output)
 #   GROUPS          --groups value             (default: "bacteria viral")
 #   LEVELS          --levels value             (default: "Complete Genome,Chromosome")
-#   NT_BUDGET       nt per seqid               (default: 100000)
+#   NT_BUDGET       nt per accession           (default: 100000)
 #   FRAG_LEN        fragment length            (default: 500)
 #   BOUNDARY_FRAC   mixed-window fraction      (default: 0.3)
 #   ONE_PER_RANK    one assembly per rank val  (default: "" = no cap;
