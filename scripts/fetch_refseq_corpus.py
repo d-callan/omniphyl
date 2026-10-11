@@ -185,11 +185,34 @@ def select_assemblies(rows: list[dict], levels: set[str],
         taxids = {r.get("species_taxid") for r in keep
                   if r.get("species_taxid")}
         tax_map = tax_resolver(taxids, cache) if tax_resolver else {}
+        # A taxid missing the requested rank is either a GAP on an
+        # otherwise-resolved lineage (protists without a phylum) or a
+        # genuinely UNPLACED taxon (new virus with a species name and
+        # almost nothing above it). Gaps train normally (their missing
+        # label is masked) and group by the nearest resolved neighbour
+        # rank for diversity; unplaced taxa (<=2 of the 6 lineage ranks
+        # resolved) pool under _unresolved and are flagged test-only.
+        rk_order = ["species", "genus", "family", "order", "class",
+                    "phylum", "domain"]
+        i_req = rk_order.index(one_per_rank) if one_per_rank in rk_order else -1
+        lin_ranks = [rk for rk in rk_order[1:] if rk != "species"]
+        scan_order = sorted((rk for rk in lin_ranks if rk != one_per_rank),
+                            key=lambda rk: abs(rk_order.index(rk) - i_req))
         groups: dict[str, list] = defaultdict(list)
         for r in keep:
             tid = r.get("species_taxid", "")
-            rank_val = tax_map.get(tid, {}).get(one_per_rank)
-            groups[rank_val or "_unresolved"].append(r)
+            lin = tax_map.get(tid, {})
+            rank_val = lin.get(one_per_rank)
+            if not rank_val:
+                resolved = sum(1 for rk in lin_ranks if lin.get(rk))
+                if resolved <= 2:
+                    groups["_unresolved"].append(r)
+                    continue
+                near = next((lin[rk] for rk in scan_order if lin.get(rk)),
+                            None)
+                groups[f"_gap:{near}" if near else "_unresolved"].append(r)
+                continue
+            groups[rank_val].append(r)
         # prefer better assemblies within each rank value: the pre-group
         # shuffle already randomised order, so a stable sort by level
         # keeps randomness inside a level while preferring completeness
