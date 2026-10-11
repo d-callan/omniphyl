@@ -147,12 +147,15 @@ def select_assemblies(rows: list[dict], levels: set[str],
                       skipped: list[dict],
                       workers: int,
                       tax_resolver=None,
-                      cache: Path | None = None) -> list[dict]:
+                      cache: Path | None = None,
+                      per_rank_n: int = 1) -> list[dict]:
     """Filter to eligible assemblies, HEAD-check for GFF, then sample.
 
     With one_per_rank set (e.g. 'phylum'): resolve each candidate's
     species_taxid through rankedlineage.dmp (downloaded once into cache)
-    and keep one assembly per distinct rank value. Taxa without a value
+    and keep up to per_rank_n assemblies per distinct rank value. N>1
+    keeps rank vocab shared between train and held-out genomes, so
+    generalization is measurable at every rank. Taxa without a value
     for that rank share a single fallback group — sampling one
     representative — so groups like viral (where most taxids lack a
     phylum in NCBI taxonomy) don't explode into thousands of singletons.
@@ -181,20 +184,25 @@ def select_assemblies(rows: list[dict], levels: set[str],
     else:
         candidates = [[r] for r in keep]
 
-    def first_with_gff(grp):
-        for r in grp[:3]:
+    def members_with_gff(grp):
+        # up to per_rank_n GFF-available members, scanning a couple of
+        # alternates so dead FTP dirs don't starve the rank value
+        got = []
+        for r in grp[:per_rank_n + 2]:
             if has_gff(r):
-                return r
-        return None
+                got.append(r)
+                if len(got) == per_rank_n:
+                    break
+        return got
 
     # GFF HEAD checks in parallel over picks (or all rows ungrouped)
     print(f"  checking GFF availability for {len(candidates)} picks ...")
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        picks = list(ex.map(first_with_gff, candidates))
+        picks = list(ex.map(members_with_gff, candidates))
     keep = []
-    for grp, r in zip(candidates, picks):
-        if r is not None:
-            keep.append(r)
+    for grp, got in zip(candidates, picks):
+        if got:
+            keep.extend(got)
         else:
             skipped.append({"accession": grp[0]["assembly_accession"],
                             "group": grp[0]["group"], "reason": "no_gff"})
@@ -521,8 +529,11 @@ def main():
                     choices=GROUPS)
     ap.add_argument("--levels", default="Complete Genome,Chromosome")
     ap.add_argument("--one-per-rank", metavar="RANK", default=None,
-                    help="sample one assembly per distinct value of this rank "
-                         "(e.g. 'phylum') to maximise phylogenetic diversity")
+                    help="sample assemblies per distinct value of this rank "
+                         "(e.g. 'phylum') to diversify phylogenetic coverage")
+    ap.add_argument("--per-rank-n", type=int, default=1,
+                    help="assemblies to keep per rank value (default 1); "
+                         "N>1 lets held-out genomes share rank vocabulary")
     ap.add_argument("--nt-budget", type=int, default=100_000,
                     help="nucleotide budget per assembly (total bases sampled); "
                          "size-normalises fragment counts across genome sizes")
@@ -556,7 +567,7 @@ def main():
         sel = select_assemblies(rows, levels, args.one_per_rank,
                                 rng, skipped, args.workers,
                                 tax_resolver=resolve_taxonomy,
-                                cache=cache)
+                                cache=cache, per_rank_n=args.per_rank_n)
         print(f"{g}: {len(rows)} assemblies -> {len(sel)} selected "
               f"(after GFF filter)")
         selected.extend(sel)

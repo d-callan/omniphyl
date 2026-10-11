@@ -38,6 +38,7 @@ NT_BUDGET="${NT_BUDGET:-100000}"
 FRAG_LEN="${FRAG_LEN:-500}"
 BOUNDARY_FRAC="${BOUNDARY_FRAC:-0.3}"
 ONE_PER_RANK="${ONE_PER_RANK:-}"
+PER_RANK_N="${PER_RANK_N:-1}"  # assemblies kept per rank value
 VEUPATH="${VEUPATH:-1}"
 K="${K:-7}"
 WIDTH="${WIDTH:-64}"
@@ -70,7 +71,7 @@ DATA="$WORKDIR/corpus"
 VEUPATH_FLAG=""
 [ "$VEUPATH" = 1 ] && VEUPATH_FLAG="--veupath"
 RANK_FLAG=""
-[ -n "$ONE_PER_RANK" ] && RANK_FLAG="--one-per-rank $ONE_PER_RANK"
+[ -n "$ONE_PER_RANK" ] && RANK_FLAG="--one-per-rank $ONE_PER_RANK --per-rank-n $PER_RANK_N"
 # shellcheck disable=SC2086
 python3 scripts/fetch_refseq_corpus.py --outdir "$DATA" \
     --groups $GROUPS --levels "$LEVELS" \
