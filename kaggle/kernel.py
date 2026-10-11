@@ -20,14 +20,14 @@ except OSError:
 WORK = "/kaggle/working"
 os.environ.setdefault("WORKDIR", f"{WORK}/omniphyl-work")
 os.environ.setdefault("OUTDIR", WORK)
-# v3: all four RefSeq groups, 3 assemblies per phylum (~280 genomes)
-# so held-out genomes share phylum vocab -> measurable generalization.
-# 300k nt/accession -> ~170k frags. WIDTH 32.
-os.environ.setdefault("GROUPS", "protozoa fungi bacteria viral")
+# v4: 5 groups incl. archaea, 2 assemblies per FAMILY (~3.6k genomes)
+# -> val asks "new species in a known family"; 75k nt/accession ->
+# ~430k frags; regs on (dropout/label-smoothing/wd), 10 epochs.
+os.environ.setdefault("GROUPS", "protozoa fungi bacteria viral archaea")
 os.environ.setdefault("LEVELS", "Complete Genome,Chromosome,Scaffold")
-os.environ.setdefault("ONE_PER_RANK", "phylum")
-os.environ.setdefault("PER_RANK_N", "3")
-os.environ.setdefault("NT_BUDGET", "300000")
+os.environ.setdefault("ONE_PER_RANK", "family")
+os.environ.setdefault("PER_RANK_N", "2")
+os.environ.setdefault("NT_BUDGET", "75000")
 os.environ.setdefault("EPOCHS", "10")
 os.environ.setdefault("DROPOUT", "0.2")
 os.environ.setdefault("LABEL_SMOOTHING", "0.05")
