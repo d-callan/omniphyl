@@ -25,6 +25,8 @@ os.environ.setdefault("OUTDIR", WORK)
 os.environ.setdefault("GROUPS", "protozoa")
 os.environ.setdefault("ONE_PER_RANK", "phylum")
 os.environ.setdefault("VEUPATH", "1")
+# block-buffered stdout hides fetch progress in the kernel log viewer
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
 # os.environ["REPO_URL"] = "https://<token>@github.com/d-callan/omniphyl.git"
 
 subprocess.run(["git", "clone", "--depth", "1",

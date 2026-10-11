@@ -567,7 +567,7 @@ def main():
                 skipped.append({"accession": row["assembly_accession"],
                                 "group": row["group"],
                                 "reason": f"download_error: {e}"})
-            if i % 50 == 0:
+            if i % max(1, len(selected) // 20) == 0:
                 print(f"  downloaded {i}/{len(selected)}")
     print(f"downloaded {len(ok)}/{len(selected)} genomes")
 
