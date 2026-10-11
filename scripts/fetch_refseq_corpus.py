@@ -249,13 +249,19 @@ def coding_stats_iv(intervals: list[tuple[int, int]],
     flen = frag_end - frag_start
     mid = frag_start + flen / 2
     overlap = 0
+    # intervals are sorted by start; cursor marks the rightmost covered base
+    # so overlapping entries (alt transcripts, overlapping genes) count once
+    covered_until = frag_start
     edges: set[int] = set()
     for s, e in intervals:
         if e <= frag_start:
             continue
         if s >= frag_end:
             break
-        overlap += min(e, frag_end) - max(s, frag_start)
+        s2, e2 = max(s, frag_start), min(e, frag_end)
+        if e2 > covered_until:
+            overlap += e2 - max(s2, covered_until)
+            covered_until = e2
         if frag_start < s < frag_end:
             edges.add(s)
         if frag_start < e < frag_end:
