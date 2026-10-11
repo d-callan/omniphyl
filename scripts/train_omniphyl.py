@@ -487,7 +487,8 @@ def main():
             best = mean_acc
             torch.save({"model": model.state_dict(), "vocab": vocab,
                         "k": args.k, "targets": all_targets,
-                        "args": vars(args)},
+                        "args": {k: str(v) if isinstance(v, Path) else v
+                                 for k, v in vars(args).items()}},
                        args.out / "best.pt")
     (args.out / "vocab.json").write_text(json.dumps(vocab, indent=1))
     print(f"done. best mean val acc {best:.3f} -> {args.out}/best.pt")
