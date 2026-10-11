@@ -94,8 +94,8 @@ python3 scripts/eval_pilot.py --model "$RUN/best.pt" \
 
 STAMP=$(date +%Y%m%d-%H%M%S)
 tar -czf "$OUTDIR/omniphyl-pilot-$STAMP.tar.gz" \
-    -C "$WORKDIR" "corpus/labels.tsv" "corpus/labels.meta.json" \
-    "run/best.pt" "run/eval" \
+    -C "$WORKDIR" "corpus/labels.tsv" "corpus/manifest.json" \
+    "corpus/skipped.tsv" "run/best.pt" "run/eval" \
     $(find run -name "*.log" -o -name "*.json" 2>/dev/null | xargs -r)
 
 echo "==> results: $OUTDIR/omniphyl-pilot-$STAMP.tar.gz"
