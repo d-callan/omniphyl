@@ -3,9 +3,12 @@
 
 Metrics emitted:
   - Per-rank top-1 accuracy and macro-F1 (taxonomy ranks + coding head)
-  - Deepest-confident-rank: for each fragment, find the deepest rank where the
-    model's top-1 prediction is within-vocabulary (not the unknown class 0);
-    report the distribution and mean depth.
+  - Split metrics: the training genome split is reproduced from the
+    checkpoint's saved args; metrics are reported separately for train vs
+    held-out val genomes (memorization vs generalization).
+  - Deepest-confident-rank: deepest rank whose top-1 softmax probability
+    clears a confidence threshold (tau sweep). Real abstention — the mask
+    class 0 is never a learned prediction.
   - Per-group accuracy breakdown (domain/phylum/... accuracy split by RefSeq
     group: bacteria/viral/fungi/...)
   - Leave-phylum-out generalisation: separate accuracy for fragments from phyla
@@ -42,7 +45,8 @@ import torch.nn.functional as F
 # Add scripts dir to path so we can import from siblings
 sys.path.insert(0, str(Path(__file__).parent))
 from train_omniphyl import (OmniPhyl, FragmentDataset, build_cell_lut,
-                             RANKS, CONT_TARGETS, encode_cont_labels)
+                             build_split, RANKS, CONT_TARGETS,
+                             encode_cont_labels)
 
 RANK_ORDER = RANKS  # domain -> ... -> species
 
@@ -164,6 +168,7 @@ def main():
     # Run inference
     all_preds: dict[str, list[int]] = {t: [] for t in cls_targets}
     all_true: dict[str, list[int]] = {t: [] for t in cls_targets}
+    all_confs: dict[str, list[float]] = {t: [] for t in cls_targets}
     cont_out: dict[str, list[float]] = {t: [] for t in CONT_TARGETS}
     cont_true: list[tuple] = []
     frag_ids = ds.ids
@@ -174,6 +179,8 @@ def main():
             _, logits = model(x)
             for i, t in enumerate(cls_targets):
                 all_preds[t].extend(logits[t].argmax(1).cpu().tolist())
+                all_confs[t].extend(
+                    logits[t].softmax(1).max(1).values.cpu().tolist())
                 all_true[t].extend(y[:, i].tolist())
             for t in CONT_TARGETS:
                 if t in logits:
@@ -184,86 +191,121 @@ def main():
     # -----------------------------------------------------------------------
     # 1. Per-target accuracy + macro-F1
     # -----------------------------------------------------------------------
-    results: dict = {"per_target": {}}
-    for t in cls_targets:
-        p, gt = all_preds[t], all_true[t]
-        known_mask = [i for i, v in enumerate(gt) if v != 0]
-        if not known_mask:
-            results["per_target"][t] = {"accuracy": None, "macro_f1": None,
-                                         "n": 0}
-            continue
-        acc = sum(p[i] == gt[i] for i in known_mask) / len(known_mask)
-        f1 = macro_f1([p[i] for i in known_mask],
-                      [gt[i] for i in known_mask], n_classes[t])
-        results["per_target"][t] = {
-            "accuracy": round(acc, 4),
-            "macro_f1": round(f1, 4),
-            "n": len(known_mask),
-        }
-        print(f"  {t:12s}  acc={acc:.3f}  macro-F1={f1:.3f}  n={len(known_mask)}")
-
-    # -----------------------------------------------------------------------
-    # 1b. Continuous annotation heads (coding_frac / boundary / offset)
-    #     Boundary recall vs flag rate is the cascade-economics gate
-    #     (open question 1 in docs/annotation-cascade.md).
-    # -----------------------------------------------------------------------
+    all_idxs = list(range(len(frag_ids)))
     frac_true = np.array([c[0] for c in cont_true])
     off_true = np.array([c[1] for c in cont_true])
-    fm = frac_true >= 0
-    om = off_true >= 0
-    results["annotation_heads"] = {}
-    if fm.any() and cont_out.get("coding_frac"):
-        p_frac = np.array(cont_out["coding_frac"])[fm]
-        t_frac = frac_true[fm]
-        mae = float(np.abs(p_frac - t_frac).mean())
-        r = (float(np.corrcoef(p_frac, t_frac)[0, 1])
-             if t_frac.std() > 0 else float("nan"))
-        results["annotation_heads"]["coding_frac"] = {
-            "mae": round(mae, 4), "pearson_r": round(r, 4), "n": int(fm.sum())}
-        print(f"  coding_frac   MAE={mae:.3f}  r={r:.3f}  n={int(fm.sum())}")
-    if fm.any() and cont_out.get("boundary"):
-        p_bnd = np.array(cont_out["boundary"])[fm]
-        t_bnd = ((frac_true[fm] > 0) & (frac_true[fm] < 1))
-        acc = float(((p_bnd > 0.5) == t_bnd).mean())
-        sweep = {}
-        for rate in (0.05, 0.10, 0.20, 0.30, 0.50):
-            thr = np.quantile(p_bnd, 1 - rate)
-            flagged = p_bnd >= thr
-            rec = float((flagged & t_bnd).sum() / max(t_bnd.sum(), 1))
-            sweep[f"flag_{int(rate*100)}pct"] = round(rec, 4)
-        results["annotation_heads"]["boundary"] = {
-            "accuracy": round(acc, 4), "recall_at_flag_rate": sweep,
-            "n": int(fm.sum()), "n_pos": int(t_bnd.sum())}
-        print(f"  boundary      acc={acc:.3f}  recall@flag={sweep}  "
-              f"n_pos={int(t_bnd.sum())}")
-    if om.any() and cont_out.get("offset"):
-        p_off = np.array(cont_out["offset"])[om]
-        mae = float(np.abs(p_off - off_true[om]).mean())
-        results["annotation_heads"]["offset"] = {
-            "mae": round(mae, 4), "n": int(om.sum())}
-        print(f"  offset        MAE={mae:.3f}  n={int(om.sum())}")
+
+    def cls_metrics(idxs: list[int]) -> dict:
+        out = {}
+        for t in cls_targets:
+            known = [i for i in idxs if all_true[t][i] != 0]
+            if not known:
+                out[t] = {"accuracy": None, "macro_f1": None, "n": 0}
+                continue
+            acc = sum(all_preds[t][i] == all_true[t][i]
+                      for i in known) / len(known)
+            f1 = macro_f1([all_preds[t][i] for i in known],
+                          [all_true[t][i] for i in known], n_classes[t])
+            out[t] = {"accuracy": round(acc, 4),
+                      "macro_f1": round(f1, 4), "n": len(known)}
+        return out
+
+    def cont_metrics(idxs: list[int]) -> dict:
+        """coding_frac / boundary / offset metrics restricted to idxs.
+
+        Boundary recall vs flag rate is the cascade-economics gate
+        (open question 1 in docs/annotation-cascade.md).
+        """
+        sel = np.asarray(idxs)
+        ft, ot = frac_true[sel], off_true[sel]
+        fmk, omk = ft >= 0, ot >= 0
+        out = {}
+        if fmk.any() and cont_out.get("coding_frac"):
+            p = np.asarray(cont_out["coding_frac"])[sel][fmk]
+            t_ = ft[fmk]
+            r = (float(np.corrcoef(p, t_)[0, 1])
+                 if t_.std() > 0 else float("nan"))
+            out["coding_frac"] = {
+                "mae": round(float(np.abs(p - t_).mean()), 4),
+                "pearson_r": round(r, 4), "n": int(fmk.sum())}
+        if fmk.any() and cont_out.get("boundary"):
+            p = np.asarray(cont_out["boundary"])[sel][fmk]
+            tb = ((ft[fmk] > 0) & (ft[fmk] < 1))
+            sweep = {}
+            for rate in (0.05, 0.10, 0.20, 0.30, 0.50):
+                thr = np.quantile(p, 1 - rate)
+                flagged = p >= thr
+                sweep[f"flag_{int(rate*100)}pct"] = round(
+                    float((flagged & tb).sum() / max(tb.sum(), 1)), 4)
+            out["boundary"] = {
+                "accuracy": round(float(((p > 0.5) == tb).mean()), 4),
+                "recall_at_flag_rate": sweep,
+                "n": int(fmk.sum()), "n_pos": int(tb.sum())}
+        if omk.any() and cont_out.get("offset"):
+            p = np.asarray(cont_out["offset"])[sel][omk]
+            out["offset"] = {
+                "mae": round(float(np.abs(p - ot[omk]).mean()), 4),
+                "n": int(omk.sum())}
+        return out
+
+    results: dict = {}
+    results["per_target"] = cls_metrics(all_idxs)
+    for t, m in results["per_target"].items():
+        print(f"  {t:12s}  acc={m['accuracy']}  macro-F1={m['macro_f1']}  "
+              f"n={m['n']}")
+    results["annotation_heads"] = cont_metrics(all_idxs)
+    for t, m in results["annotation_heads"].items():
+        print(f"  {t:12s}  {m}")
+
+    # -----------------------------------------------------------------------
+    # 1c. Honest split: reproduce the training genome split (deterministic
+    #     given the saved args) and score train vs held-out val fragments
+    #     separately. per_target mixes memorized train frags with held-out
+    #     frags; the val column is the real generalization readout.
+    # -----------------------------------------------------------------------
+    val_accs, _ = build_split(
+        meta,
+        float(train_args.get("val_frac", 0.1)),
+        float(train_args.get("holdout_genus_frac", 0.0)),
+        int(train_args.get("seed", 0)))
+    val_set = {i for i, fid in enumerate(frag_ids)
+               if meta[fid].get("accession") in val_accs}
+    val_idxs = sorted(val_set)
+    train_idxs = [i for i in all_idxs if i not in val_set]
+    results["split_metrics"] = {
+        "n_train": len(train_idxs), "n_val": len(val_idxs),
+        "val_genomes": sorted(val_accs),
+        "train": {"per_target": cls_metrics(train_idxs),
+                  "annotation_heads": cont_metrics(train_idxs)},
+        "val": {"per_target": cls_metrics(val_idxs),
+                "annotation_heads": cont_metrics(val_idxs)}}
+    print(f"\nSplit: {len(train_idxs)} train / {len(val_idxs)} val-genome "
+          f"frags ({len(val_accs)} held-out genomes)")
+    for t, m in results["split_metrics"]["val"]["per_target"].items():
+        print(f"  val {t:12s}  acc={m['accuracy']}  n={m['n']}")
 
     # -----------------------------------------------------------------------
     # 2. Deepest-confident-rank: deepest RANK where pred != 0 (unknown)
     #    Only applies to taxonomy ranks, not the coding head.
     # -----------------------------------------------------------------------
-    depth_counts: dict[str, int] = defaultdict(int)
-    for i in range(len(frag_ids)):
-        depth = "none"
-        for t in reversed(RANK_ORDER):  # species -> ... -> domain
-            if t in all_targets:
-                idx = all_targets.index(t)
-                if all_preds[t][i] != 0:
+    # Descend the cascade while a rank's top-1 softmax prob clears tau.
+    # (The old pred != unknown check never abstained: class 0 is a mask
+    # label the model never emits, so every fragment reached 'species'.)
+    results["deepest_confident_rank"] = {}
+    print("\nDeepest confident rank distribution:")
+    for tau in (0.5, 0.8, 0.9):
+        dc: dict[str, int] = defaultdict(int)
+        for i in range(len(frag_ids)):
+            depth = "none"
+            for t in reversed(RANK_ORDER):  # species -> ... -> domain
+                if (t in all_targets and all_preds[t][i] != 0
+                        and all_confs[t][i] >= tau):
                     depth = t
                     break
-        depth_counts[depth] += 1
-
-    results["deepest_confident_rank"] = dict(depth_counts)
-    rank_order_with_none = RANK_ORDER + ["none"]
-    print("\nDeepest confident rank distribution:")
-    for r in rank_order_with_none:
-        n = depth_counts.get(r, 0)
-        print(f"  {r:12s}  {n:6d}  ({100*n/max(len(frag_ids),1):.1f}%)")
+            dc[depth] += 1
+        results["deepest_confident_rank"][f"tau_{tau}"] = dict(dc)
+        print(f"  tau={tau}: " + "  ".join(
+            f"{r}:{dc.get(r, 0)}" for r in RANK_ORDER + ["none"]))
 
     # -----------------------------------------------------------------------
     # 3. Per-group accuracy (by RefSeq group column)

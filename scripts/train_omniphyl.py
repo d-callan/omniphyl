@@ -427,9 +427,13 @@ def main():
             with torch.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=amp):
                 _, logits = model(x)
+                # skip heads whose batch labels are all masked —
+                # cross_entropy(ignore_index=0) returns NaN there (val
+                # batches whose rank labels are entirely out-of-vocab)
                 terms = [F.cross_entropy(logits[t], y[:, i],
                                          ignore_index=0)
-                         for i, t in enumerate(cls_targets)]
+                         for i, t in enumerate(cls_targets)
+                         if (y[:, i] != 0).any()]
                 fm = yc[:, 0] >= 0          # coding_frac label present
                 btgt = ((yc[:, 0] > 0) & (yc[:, 0] < 1)).float()
                 if fm.any():
@@ -441,6 +445,8 @@ def main():
                 if om.any():
                     terms.append(F.mse_loss(torch.sigmoid(
                         logits["offset"][:, 0][om]), yc[om, 1]))
+                if not terms:
+                    continue
                 loss = torch.stack(terms).mean()
             if train:
                 opt.zero_grad(set_to_none=True)
