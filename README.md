@@ -13,6 +13,8 @@ Design documents live in `docs/`:
   (fuzzy candidacy -> exact boundary calls) and the VEuPathDB label tier.
 - `docs/pilot-plan.md` — evaluation methodology.
 - `docs/use-cases.md` — downstream applications.
+- `docs/remote-runs.md` — running fetch+train+eval on free remote
+  hardware (Kaggle kernels, Colab, laptop CPU).
 
 ## Layout
 
@@ -29,6 +31,9 @@ Design documents live in `docs/`:
 - `scripts/eval_pilot.py` — per-rank accuracy/F1, confusion matrices,
   deepest-confident-rank, plus annotation-head metrics (frac MAE,
   boundary recall-vs-flag-rate, offset MAE).
+- `remote/run_pilot.sh` — env-var-parameterized end-to-end runner
+  (clone -> smoke -> fetch -> train -> eval -> tarball).
+- `kaggle/` — kernel scaffold for `kaggle kernels push` (free T4).
 - `scripts/screen_contaminants.py` — contaminant screening for pilot
   fragments.
 - `tests/test_smoke.py` — network-free smoke tests + end-to-end
