@@ -84,13 +84,15 @@ def download(url: str, dest: Path, retries: int = 3, timeout: int = 300) -> Path
     dest.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(retries):
         try:
+            part = dest.parent / (dest.name + ".part")
             with urllib.request.urlopen(url, timeout=timeout) as r, \
-                    open(dest, "wb") as f:
+                    open(part, "wb") as f:
                 while True:
                     chunk = r.read(1 << 20)
                     if not chunk:
                         break
                     f.write(chunk)
+            part.replace(dest)  # atomic: never leave a truncated cache
             return dest
         except Exception as e:
             if attempt == retries - 1:
@@ -113,8 +115,9 @@ def load_summary(group: str, cache: Path) -> list[dict]:
         for line in f:
             if not line.startswith("#"):
                 break
-            if line.startswith("# assembly_accession"):
-                header = line[2:].rstrip("\n").split("\t")
+            h = line.lstrip("# ")
+            if h.startswith("assembly_accession"):
+                header = h.rstrip("\n").split("\t")
         reader = csv.DictReader(f, fieldnames=header, delimiter="\t")
         for row in reader:
             row["group"] = group
@@ -124,64 +127,74 @@ def load_summary(group: str, cache: Path) -> list[dict]:
 
 def has_gff(row: dict, timeout: int = 10) -> bool:
     """HEAD-check whether the GFF file exists on the FTP mirror."""
-    ftp_dir = row["ftp_path"].replace("ftp://", "https://")
+    ftp_dir = row["ftp_path"].replace("ftp://", "https://").rstrip("/")
     name = ftp_dir.rsplit("/", 1)[-1]
     url = f"{ftp_dir}/{name}_genomic.gff.gz"
-    try:
-        req = urllib.request.Request(url, method="HEAD")
-        with urllib.request.urlopen(req, timeout=timeout):
-            return True
-    except Exception:
-        return False
+    for a in range(3):
+        try:
+            req = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(req, timeout=timeout):
+                return True
+        except Exception:
+            # NCBI throttles concurrent HEAD bursts; back off and retry
+            time.sleep(2 * (a + 1))
+    return False
 
 
 def select_assemblies(rows: list[dict], levels: set[str],
                       one_per_rank: str | None,
                       rng: random.Random,
                       skipped: list[dict],
-                      workers: int) -> list[dict]:
+                      workers: int,
+                      tax_resolver=None,
+                      cache: Path | None = None) -> list[dict]:
     """Filter to eligible assemblies, HEAD-check for GFF, then sample.
 
-    With one_per_rank='phylum': pick one assembly per distinct phylum value
-    (after taxonomy is available from the summary's taxid field — approximated
-    here by the organism_name prefix; exact phylum comes post-taxdump but
-    we need to select before downloading).  Since the summary doesn't carry
-    phylum directly, we group by species_taxid and pick one per group as a
-    proxy, then rely on the post-download taxdump to give us the real phylum
-    column.  For the pilot this is sufficient — the taxdump phylum is used
-    in evaluation, not sampling.
+    With one_per_rank set (e.g. 'phylum'): resolve each candidate's
+    species_taxid through rankedlineage.dmp (downloaded once into cache)
+    and keep one assembly per distinct rank value. Taxa without a value
+    for that rank each form their own group so nothing is silently
+    dropped; the label columns still come from the same taxdump.
     """
     keep = [r for r in rows
             if r.get("assembly_level") in levels
             and r.get("version_status") == "latest"
             and r.get("genome_rep") == "Full"
-            and not r.get("excluded_from_refseq")
-            and r.get("ftp_path", "").startswith("ftp")]
+            and r.get("excluded_from_refseq", "na") in ("", "na")
+            and r.get("ftp_path", "").startswith(("ftp://", "https://"))]
     rng.shuffle(keep)
 
     # GFF HEAD checks in parallel
     print(f"  checking GFF availability for {len(keep)} candidates ...")
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        gff_ok = dict(zip(keep, ex.map(has_gff, keep)))
-    for r in keep:
-        if not gff_ok[r]:
+        gff_flags = list(ex.map(has_gff, keep))
+    survivors = []
+    for r, ok in zip(keep, gff_flags):
+        if ok:
+            survivors.append(r)
+        else:
             skipped.append({"accession": r["assembly_accession"],
                             "group": r["group"], "reason": "no_gff"})
-    keep = [r for r in keep if gff_ok[r]]
+    keep = survivors
 
     if one_per_rank:
-        # Group by infraspecific_name/taxid as phylum proxy; pick one per group
-        by_taxid: dict[str, list] = defaultdict(list)
+        taxids = {r.get("species_taxid") for r in keep
+                  if r.get("species_taxid")}
+        tax_map = tax_resolver(taxids, cache) if tax_resolver else {}
+        groups: dict[str, list] = defaultdict(list)
         for r in keep:
-            by_taxid[r.get("species_taxid", "unknown")].append(r)
-        keep = [grp[0] for grp in by_taxid.values()]
+            tid = r.get("species_taxid", "")
+            rank_val = tax_map.get(tid, {}).get(one_per_rank)
+            # missing rank value -> unique group so the taxon still samples
+            groups[rank_val or f"_unresolved_{tid}"].append(r)
+        keep = [grp[0] for grp in groups.values()]
         rng.shuffle(keep)
 
     return keep
 
 
 def fetch_fasta_and_gff(row: dict, dest_dir: Path) -> tuple[Path, Path]:
-    ftp_dir = row["ftp_path"].replace("ftp://", "https://")
+    ftp_dir = row["ftp_path"].replace("ftp://", "https://").rstrip("/")
     name = ftp_dir.rsplit("/", 1)[-1]
     acc = row["assembly_accession"]
     fna = dest_dir / f"{acc}.fna.gz"
@@ -526,7 +539,9 @@ def main():
     for g in args.groups:
         rows = load_summary(g, cache)
         sel = select_assemblies(rows, levels, args.one_per_rank,
-                                rng, skipped, args.workers)
+                                rng, skipped, args.workers,
+                                tax_resolver=resolve_taxonomy,
+                                cache=cache)
         print(f"{g}: {len(rows)} assemblies -> {len(sel)} selected "
               f"(after GFF filter)")
         selected.extend(sel)

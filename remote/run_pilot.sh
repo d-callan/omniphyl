@@ -15,6 +15,8 @@
 #   NT_BUDGET       nt per seqid               (default: 100000)
 #   FRAG_LEN        fragment length            (default: 500)
 #   BOUNDARY_FRAC   mixed-window fraction      (default: 0.3)
+#   ONE_PER_RANK    one assembly per rank val  (default: "" = no cap;
+#                   e.g. "phylum" -> max phylogenetic diversity, few genomes)
 #   VEUPATH         1 = pass --veupath         (default: 1)
 #   K               FCGR k-mer order           (default: 7)
 #   WIDTH           ResNet width               (default: 64)
@@ -35,6 +37,7 @@ LEVELS="${LEVELS:-Complete Genome,Chromosome}"
 NT_BUDGET="${NT_BUDGET:-100000}"
 FRAG_LEN="${FRAG_LEN:-500}"
 BOUNDARY_FRAC="${BOUNDARY_FRAC:-0.3}"
+ONE_PER_RANK="${ONE_PER_RANK:-}"
 VEUPATH="${VEUPATH:-1}"
 K="${K:-7}"
 WIDTH="${WIDTH:-64}"
@@ -66,12 +69,14 @@ fi
 DATA="$WORKDIR/corpus"
 VEUPATH_FLAG=""
 [ "$VEUPATH" = 1 ] && VEUPATH_FLAG="--veupath"
+RANK_FLAG=""
+[ -n "$ONE_PER_RANK" ] && RANK_FLAG="--one-per-rank $ONE_PER_RANK"
 # shellcheck disable=SC2086
 python3 scripts/fetch_refseq_corpus.py --outdir "$DATA" \
     --groups $GROUPS --levels "$LEVELS" \
     --nt-budget "$NT_BUDGET" --frag-len-min "$FRAG_LEN" \
     --frag-len-max "$FRAG_LEN" --boundary-frac "$BOUNDARY_FRAC" \
-    $VEUPATH_FLAG --workers 8
+    $VEUPATH_FLAG $RANK_FLAG --workers 8
 
 # --- train ------------------------------------------------------------------
 RUN="$WORKDIR/run"

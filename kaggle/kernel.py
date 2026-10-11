@@ -20,6 +20,11 @@ except OSError:
 WORK = "/kaggle/working"
 os.environ.setdefault("WORKDIR", f"{WORK}/omniphyl-work")
 os.environ.setdefault("OUTDIR", WORK)
+# First pilot: protozoa only, one assembly per phylum -> ~5-10 diverse
+# genomes, small corpus, fast end-to-end.
+os.environ.setdefault("GROUPS", "protozoa")
+os.environ.setdefault("ONE_PER_RANK", "phylum")
+os.environ.setdefault("VEUPATH", "1")
 # os.environ["REPO_URL"] = "https://<token>@github.com/d-callan/omniphyl.git"
 
 subprocess.run(["git", "clone", "--depth", "1",
