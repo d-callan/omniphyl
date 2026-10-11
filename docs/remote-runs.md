@@ -13,8 +13,10 @@ the official `kaggle` CLI pushes jobs from the terminal.
 
 ### Setup (once)
 
-1. kaggle.com -> account settings -> **verify phone number** (required
-   for GPU + internet on kernels).
+1. kaggle.com -> account settings -> **verify phone number**.
+   Without it kernels get NO internet AND no GPU — `git clone` fails
+   with `Could not resolve host`. Both kernels fail fast on this now
+   with a clear message; fix is one SMS at kaggle.com/settings.
 2. Account -> API -> "Create New Token" -> `~/.kaggle/access_token`
    (`chmod 600`). Requires a current `kaggle` CLI; older versions used
    `~/.kaggle/kaggle.json` (username+key) — either works, and

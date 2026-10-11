@@ -6,7 +6,15 @@ GPU quota — same checks as `run_pilot.sh`'s SMOKE stage. Push:
 `kaggle kernels output daniellecallan/omniphyl-smoke` (or the web log).
 """
 
+import socket
 import subprocess
+
+try:
+    socket.create_connection(("github.com", 443), timeout=10)
+except OSError:
+    raise SystemExit(
+        "NO INTERNET on this kernel VM — verify phone number at "
+        "kaggle.com/settings (required for internet + GPU), then re-push.")
 
 WORK = "/kaggle/working"
 subprocess.run(

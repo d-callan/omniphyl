@@ -7,7 +7,15 @@ script. See docs/remote-runs.md.
 """
 
 import os
+import socket
 import subprocess
+
+try:
+    socket.create_connection(("github.com", 443), timeout=10)
+except OSError:
+    raise SystemExit(
+        "NO INTERNET on this kernel VM — verify phone number at "
+        "kaggle.com/settings (required for internet + GPU), then re-push.")
 
 WORK = "/kaggle/working"
 os.environ.setdefault("WORKDIR", f"{WORK}/omniphyl-work")
