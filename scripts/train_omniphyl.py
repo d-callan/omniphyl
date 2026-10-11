@@ -302,10 +302,14 @@ def encode_cont_labels(rows: dict[str, dict]) -> dict[str, tuple]:
 def build_split(meta: dict[str, dict], val_frac: float, genus_holdout: float,
                 seed: int):
     rng = random.Random(seed)
-    accs = sorted({m["accession"] for m in meta.values()})
+    # genomes whose requested rank was unresolved in taxonomy are
+    # test-only: never trained on, always held out (OOD probe set)
+    forced_val = {m["accession"] for m in meta.values()
+                  if m.get("rank_unresolved") == "1"}
+    accs = sorted({m["accession"] for m in meta.values()} - forced_val)
     rng.shuffle(accs)
     n_val = max(1, int(len(accs) * val_frac))
-    val_accs = set(accs[:n_val])
+    val_accs = set(accs[:n_val]) | forced_val
 
     holdout_genera = set()
     if genus_holdout > 0:

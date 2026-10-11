@@ -75,6 +75,12 @@ GROUPS = ["archaea", "bacteria", "fungi", "invertebrate", "plant",
           "protozoa", "vertebrate_mammalian", "vertebrate_other", "viral"]
 
 RANKS = ["domain", "phylum", "class", "order", "family", "genus", "species"]
+
+# Within a rank group, picks prefer more complete assemblies; Scaffold
+# (and Contig) members only fill slots after better levels exhaust —
+# completeness is nice-to-have for fragment slicing, not a hard gate.
+LEVEL_PREF = {"Complete Genome": 0, "Chromosome": 1,
+              "Scaffold": 2, "Contig": 3}
 # rankedlineage.dmp column order (after taxid, name):
 RL_COLS = ["species", "genus", "family", "order", "class", "phylum",
            "kingdom", "superkingdom"]
@@ -155,13 +161,17 @@ def select_assemblies(rows: list[dict], levels: set[str],
     species_taxid through rankedlineage.dmp (downloaded once into cache)
     and keep up to per_rank_n assemblies per distinct rank value. N>1
     keeps rank vocab shared between train and held-out genomes, so
-    generalization is measurable at every rank. Taxa without a value
-    for that rank share a single fallback group — sampling one
-    representative — so groups like viral (where most taxids lack a
-    phylum in NCBI taxonomy) don't explode into thousands of singletons.
+    generalization is measurable at every rank.    Taxa without a value
+    for that rank share a single fallback group — so groups like viral
+    (where most taxids lack a phylum in NCBI taxonomy) don't explode
+    into thousands of singletons. Fallback picks are flagged
+    _rank_unresolved: they stay in the corpus as test-only genomes
+    (train_omniphyl.build_split forces them into val).
     Grouping happens BEFORE the GFF HEAD sweep so only the picks (~one
     per rank value) get checked, not every candidate (bacteria alone
-    has ~75k); a failed pick walks its group for an alternate.
+    has ~75k); a failed pick walks its group for an alternate. Each
+    group is ordered by assembly level so Scaffold members fill slots
+    only after Complete/Chromosome members are exhausted.
     """
     keep = [r for r in rows
             if r.get("assembly_level") in levels
@@ -180,9 +190,16 @@ def select_assemblies(rows: list[dict], levels: set[str],
             tid = r.get("species_taxid", "")
             rank_val = tax_map.get(tid, {}).get(one_per_rank)
             groups[rank_val or "_unresolved"].append(r)
-        candidates = list(groups.values())
+        # prefer better assemblies within each rank value: the pre-group
+        # shuffle already randomised order, so a stable sort by level
+        # keeps randomness inside a level while preferring completeness
+        candidates = []
+        for key, grp in groups.items():
+            grp.sort(key=lambda r: LEVEL_PREF.get(
+                r.get("assembly_level", ""), 9))
+            candidates.append((key, grp))
     else:
-        candidates = [[r] for r in keep]
+        candidates = [(None, [r]) for r in keep]
 
     def members_with_gff(grp):
         # up to per_rank_n GFF-available members, scanning a couple of
@@ -198,14 +215,17 @@ def select_assemblies(rows: list[dict], levels: set[str],
     # GFF HEAD checks in parallel over picks (or all rows ungrouped)
     print(f"  checking GFF availability for {len(candidates)} picks ...")
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        picks = list(ex.map(members_with_gff, candidates))
+        picks = list(ex.map(lambda c: members_with_gff(c[1]), candidates))
     keep = []
-    for grp, got in zip(candidates, picks):
-        if got:
-            keep.extend(got)
-        else:
+    for (key, grp), got in zip(candidates, picks):
+        if not got:
             skipped.append({"accession": grp[0]["assembly_accession"],
                             "group": grp[0]["group"], "reason": "no_gff"})
+            continue
+        if key == "_unresolved":
+            for r in got:
+                r["_rank_unresolved"] = "1"
+        keep.extend(got)
 
     return keep
 
@@ -603,9 +623,9 @@ def main():
     with open(frag_path, "w") as ff, open(lab_path, "w", newline="") as lf:
         w = csv.writer(lf, delimiter="\t")
         w.writerow(["frag_id", "accession", "seqid", "start", "end",
-                    "length", "taxid", "group", "coding", "label_source",
-                    "coding_frac", "boundary", "n_boundaries",
-                    "boundary_offset"] + RANKS)
+                    "length", "taxid", "group", "rank_unresolved",
+                    "coding", "label_source", "coding_frac", "boundary",
+                    "n_boundaries", "boundary_offset"] + RANKS)
         for row in ok:
             tax = tax_map.get(row.get("species_taxid", ""), {})
             veu = (fetch_veupathdb_cds(row["assembly_accession"], cache)
@@ -664,7 +684,8 @@ def main():
                            "coding" if stats[0] >= 0.5 else "non-coding")
                     w.writerow([fid, row["assembly_accession"], seqid, s, e,
                                 len(frag), row.get("species_taxid", ""),
-                                row["group"], cod, label_source,
+                                row["group"], row.get("_rank_unresolved", "0"),
+                                cod, label_source,
                                 frac_s, bnd_s, nb_s, boff_s] +
                                [tax.get(r, "") or "" for r in RANKS])
                     n_frags += 1

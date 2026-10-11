@@ -24,6 +24,7 @@ os.environ.setdefault("OUTDIR", WORK)
 # so held-out genomes share phylum vocab -> measurable generalization.
 # 300k nt/accession -> ~170k frags. WIDTH 32.
 os.environ.setdefault("GROUPS", "protozoa fungi bacteria viral")
+os.environ.setdefault("LEVELS", "Complete Genome,Chromosome,Scaffold")
 os.environ.setdefault("ONE_PER_RANK", "phylum")
 os.environ.setdefault("PER_RANK_N", "3")
 os.environ.setdefault("NT_BUDGET", "300000")
