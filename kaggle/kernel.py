@@ -20,10 +20,13 @@ except OSError:
 WORK = "/kaggle/working"
 os.environ.setdefault("WORKDIR", f"{WORK}/omniphyl-work")
 os.environ.setdefault("OUTDIR", WORK)
-# First pilot: protozoa only, one assembly per phylum -> ~5-10 diverse
-# genomes, small corpus, fast end-to-end.
-os.environ.setdefault("GROUPS", "protozoa")
+# v2: all four RefSeq groups, still one assembly per phylum (~90
+# genomes), 500k nt/accession -> ~90k frags. WIDTH 32: corpus is
+# data-limited, not capacity-limited.
+os.environ.setdefault("GROUPS", "protozoa fungi bacteria viral")
 os.environ.setdefault("ONE_PER_RANK", "phylum")
+os.environ.setdefault("NT_BUDGET", "500000")
+os.environ.setdefault("WIDTH", "32")
 os.environ.setdefault("VEUPATH", "1")
 # block-buffered stdout hides fetch progress in the kernel log viewer
 os.environ.setdefault("PYTHONUNBUFFERED", "1")

@@ -153,8 +153,12 @@ def select_assemblies(rows: list[dict], levels: set[str],
     With one_per_rank set (e.g. 'phylum'): resolve each candidate's
     species_taxid through rankedlineage.dmp (downloaded once into cache)
     and keep one assembly per distinct rank value. Taxa without a value
-    for that rank each form their own group so nothing is silently
-    dropped; the label columns still come from the same taxdump.
+    for that rank share a single fallback group — sampling one
+    representative — so groups like viral (where most taxids lack a
+    phylum in NCBI taxonomy) don't explode into thousands of singletons.
+    Grouping happens BEFORE the GFF HEAD sweep so only the picks (~one
+    per rank value) get checked, not every candidate (bacteria alone
+    has ~75k); a failed pick walks its group for an alternate.
     """
     keep = [r for r in rows
             if r.get("assembly_level") in levels
@@ -164,19 +168,6 @@ def select_assemblies(rows: list[dict], levels: set[str],
             and r.get("ftp_path", "").startswith(("ftp://", "https://"))]
     rng.shuffle(keep)
 
-    # GFF HEAD checks in parallel
-    print(f"  checking GFF availability for {len(keep)} candidates ...")
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        gff_flags = list(ex.map(has_gff, keep))
-    survivors = []
-    for r, ok in zip(keep, gff_flags):
-        if ok:
-            survivors.append(r)
-        else:
-            skipped.append({"accession": r["assembly_accession"],
-                            "group": r["group"], "reason": "no_gff"})
-    keep = survivors
-
     if one_per_rank:
         taxids = {r.get("species_taxid") for r in keep
                   if r.get("species_taxid")}
@@ -185,10 +176,28 @@ def select_assemblies(rows: list[dict], levels: set[str],
         for r in keep:
             tid = r.get("species_taxid", "")
             rank_val = tax_map.get(tid, {}).get(one_per_rank)
-            # missing rank value -> unique group so the taxon still samples
-            groups[rank_val or f"_unresolved_{tid}"].append(r)
-        keep = [grp[0] for grp in groups.values()]
-        rng.shuffle(keep)
+            groups[rank_val or "_unresolved"].append(r)
+        candidates = list(groups.values())
+    else:
+        candidates = [[r] for r in keep]
+
+    def first_with_gff(grp):
+        for r in grp[:3]:
+            if has_gff(r):
+                return r
+        return None
+
+    # GFF HEAD checks in parallel over picks (or all rows ungrouped)
+    print(f"  checking GFF availability for {len(candidates)} picks ...")
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        picks = list(ex.map(first_with_gff, candidates))
+    keep = []
+    for grp, r in zip(candidates, picks):
+        if r is not None:
+            keep.append(r)
+        else:
+            skipped.append({"accession": grp[0]["assembly_accession"],
+                            "group": grp[0]["group"], "reason": "no_gff"})
 
     return keep
 
