@@ -28,6 +28,7 @@ os.environ.setdefault("LEVELS", "Complete Genome,Chromosome,Scaffold")
 os.environ.setdefault("ONE_PER_RANK", "phylum")
 os.environ.setdefault("PER_RANK_N", "3")
 os.environ.setdefault("NT_BUDGET", "300000")
+os.environ.setdefault("EPOCHS", "10")
 os.environ.setdefault("WIDTH", "32")
 os.environ.setdefault("VEUPATH", "1")
 # block-buffered stdout hides fetch progress in the kernel log viewer
