@@ -47,6 +47,9 @@ EPOCHS="${EPOCHS:-30}"
 BATCH="${BATCH:-256}"
 POS_CHANNELS="${POS_CHANNELS:-1}"
 VAL_FRAC="${VAL_FRAC:-0.1}"
+DROPOUT="${DROPOUT:-0}"
+LABEL_SMOOTHING="${LABEL_SMOOTHING:-0}"
+WD="${WD:-1e-4}"
 SMOKE="${SMOKE:-1}"
 
 mkdir -p "$WORKDIR" "$OUTDIR"
@@ -89,7 +92,9 @@ POS_FLAG=""
 python3 scripts/train_omniphyl.py \
     --fragments "$DATA/fragments.fna" --labels "$DATA/labels.tsv" \
     --out "$RUN" --k "$K" --width "$WIDTH" --epochs "$EPOCHS" \
-    --batch-size "$BATCH" --val-frac "$VAL_FRAC" $POS_FLAG
+    --batch-size "$BATCH" --val-frac "$VAL_FRAC" \
+    --dropout "$DROPOUT" --label-smoothing "$LABEL_SMOOTHING" --wd "$WD" \
+    $POS_FLAG
 
 # --- eval + bundle ----------------------------------------------------------
 python3 scripts/eval_pilot.py --model "$RUN/best.pt" \

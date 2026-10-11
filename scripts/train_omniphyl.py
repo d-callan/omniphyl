@@ -256,17 +256,18 @@ class ViTEncoder(nn.Module):
 class OmniPhyl(nn.Module):
     def __init__(self, n_classes: dict[str, int], width: int = 64,
                  cin: int = 1, backbone: str = "resnet", side: int = 128,
-                 targets: list[str] | None = None):
+                 targets: list[str] | None = None, dropout: float = 0.0):
         super().__init__()
         self.encoder = (ViTEncoder(cin, side, dim=width * 4)
                         if backbone == "vit" else ResNetEncoder(cin, width))
         self.latent = self.encoder.latent
+        self.drop = nn.Dropout(dropout)
         keys = targets if targets is not None else list(n_classes.keys())
         self.heads = nn.ModuleDict(
             {t: nn.Linear(self.latent, n_classes[t]) for t in keys})
 
     def forward(self, x):
-        z = self.encoder(x)
+        z = self.drop(self.encoder(x))
         return z, {r: h(z) for r, h in self.heads.items()}
 
 
@@ -347,6 +348,13 @@ def main():
                     default="resnet",
                     help="encoder: CNN (proven FCGR default) or ViT "
                          "(global attention over quadtree, PCVR-style)")
+    ap.add_argument("--dropout", type=float, default=0.0,
+                    help="dropout on the encoder latent before heads")
+    ap.add_argument("--label-smoothing", type=float, default=0.0,
+                    help="CE label smoothing; keeps softmax confidence "
+                         "honest for the abstention metric")
+    ap.add_argument("--wd", type=float, default=1e-4,
+                    help="AdamW weight decay (default 1e-4)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cpu", action="store_true")
     args = ap.parse_args()
@@ -411,9 +419,9 @@ def main():
     model = OmniPhyl(n_classes, args.width,
                      cin=3 if args.pos_channels else 1,
                      backbone=args.backbone, side=1 << args.k,
-                     targets=all_targets).to(device)
+                     targets=all_targets, dropout=args.dropout).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                            weight_decay=1e-4)
+                            weight_decay=args.wd)
     steps = len(train_ld) * args.epochs
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / steps)))
@@ -435,7 +443,8 @@ def main():
                 # cross_entropy(ignore_index=0) returns NaN there (val
                 # batches whose rank labels are entirely out-of-vocab)
                 terms = [F.cross_entropy(logits[t], y[:, i],
-                                         ignore_index=0)
+                                         ignore_index=0,
+                                         label_smoothing=args.label_smoothing)
                          for i, t in enumerate(cls_targets)
                          if (y[:, i] != 0).any()]
                 fm = yc[:, 0] >= 0          # coding_frac label present
