@@ -40,6 +40,7 @@ BOUNDARY_FRAC="${BOUNDARY_FRAC:-0.3}"
 ONE_PER_RANK="${ONE_PER_RANK:-}"
 PER_RANK_N="${PER_RANK_N:-1}"  # assemblies kept per rank value
 VEUPATH="${VEUPATH:-1}"
+REQUIRE_GFF="${REQUIRE_GFF:-0}"  # 1 = drop assemblies lacking RefSeq GFF
 K="${K:-7}"
 WIDTH="${WIDTH:-64}"
 EPOCHS="${EPOCHS:-30}"
@@ -72,12 +73,14 @@ VEUPATH_FLAG=""
 [ "$VEUPATH" = 1 ] && VEUPATH_FLAG="--veupath"
 RANK_FLAG=""
 [ -n "$ONE_PER_RANK" ] && RANK_FLAG="--one-per-rank $ONE_PER_RANK --per-rank-n $PER_RANK_N"
+GFF_FLAG=""
+[ "$REQUIRE_GFF" = 1 ] && GFF_FLAG="--require-gff"
 # shellcheck disable=SC2086
 python3 scripts/fetch_refseq_corpus.py --outdir "$DATA" \
     --groups $GROUPS --levels "$LEVELS" \
     --nt-budget "$NT_BUDGET" --frag-len-min "$FRAG_LEN" \
     --frag-len-max "$FRAG_LEN" --boundary-frac "$BOUNDARY_FRAC" \
-    $VEUPATH_FLAG $RANK_FLAG --workers 8
+    $VEUPATH_FLAG $RANK_FLAG $GFF_FLAG --workers 8
 
 # --- train ------------------------------------------------------------------
 RUN="$WORKDIR/run"

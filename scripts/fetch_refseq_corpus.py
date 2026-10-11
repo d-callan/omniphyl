@@ -154,8 +154,13 @@ def select_assemblies(rows: list[dict], levels: set[str],
                       workers: int,
                       tax_resolver=None,
                       cache: Path | None = None,
-                      per_rank_n: int = 1) -> list[dict]:
-    """Filter to eligible assemblies, HEAD-check for GFF, then sample.
+                      per_rank_n: int = 1,
+                      require_gff: bool = True) -> list[dict]:
+    """Filter to eligible assemblies, then sample.
+
+    require_gff gates a HEAD sweep dropping picks without a RefSeq GFF;
+    with it off, picks are taken directly and GFF-missing genomes train
+    with annotation labels masked (taxonomy labels unaffected).
 
     With one_per_rank set (e.g. 'phylum'): resolve each candidate's
     species_taxid through rankedlineage.dmp (downloaded once into cache)
@@ -235,10 +240,14 @@ def select_assemblies(rows: list[dict], levels: set[str],
                     break
         return got
 
-    # GFF HEAD checks in parallel over picks (or all rows ungrouped)
-    print(f"  checking GFF availability for {len(candidates)} picks ...")
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        picks = list(ex.map(lambda c: members_with_gff(c[1]), candidates))
+    if require_gff:
+        # GFF HEAD checks in parallel over picks (or all rows ungrouped)
+        print(f"  checking GFF availability for {len(candidates)} picks ...")
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            picks = list(ex.map(lambda c: members_with_gff(c[1]),
+                                candidates))
+    else:
+        picks = [grp[:per_rank_n] for _, grp in candidates]
     keep = []
     for (key, grp), got in zip(candidates, picks):
         if not got:
@@ -253,7 +262,8 @@ def select_assemblies(rows: list[dict], levels: set[str],
     return keep
 
 
-def fetch_fasta_and_gff(row: dict, dest_dir: Path) -> tuple[Path, Path]:
+def fetch_fasta_and_gff(row: dict, dest_dir: Path,
+                        require_gff: bool = True):
     ftp_dir = row["ftp_path"].replace("ftp://", "https://").rstrip("/")
     name = ftp_dir.rsplit("/", 1)[-1]
     acc = row["assembly_accession"]
@@ -262,7 +272,12 @@ def fetch_fasta_and_gff(row: dict, dest_dir: Path) -> tuple[Path, Path]:
     if not fna.exists():
         download(f"{ftp_dir}/{name}_genomic.fna.gz", fna)
     if not gff.exists():
-        download(f"{ftp_dir}/{name}_genomic.gff.gz", gff)
+        try:
+            download(f"{ftp_dir}/{name}_genomic.gff.gz", gff)
+        except Exception:
+            if require_gff:
+                raise
+            gff = None
     return fna, gff
 
 
@@ -577,6 +592,9 @@ def main():
     ap.add_argument("--per-rank-n", type=int, default=1,
                     help="assemblies to keep per rank value (default 1); "
                          "N>1 lets held-out genomes share rank vocabulary")
+    ap.add_argument("--require-gff", action="store_true",
+                    help="drop assemblies lacking a RefSeq GFF; default keeps "
+                         "them with annotation labels masked")
     ap.add_argument("--nt-budget", type=int, default=100_000,
                     help="nucleotide budget per assembly (total bases sampled); "
                          "size-normalises fragment counts across genome sizes")
@@ -610,14 +628,16 @@ def main():
         sel = select_assemblies(rows, levels, args.one_per_rank,
                                 rng, skipped, args.workers,
                                 tax_resolver=resolve_taxonomy,
-                                cache=cache, per_rank_n=args.per_rank_n)
+                                cache=cache, per_rank_n=args.per_rank_n,
+                                require_gff=args.require_gff)
         print(f"{g}: {len(rows)} assemblies -> {len(sel)} selected "
               f"(after GFF filter)")
         selected.extend(sel)
 
     # 3. download FASTAs + GFFs (parallel)
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(fetch_fasta_and_gff, r, gdir): r for r in selected}
+        futs = {ex.submit(fetch_fasta_and_gff, r, gdir, args.require_gff): r
+                for r in selected}
         ok = []
         for i, fut in enumerate(as_completed(futs), 1):
             row = futs[fut]
@@ -655,8 +675,9 @@ def main():
                    if args.veupath else None)
             alias_groups = (load_chrom_alias(row["assembly_accession"], cache)
                             if veu else {})
-            label_source = "veupathdb" if veu else "refseq_gff"
-            cds = load_gff_cds(row["_gff"])
+            label_source = ("veupathdb" if veu else
+                            "refseq_gff" if row["_gff"] else "none")
+            cds = load_gff_cds(row["_gff"]) if row["_gff"] else {}
             n_veu_unmatched = 0
             # --nt-budget is per ACCESSION; each seqid draws a
             # length-proportional share so every nucleotide position is
