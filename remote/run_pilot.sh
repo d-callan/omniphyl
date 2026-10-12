@@ -35,6 +35,7 @@ OUTDIR="${OUTDIR:-$PWD/output}"
 GROUPS="${GROUPS:-bacteria viral}"
 LEVELS="${LEVELS:-Complete Genome,Chromosome}"
 NT_BUDGET="${NT_BUDGET:-100000}"
+GROUP_NT_TOTAL="${GROUP_NT_TOTAL:-0}"  # >0 = equal total nt per group, overrides NT_BUDGET
 FRAG_LEN="${FRAG_LEN:-500}"
 BOUNDARY_FRAC="${BOUNDARY_FRAC:-0.3}"
 ONE_PER_RANK="${ONE_PER_RANK:-}"
@@ -78,12 +79,14 @@ RANK_FLAG=""
 [ -n "$ONE_PER_RANK" ] && RANK_FLAG="--one-per-rank $ONE_PER_RANK --per-rank-n $PER_RANK_N"
 GFF_FLAG=""
 [ "$REQUIRE_GFF" = 1 ] && GFF_FLAG="--require-gff"
+GBUDGET_FLAG=""
+[ "$GROUP_NT_TOTAL" != 0 ] && GBUDGET_FLAG="--group-nt-total $GROUP_NT_TOTAL"
 # shellcheck disable=SC2086
 python3 scripts/fetch_refseq_corpus.py --outdir "$DATA" \
     --groups $GROUPS --levels "$LEVELS" \
     --nt-budget "$NT_BUDGET" --frag-len-min "$FRAG_LEN" \
     --frag-len-max "$FRAG_LEN" --boundary-frac "$BOUNDARY_FRAC" \
-    $VEUPATH_FLAG $RANK_FLAG $GFF_FLAG --workers 8
+    $VEUPATH_FLAG $RANK_FLAG $GFF_FLAG $GBUDGET_FLAG --workers 8
 
 # --- train ------------------------------------------------------------------
 RUN="$WORKDIR/run"

@@ -598,6 +598,12 @@ def main():
     ap.add_argument("--nt-budget", type=int, default=100_000,
                     help="nucleotide budget per assembly (total bases sampled); "
                          "size-normalises fragment counts across genome sizes")
+    ap.add_argument("--group-nt-total", type=int, default=0,
+                    help="if >0, overrides --nt-budget: this total nucleotide "
+                         "budget is split EVENLY across each group's selected "
+                         "assemblies, so every group contributes equal bases "
+                         "(sparse groups get deep per-genome coverage, "
+                         "dominant groups thin)")
     ap.add_argument("--frag-len-min", type=int, default=500)
     ap.add_argument("--frag-len-max", type=int, default=500)
     ap.add_argument("--max-amb-frac", type=float, default=0.05)
@@ -630,8 +636,11 @@ def main():
                                 tax_resolver=resolve_taxonomy,
                                 cache=cache, per_rank_n=args.per_rank_n,
                                 require_gff=args.require_gff)
-        print(f"{g}: {len(rows)} assemblies -> {len(sel)} selected "
-              f"(after GFF filter)")
+        if args.group_nt_total and sel:
+            for r in sel:
+                r["_nt_budget"] = args.group_nt_total // len(sel)
+        tag = "GFF required" if args.require_gff else "GFF optional"
+        print(f"{g}: {len(rows)} assemblies -> {len(sel)} selected ({tag})")
         selected.extend(sel)
 
     # 3. download FASTAs + GFFs (parallel)
@@ -685,7 +694,8 @@ def main():
             seq_lens = {s: len(q) for s, q in iter_fasta_gz(row["_fasta"])}
             total_len = sum(seq_lens.values())
             for seqid, seq in iter_fasta_gz(row["_fasta"]):
-                seq_budget = round(args.nt_budget * len(seq) / total_len)
+                acc_budget = row.get("_nt_budget", args.nt_budget)
+                seq_budget = round(acc_budget * len(seq) / total_len)
                 if veu:
                     iv = veupath_intervals(veu, alias_groups, seqid)
                     if iv is None:
