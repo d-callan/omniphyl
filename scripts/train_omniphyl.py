@@ -127,18 +127,39 @@ def fcgr_encode(seq: str, k: int, lut: np.ndarray,
     return out
 
 
+def seq_encode(seq: str, seq_len: int,
+               perm: np.ndarray | None = None) -> np.ndarray:
+    """sequence -> one-hot tensor [4, seq_len] float32; N -> all-zero col.
+
+    Perm is a 4-digit base remap (same augmentation semantics as the FCGR
+    vertex permute).
+    """
+    out = np.zeros((4, seq_len), dtype=np.float32)
+    codes = BASE2DIGIT[np.frombuffer(seq.encode("ascii", "replace"),
+                                     dtype=np.uint8)]
+    if perm is not None:
+        codes = np.where(codes >= 0, perm[np.clip(codes, 0, 3)], -1)
+    n = min(len(codes), seq_len)
+    idx = np.nonzero(codes[:n] >= 0)[0]
+    out[codes[:n][idx], idx] = 1.0
+    return out
+
+
 class FragmentDataset(Dataset):
     """Line-offset-indexed FASTA -> (FCGR tensor, per-target label ids)."""
 
     def __init__(self, fasta: Path, labels: dict[str, dict], k: int,
                  lut: np.ndarray, augment: bool = False, pos: bool = False,
                  targets: list[str] | None = None,
-                 cont: dict[str, tuple] | None = None):
+                 cont: dict[str, tuple] | None = None,
+                 seq: bool = False, seq_len: int = 500):
         self.fasta = Path(fasta)
         self.k = k
         self.lut = lut
         self.augment = augment
         self.pos = pos
+        self.seq = seq
+        self.seq_len = seq_len
         self.labels = labels  # frag_id -> {target: int}
         self.cont = cont or {}  # frag_id -> (coding_frac, boundary_offset)
         self.ids = list(labels.keys())
@@ -182,8 +203,9 @@ class FragmentDataset(Dataset):
     def __getitem__(self, i):
         fid = self.ids[i]
         perm = np.random.permutation(4) if self.augment else None
-        img = fcgr_encode(self._read_seq(fid), self.k, self.lut, perm,
-                          self.pos)
+        s = self._read_seq(fid)
+        img = (seq_encode(s, self.seq_len, perm) if self.seq
+               else fcgr_encode(s, self.k, self.lut, perm, self.pos))
         lab = np.array([self.labels[fid].get(t, 0) for t in self.targets],
                        dtype=np.int64)
         c = self.cont.get(fid, (-1.0, -1.0))  # -1 = unlabeled/missing
@@ -209,10 +231,11 @@ class Block(nn.Module):
 
 
 class ResNetEncoder(nn.Module):
-    def __init__(self, cin: int, width: int):
+    def __init__(self, cin: int, width: int, stem_stride: int = 2):
         super().__init__()
-        self.stem = nn.Sequential(nn.Conv2d(cin, width, 5, 2, 2, bias=False),
-                                  nn.BatchNorm2d(width), nn.ReLU())
+        self.stem = nn.Sequential(
+            nn.Conv2d(cin, width, 5, stem_stride, 2, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU())
         self.stages = nn.Sequential(
             Block(width, width), Block(width, width),
             Block(width, width * 2, 2), Block(width * 2, width * 2),
@@ -223,6 +246,37 @@ class ResNetEncoder(nn.Module):
 
     def forward(self, x):
         return self.stages(self.stem(x)).mean(dim=(2, 3))
+
+
+class SeqEncoder(nn.Module):
+    """1D CNN over one-hot bases -- keeps motif + positional info the FCGR
+    composition histogram discards.
+
+    Global mean+max concat pooling: mean carries broad compositional
+    signal, max carries presence of discriminative motifs anywhere in the
+    window.
+    """
+
+    def __init__(self, width: int):
+        super().__init__()
+
+        def blk(i, o, s=1):
+            return nn.Sequential(nn.Conv1d(i, o, 9, s, 4, bias=False),
+                                 nn.BatchNorm1d(o), nn.ReLU())
+
+        self.net = nn.Sequential(
+            blk(4, width),
+            blk(width, width * 2, 2),
+            blk(width * 2, width * 2),
+            blk(width * 2, width * 4, 2),
+            blk(width * 4, width * 4),
+            blk(width * 4, width * 8, 2),
+        )
+        self.latent = width * 8 * 2
+
+    def forward(self, x):
+        h = self.net(x)
+        return torch.cat([h.mean(2), h.amax(2)], dim=1)
 
 
 class ViTEncoder(nn.Module):
@@ -256,10 +310,15 @@ class ViTEncoder(nn.Module):
 class OmniPhyl(nn.Module):
     def __init__(self, n_classes: dict[str, int], width: int = 64,
                  cin: int = 1, backbone: str = "resnet", side: int = 128,
-                 targets: list[str] | None = None, dropout: float = 0.0):
+                 targets: list[str] | None = None, dropout: float = 0.0,
+                 stem_stride: int = 2):
         super().__init__()
-        self.encoder = (ViTEncoder(cin, side, dim=width * 4)
-                        if backbone == "vit" else ResNetEncoder(cin, width))
+        if backbone == "vit":
+            self.encoder = ViTEncoder(cin, side, dim=width * 4)
+        elif backbone == "seq":
+            self.encoder = SeqEncoder(width)
+        else:
+            self.encoder = ResNetEncoder(cin, width, stem_stride)
         self.latent = self.encoder.latent
         self.drop = nn.Dropout(dropout)
         keys = targets if targets is not None else list(n_classes.keys())
@@ -344,10 +403,18 @@ def main():
     ap.add_argument("--pos-channels", action="store_true",
                     help="add mean-CGR-(x,y) channels per cell "
                          "(PhageCGRNet positional features)")
-    ap.add_argument("--backbone", choices=["resnet", "vit"],
+    ap.add_argument("--backbone", choices=["resnet", "vit", "seq"],
                     default="resnet",
-                    help="encoder: CNN (proven FCGR default) or ViT "
-                         "(global attention over quadtree, PCVR-style)")
+                    help="encoder: resnet=FCGR CNN (default), vit=FCGR "
+                         "global attention, seq=1D CNN over one-hot bases "
+                         "(keeps motif/positional info FCGR discards)")
+    ap.add_argument("--stem-stride", type=int, default=2,
+                    help="resnet stem conv stride; 1 keeps full FCGR "
+                         "resolution (stride-2 merges each k-mer's "
+                         "terminal-base digit on both grid axes)")
+    ap.add_argument("--seq-len", type=int, default=500,
+                    help="pad/truncate fragments to this length for "
+                         "--backbone seq")
     ap.add_argument("--dropout", type=float, default=0.0,
                     help="dropout on the encoder latent before heads")
     ap.add_argument("--label-smoothing", type=float, default=0.0,
@@ -402,14 +469,17 @@ def main():
     cont_train = encode_cont_labels(train_meta)
     cont_val = encode_cont_labels(val_meta)
 
+    use_seq = args.backbone == "seq"
     train_ds = FragmentDataset(args.fragments, encode_labels(train_meta),
                                args.k, lut,
                                augment=args.vertex_permute_augment,
                                pos=args.pos_channels,
-                               targets=cls_targets, cont=cont_train)
+                               targets=cls_targets, cont=cont_train,
+                               seq=use_seq, seq_len=args.seq_len)
     val_ds = FragmentDataset(args.fragments, encode_labels(val_meta),
                              args.k, lut, pos=args.pos_channels,
-                             targets=cls_targets, cont=cont_val)
+                             targets=cls_targets, cont=cont_val,
+                             seq=use_seq, seq_len=args.seq_len)
     train_ld = DataLoader(train_ds, args.batch_size, shuffle=True,
                           num_workers=args.num_workers, drop_last=True,
                           persistent_workers=args.num_workers > 0)
@@ -419,7 +489,8 @@ def main():
     model = OmniPhyl(n_classes, args.width,
                      cin=3 if args.pos_channels else 1,
                      backbone=args.backbone, side=1 << args.k,
-                     targets=all_targets, dropout=args.dropout).to(device)
+                     targets=all_targets, dropout=args.dropout,
+                     stem_stride=args.stem_stride).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.wd)
     steps = len(train_ld) * args.epochs

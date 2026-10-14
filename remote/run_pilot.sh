@@ -51,6 +51,8 @@ VAL_FRAC="${VAL_FRAC:-0.1}"
 DROPOUT="${DROPOUT:-0}"
 LABEL_SMOOTHING="${LABEL_SMOOTHING:-0}"
 WD="${WD:-1e-4}"
+BACKBONE="${BACKBONE:-resnet}"      # resnet | vit | seq
+STEM_STRIDE="${STEM_STRIDE:-2}"     # 1 = full-res FCGR stem
 SMOKE="${SMOKE:-1}"
 
 mkdir -p "$WORKDIR" "$OUTDIR"
@@ -97,6 +99,8 @@ python3 scripts/train_omniphyl.py \
     --out "$RUN" --k "$K" --width "$WIDTH" --epochs "$EPOCHS" \
     --batch-size "$BATCH" --val-frac "$VAL_FRAC" \
     --dropout "$DROPOUT" --label-smoothing "$LABEL_SMOOTHING" --wd "$WD" \
+    --backbone "$BACKBONE" --stem-stride "$STEM_STRIDE" \
+    --seq-len "$FRAG_LEN" \
     $POS_FLAG
 
 # --- eval + bundle ----------------------------------------------------------
