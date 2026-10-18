@@ -44,8 +44,8 @@ os.environ.setdefault("SKIP_FETCH", "1")
 os.environ.setdefault("CORPUS_DIR", CORPUS)
 # --- arm config -------------------------------------------------------
 os.environ.setdefault("AUX", "hash,aa")      # A3: 11-mer bag + AA 3-mer
-# BACKBONE inherits A2's msfcgr only if A2 clears its gate; resnet until then
-os.environ.setdefault("HEAD", "flat")     # A0 control; A1 -> "tree"
+os.environ.setdefault("BACKBONE", "msfcgr")  # A2 winner (cleared gate)
+os.environ.setdefault("HEAD", "tree")        # A1 winner (cleared gate)
 os.environ.setdefault("PRIOR_TAU", "1.0")
 os.environ.setdefault("EPOCHS", "10")
 os.environ.setdefault("WIDTH", "32")
