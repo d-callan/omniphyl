@@ -10,9 +10,11 @@ Per-arm config lives in the os.environ block below.  Clone this dir per arm
 (A0 flat / A1 tree / ...), flip HEAD or other knobs, push as its own slug.
 """
 
+import glob
 import os
 import socket
 import subprocess
+import sys
 
 try:
     socket.create_connection(("github.com", 443), timeout=10)
@@ -22,10 +24,18 @@ except OSError:
         "kaggle.com/settings (required for internet + GPU), then re-push.")
 
 WORK = "/kaggle/working"
-CORPUS = "/kaggle/input/omniphyl-5group-mini-corpus"
-for f in ("fragments.fna", "labels.tsv"):
-    if not os.path.exists(f"{CORPUS}/{f}"):
-        raise SystemExit(f"missing {CORPUS}/{f} — corpus dataset not mounted?")
+# dataset_sources mount under /kaggle/input/datasets/<user>/<slug> on
+# script kernels (not /kaggle/input/<slug>) — locate it by content.
+hits = glob.glob("/kaggle/input/**/fragments.fna", recursive=True)
+if not hits:
+    print("/kaggle/input contents:", file=sys.stderr)
+    for root, dirs, files in os.walk("/kaggle/input"):
+        print(f"  {root}: {dirs} {files}", file=sys.stderr)
+    raise SystemExit("no fragments.fna under /kaggle/input — "
+                     "corpus dataset not mounted?")
+CORPUS = os.path.dirname(hits[0])
+if not os.path.exists(f"{CORPUS}/labels.tsv"):
+    raise SystemExit(f"missing labels.tsv next to {hits[0]}")
 print(f"corpus mount: {CORPUS}: {sorted(os.listdir(CORPUS))}")
 
 os.environ.setdefault("WORKDIR", f"{WORK}/omniphyl-work")
