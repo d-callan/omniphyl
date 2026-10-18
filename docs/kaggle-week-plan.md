@@ -68,6 +68,34 @@ Order follows the proposal's ablation ladder, re-sorted so the highest-informati
 
 **Guardrail:** one variable per arm. If A2 underperforms, we learn "multi-scale/RC hurts" — not "the whole proposal is wrong". Arms A1–A3 are cumulative *only after* each individually clears its gate; otherwise they're independent vs A0.
 
+### Arm results — 5group-mini corpus (2,874 genomes, 63,372 screened frags)
+
+**A0 (flat)** — kernel `omniphyl-a0-flat` v2, `~/omniphyl-work/a0_out/`:
+
+| rank | frag acc | macro-F1 | consensus (all frags) |
+|---|---|---|---|
+| domain | 0.662 | 0.266 | 0.768 |
+| phylum | 0.531 | 0.035 | 0.624 |
+| class | 0.492 | 0.015 | 0.553 |
+| order | 0.135 | 0.010 | 0.172 |
+| family–species | n=0 (no in-vocab val labels) | — | — |
+
+Collapse check (predicted-class entropy from `predictions.tsv`): phylum H=1.72 nats, Uroviricota takes 50.8% of all phylum calls — the v4 collapse is reproduced on the frozen corpus.
+
+**A1 (tree head)** — kernel `omniphyl-a1-tree` v5. First read looked catastrophic (val domain 0.19, deep ranks 0.000), but that was an **eval artifact, not a training failure**: the head is trained so `softmax(logits + τ·log ν) = P(y)` with `PRIOR_TAU=1.0`, while the evaluator computed marginals at τ=0 — i.e. argmax over `P/ν` odds-over-prior ratios, which systematically inflates rare taxa (9,820 Bacteria frags called *Singelaviria*; a rare chytrid lineage took 61.6% of genus calls). Re-running eval with `--infer-tau 1.0` (MAP, `f6eceba` — now the default for tree ckpts) on the same `best.pt`:
+
+| rank | frag acc | macro-F1 | consensus |
+|---|---|---|---|
+| domain | **0.873** | **0.482** | **0.928** |
+| phylum | **0.665** | **0.104** | **0.713** |
+| class | 0.504 | 0.041 | 0.523 |
+| order | 0.118 | 0.016 | 0.101 |
+| family | 0.056 | 0.005 | 0.079 |
+| genus | 0.034 | 0.003 | 0.049 |
+| species | 0.040 | 0.003 | 0.052 |
+
+**Gate: passed.** Phylum macro-F1 3× A0, domain ~2×, class ~3×; phylum entropy 1.72→2.12 with Uroviricota top-share 50.8→41.5 (collapse undone); calibration also improves (domain ECE 0.31→0.07). Family macro-F1 is formally unevaluable for A0 (n=0 on val) but the macro-F1 trend favors the tree head at every comparable rank. Deep-rank *accuracy* stays low on held-out genera — expected: those classes are unseen by construction. A1 ships to scale; tree head becomes the default for cumulative arms pending A2's backbone verdict.
+
 ---
 
 ## 3. Step 0 — free analysis before any GPU spend (local, day 1)
