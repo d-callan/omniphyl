@@ -459,7 +459,9 @@ class TreeRankHead(nn.Module):
         """log P(c | parent(c), z) for classes 1..C-1 as a [B, C-1] tensor."""
         zn = F.normalize(z, dim=1)
         w = F.normalize(self.proto, dim=1)
-        lg = self.scale * (zn @ w.T)
+        # fp32: bf16 under autocast breaks scatter_add_ (exp is autocast to
+        # fp32) and is too coarse for the logsumexp below anyway
+        lg = (self.scale * (zn @ w.T)).float()
         if tau:
             lg = lg + tau * self.log_prior[1:]
         pidx = self.parent_of[1:].expand(lg.size(0), -1)
