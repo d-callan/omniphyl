@@ -1,23 +1,18 @@
 """Kaggle kernel entrypoint: ablation arm on the frozen 5group-mini corpus.
 
-Mounts the fetch kernel's output (omniphyl-corpus-*.tar.gz) as a dataset
-source, extracts it, and runs remote/run_pilot.sh with SKIP_FETCH=1 —
-every arm trains on identical fragments/labels; only env knobs differ.
+Mounts the daniellecallan/omniphyl-5group-mini-corpus dataset (Kaggle
+unpacks the uploaded tarball on ingest, so the mount is a plain dir of
+fragments.fna/labels.tsv/manifest.json) and runs remote/run_pilot.sh
+with SKIP_FETCH=1 — every arm trains on identical fragments/labels;
+only env knobs differ.
 
 Per-arm config lives in the os.environ block below.  Clone this dir per arm
 (A0 flat / A1 tree / ...), flip HEAD or other knobs, push as its own slug.
-
-Requires the fetch kernel's output to have been promoted to the
-daniellecallan/omniphyl-5group-mini-corpus dataset (pull the tarball with
-`kaggle kernels output`, then `kaggle datasets create` on it — same path
-as the v4 corpus dataset).
 """
 
-import glob
 import os
 import socket
 import subprocess
-import tarfile
 
 try:
     socket.create_connection(("github.com", 443), timeout=10)
@@ -27,20 +22,11 @@ except OSError:
         "kaggle.com/settings (required for internet + GPU), then re-push.")
 
 WORK = "/kaggle/working"
-CORPUS = f"{WORK}/corpus"
-
-# --- extract the frozen corpus tarball mounted from the corpus dataset ---
-tarballs = sorted(
-    glob.glob("/kaggle/input/omniphyl-5group-mini-corpus/*.tar.gz"))
-if not tarballs:
-    raise SystemExit(
-        "no omniphyl-corpus-*.tar.gz under "
-        "/kaggle/input/omniphyl-5group-mini-corpus — promote the fetch "
-        "kernel's output to that dataset first")
-os.makedirs(CORPUS, exist_ok=True)
-with tarfile.open(tarballs[-1]) as tf:  # newest if several
-    tf.extractall(CORPUS)
-print(f"extracted {tarballs[-1]} -> {CORPUS}: {sorted(os.listdir(CORPUS))}")
+CORPUS = "/kaggle/input/omniphyl-5group-mini-corpus"
+for f in ("fragments.fna", "labels.tsv"):
+    if not os.path.exists(f"{CORPUS}/{f}"):
+        raise SystemExit(f"missing {CORPUS}/{f} — corpus dataset not mounted?")
+print(f"corpus mount: {CORPUS}: {sorted(os.listdir(CORPUS))}")
 
 os.environ.setdefault("WORKDIR", f"{WORK}/omniphyl-work")
 os.environ.setdefault("OUTDIR", WORK)
