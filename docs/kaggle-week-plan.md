@@ -92,6 +92,22 @@ Collapse check (predicted-class entropy): phylum H 1.72→2.12 nats, Uroviricota
 
 **Design implication — mechanism is parent-gating, not weak deep heads.** Two hypotheses were on the table: (a) chained-marginal error compounding, (b) thin deep-rank supervision. Stratifying val frags by true-class training support goes the wrong way for (b) — A1's order deficit *grows* to −0.18 on classes with ≥300 train frags. Conditioning on parent-call correctness resolves it: when A1's parent call is right, genus acc is **1.000** (n=174) and species 0.79; when wrong, ~0 at every rank. The deep heads are sharp inside the chain; the regression is wrong-ancestor lock-out — deep marginals inherit the parent's log-mass, so a parent miss zeroes the child's chance. Parent accuracy decays down the tree → compounding ceiling that only *correlates* with supervision density. Options like beam marginals or per-rank ensembling of conditional+marginal exist, but the cheap discriminating test is still scale: v4's parent accuracies should be higher, which mechanically lifts every rank under the chain. No architecture change until A5 reads.
 
+**A2 (msfcgr backbone, flat head)** — kernel `omniphyl-a2-msfcgr` v1, same-inputs eval vs A0:
+
+| rank | A0 acc | A2 acc | A0 macro-F1 | A2 macro-F1 | A0 consensus | A2 consensus |
+|---|---|---|---|---|---|---|
+| domain | 0.755 | **0.794** | 0.373 | **0.418** | 0.841 | **0.873** |
+| phylum | 0.539 | **0.597** | 0.051 | **0.074** | 0.603 | **0.647** |
+| class | 0.501 | **0.557** | 0.028 | **0.046** | 0.566 | **0.621** |
+| order | 0.173 | **0.253** | 0.018 | **0.033** | 0.230 | **0.302** |
+| family | 0.120 | **0.189** | 0.013 | **0.020** | 0.205 | **0.472** |
+| genus | 0.095 | **0.152** | 0.010 | **0.016** | 0.238 | **0.447** |
+| species | 0.095 | **0.164** | 0.010 | **0.018** | 0.218 | **0.422** |
+
+**Gate: passed** — order frag acc +8.0 pts exactly the target; every rank and metric improves, no trade-off. The deep-rank *consensus* gains are the headline: family 0.21→0.47, genus 0.24→0.45, species 0.22→0.42 — nearly 2× where single-scale RC-unaware FCGRs saturate. Mechanistically consistent with the proposal: RC canonicalization halves the input space (same function, 2× effective data per motif), k=4/5/6 channels restore dense compositional signal the sparse k=7 grid misses, and quadtree-aligned convs stop merging the most discriminative terminal-base digit. Wins at family+ show up in consensus before frag acc because consensus voting needs the *rank distribution* to sharpen, not the argmax.
+
+**A1 vs A2 are complementary:** tree head wins shallow (dom .873/.928 cons, phy .665/.713) via prior-sibling structure but locks out on parent misses; msfcgr wins deep via representation (genus cons .45 vs .05). Both gates cleared → cumulative arms stack them: A3 = msfcgr + tree + aux(hash,aa), pushed as `omniphyl-a3-aux` v1.
+
 ---
 
 ## 3. Step 0 — free analysis before any GPU spend (local, day 1)
