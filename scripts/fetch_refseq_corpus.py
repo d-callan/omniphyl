@@ -22,8 +22,8 @@ Zero-dependency (stdlib only). Steps:
      RefSeq GFF. `label_source` records which tier produced each row.
 
 Outputs in --outdir:
-  genomes/<accession>.fna.gz     downloaded assemblies
-  genomes/<accession>.gff.gz     downloaded GFF annotations
+  genomes/<accession>.fna.gz     transient: deleted after slicing
+  genomes/<accession>.gff.gz     transient: deleted after slicing
   fragments.fna                  simulated fragments
   labels.tsv                     frag_id, accession, seqid, start, end,
                                  length, taxid, group, coding,
@@ -53,6 +53,7 @@ Usage:
 """
 import argparse
 import csv
+import errno
 import gzip
 import io
 import json
@@ -104,6 +105,9 @@ def download(url: str, dest: Path, retries: int = 3, timeout: int = 300) -> Path
             part.replace(dest)  # atomic: never leave a truncated cache
             return dest
         except Exception as e:
+            # a full disk can't be fixed by retrying; fail fast
+            if getattr(e, "errno", None) == errno.ENOSPC:
+                raise
             if attempt == retries - 1:
                 raise
             wait = 2 ** attempt * 5
@@ -610,6 +614,69 @@ def resolve_taxonomy(taxids: set[str], cache: Path) -> dict:
     return out
 
 
+def slice_assembly(row: dict, gdir: Path, args, cache: Path):
+    """Fetch one assembly, slice its nt-budgeted fragments, delete sources.
+
+    Genome FASTAs/GFFs are transient per accession: nothing downstream
+    reads genomes/, and hoarding thousands of assemblies overflows the
+    ~20GB /kaggle/working quota.  Returns
+    (row, label_source, [(seqid, s, e, frag, stats)], n_veu_unmatched).
+    Each accession seeds its own rng (f"{seed}:{acc}") so fragment draws
+    are independent of selection order and worker scheduling.
+    """
+    acc = row["assembly_accession"]
+    try:
+        fna, gff = fetch_fasta_and_gff(row, gdir, args.require_gff)
+        veu = (fetch_veupathdb_cds(acc, cache) if args.veupath else None)
+        alias_groups = load_chrom_alias(acc, cache) if veu else {}
+        label_source = ("veupathdb" if veu else
+                        "refseq_gff" if gff else "none")
+        cds = load_gff_cds(gff) if gff else {}
+        rng = random.Random(f"{args.seed}:{acc}")
+        acc_budget = row.get("_nt_budget", args.nt_budget)
+        # --nt-budget is per ACCESSION; each seqid draws a
+        # length-proportional share so every nucleotide position is
+        # equally likely to be sampled regardless of contig count.
+        seq_lens = {s: len(q) for s, q in iter_fasta_gz(fna)}
+        total_len = sum(seq_lens.values())
+        frags = []
+        n_veu_unmatched = 0
+        for seqid, seq in iter_fasta_gz(fna):
+            seq_budget = round(acc_budget * len(seq) / total_len)
+            if veu:
+                iv = veupath_intervals(veu, alias_groups, seqid)
+                if iv is None:
+                    n_veu_unmatched += 1
+                    stats_of = lambda s, e: None
+                else:
+                    stats_of = lambda s, e: coding_stats_iv(iv, s, e)
+            else:
+                stats_of = lambda s, e: coding_stats(seqid, s, e, cds)
+            cands = [(s, e, frag, stats_of(s, e))
+                     for s, e, frag in slice_fragments(
+                         seq, args.frag_len_min, args.frag_len_max,
+                         seq_budget, args.max_amb_frac, rng)]
+            # Boundary stratification: mixed windows (0 < frac < 1) are
+            # rare under uniform sampling but carry the candidacy signal;
+            # subsample each bucket to hit --boundary-frac.
+            if args.boundary_frac > 0:
+                mixed = [c for c in cands
+                         if c[3] is not None and 0 < c[3][0] < 1]
+                pure = [c for c in cands
+                        if c[3] is None or not 0 < c[3][0] < 1]
+                n_b = min(len(mixed),
+                          round(args.boundary_frac * len(cands)))
+                n_nb = min(len(pure), len(cands) - n_b)
+                cands = rng.sample(mixed, n_b) + rng.sample(pure, n_nb)
+            frags.extend((seqid, s, e, frag, stats)
+                         for s, e, frag, stats in cands)
+        return row, label_source, frags, n_veu_unmatched
+    finally:
+        for name in (f"{acc}.fna.gz", f"{acc}.fna.gz.part",
+                     f"{acc}.gff.gz", f"{acc}.gff.gz.part"):
+            (gdir / name).unlink(missing_ok=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -719,31 +786,35 @@ def main():
               + f" ({tag})")
         selected.extend(sel)
 
-    # 3. download FASTAs + GFFs (parallel)
+    # 3. taxonomy labels (resolved for all selected upfront so the
+    #    per-accession workers return fully-labelled records)
+    taxids = {r["species_taxid"] for r in selected
+              if r.get("species_taxid")}
+    tax_map = resolve_taxonomy(taxids, cache)
+
+    # 4. fetch + fragment (parallel); results buffered by selection index
+    #    so fragments/labels are written in deterministic order
+    results = {}  # i -> (row, label_source, frags, n_veu_unmatched)
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(fetch_fasta_and_gff, r, gdir, args.require_gff): r
-                for r in selected}
-        ok = []
-        for i, fut in enumerate(as_completed(futs), 1):
-            row = futs[fut]
+        futs = {ex.submit(slice_assembly, r, gdir, args, cache): i
+                for i, r in enumerate(selected)}
+        for n_done, fut in enumerate(as_completed(futs), 1):
+            i = futs[fut]
+            row = selected[i]
             try:
-                row["_fasta"], row["_gff"] = fut.result()
-                ok.append(row)
+                results[i] = fut.result()
             except Exception as e:
                 print(f"  FAILED {row['assembly_accession']}: {e}",
                       file=sys.stderr)
                 skipped.append({"accession": row["assembly_accession"],
                                 "group": row["group"],
-                                "reason": f"download_error: {e}"})
-            if i % max(1, len(selected) // 20) == 0:
-                print(f"  downloaded {i}/{len(selected)}")
-    print(f"downloaded {len(ok)}/{len(selected)} genomes")
+                                "reason": f"fetch_error: {e}"})
+            if n_done % max(1, len(selected) // 20) == 0:
+                print(f"  processed {n_done}/{len(selected)}")
+    ok = [selected[i] for i in sorted(results)]
+    print(f"downloaded+sliced {len(ok)}/{len(selected)} genomes")
 
-    # 4. taxonomy labels
-    taxids = {r["species_taxid"] for r in ok if r.get("species_taxid")}
-    tax_map = resolve_taxonomy(taxids, cache)
-
-    # 5. fragment + emit
+    # 5. emit
     frag_path = args.outdir / "fragments.fna"
     lab_path = args.outdir / "labels.tsv"
     skip_path = args.outdir / "skipped.tsv"
@@ -754,73 +825,33 @@ def main():
                     "length", "taxid", "group", "rank_unresolved",
                     "seq_source", "coding", "label_source", "coding_frac",
                     "boundary", "n_boundaries", "boundary_offset"] + RANKS)
-        for row in ok:
+        for i in sorted(results):
+            row, label_source, frags, n_veu_unmatched = results[i]
             tax = tax_map.get(row.get("species_taxid", ""), {})
-            veu = (fetch_veupathdb_cds(row["assembly_accession"], cache)
-                   if args.veupath else None)
-            alias_groups = (load_chrom_alias(row["assembly_accession"], cache)
-                            if veu else {})
-            label_source = ("veupathdb" if veu else
-                            "refseq_gff" if row["_gff"] else "none")
-            cds = load_gff_cds(row["_gff"]) if row["_gff"] else {}
-            n_veu_unmatched = 0
-            # --nt-budget is per ACCESSION; each seqid draws a
-            # length-proportional share so every nucleotide position is
-            # equally likely to be sampled regardless of contig count.
-            seq_lens = {s: len(q) for s, q in iter_fasta_gz(row["_fasta"])}
-            total_len = sum(seq_lens.values())
-            for seqid, seq in iter_fasta_gz(row["_fasta"]):
-                acc_budget = row.get("_nt_budget", args.nt_budget)
-                seq_budget = round(acc_budget * len(seq) / total_len)
-                if veu:
-                    iv = veupath_intervals(veu, alias_groups, seqid)
-                    if iv is None:
-                        n_veu_unmatched += 1
-                        stats_of = lambda s, e: None
-                    else:
-                        stats_of = lambda s, e: coding_stats_iv(iv, s, e)
+            for seqid, s, e, frag, stats in frags:
+                fid = f"{row['assembly_accession']}|{seqid}|{s}-{e}"
+                ff.write(f">{fid}\n")
+                for i2 in range(0, len(frag), 70):
+                    ff.write(frag[i2:i2 + 70] + "\n")
+                if stats is None:
+                    frac_s, bnd_s, nb_s, boff_s = "", "", "", ""
                 else:
-                    stats_of = lambda s, e: coding_stats(seqid, s, e, cds)
-                cands = [(s, e, frag, stats_of(s, e))
-                         for s, e, frag in slice_fragments(
-                             seq, args.frag_len_min, args.frag_len_max,
-                             seq_budget, args.max_amb_frac, rng)]
-                # Boundary stratification: mixed windows (0 < frac < 1)
-                # are rare under uniform sampling but carry the candidacy
-                # signal; subsample each bucket to hit --boundary-frac.
-                if args.boundary_frac > 0:
-                    mixed = [c for c in cands
-                             if c[3] is not None and 0 < c[3][0] < 1]
-                    pure = [c for c in cands
-                            if c[3] is None or not 0 < c[3][0] < 1]
-                    n_b = min(len(mixed),
-                              round(args.boundary_frac * len(cands)))
-                    n_nb = min(len(pure), len(cands) - n_b)
-                    cands = rng.sample(mixed, n_b) + rng.sample(pure, n_nb)
-                for s, e, frag, stats in cands:
-                    fid = f"{row['assembly_accession']}|{seqid}|{s}-{e}"
-                    ff.write(f">{fid}\n")
-                    for i in range(0, len(frag), 70):
-                        ff.write(frag[i:i + 70] + "\n")
-                    if stats is None:
-                        frac_s, bnd_s, nb_s, boff_s = "", "", "", ""
-                    else:
-                        frac, n_bnd, boff = stats
-                        frac_s = f"{frac:.4f}"
-                        bnd_s = "1" if 0 < frac < 1 else "0"
-                        nb_s = str(n_bnd)
-                        boff_s = f"{boff:.4f}" if boff is not None else ""
-                    cod = ("NA" if stats is None else
-                           "coding" if stats[0] >= 0.5 else "non-coding")
-                    w.writerow([fid, row["assembly_accession"], seqid, s, e,
-                                len(frag), row.get("species_taxid", ""),
-                                row["group"], row.get("_rank_unresolved", "0"),
-                                row.get("_seq_source", "refseq"),
-                                cod, label_source,
-                                frac_s, bnd_s, nb_s, boff_s] +
-                               [tax.get(r, "") or "" for r in RANKS])
-                    n_frags += 1
-            if veu and n_veu_unmatched:
+                    frac, n_bnd, boff = stats
+                    frac_s = f"{frac:.4f}"
+                    bnd_s = "1" if 0 < frac < 1 else "0"
+                    nb_s = str(n_bnd)
+                    boff_s = f"{boff:.4f}" if boff is not None else ""
+                cod = ("NA" if stats is None else
+                       "coding" if stats[0] >= 0.5 else "non-coding")
+                w.writerow([fid, row["assembly_accession"], seqid, s, e,
+                            len(frag), row.get("species_taxid", ""),
+                            row["group"], row.get("_rank_unresolved", "0"),
+                            row.get("_seq_source", "refseq"),
+                            cod, label_source,
+                            frac_s, bnd_s, nb_s, boff_s] +
+                           [tax.get(r, "") or "" for r in RANKS])
+                n_frags += 1
+            if n_veu_unmatched:
                 print(f"  {row['assembly_accession']}: "
                       f"{n_veu_unmatched} seqids unmatched to VEuPathDB "
                       f"chrom names (NA labels)", file=sys.stderr)
