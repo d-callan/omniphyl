@@ -96,6 +96,8 @@ Collapse check (predicted-class entropy from `predictions.tsv`): phylum H=1.72 n
 
 **Gate: passed.** Phylum macro-F1 3× A0, domain ~2×, class ~3×; phylum entropy 1.72→2.12 with Uroviricota top-share 50.8→41.5 (collapse undone); calibration also improves (domain ECE 0.31→0.07). Family macro-F1 is formally unevaluable for A0 (n=0 on val) but the macro-F1 trend favors the tree head at every comparable rank. Deep-rank *accuracy* stays low on held-out genera — expected: those classes are unseen by construction. A1 ships to scale; tree head becomes the default for cumulative arms pending A2's backbone verdict.
 
+**Where the gains come from** (group consensus, A0→A1): archaea was 0.000 at *every* rank under the flat head and reaches domain 0.80 / phylum 0.50 / class 0.33 under the tree head — the prior-sibling structure effectively borrows strength for undersampled groups. Fungi class jumps 0.067→0.419. The only regressions are where the flat head already had signal (bacterial order −0.12, viral class −0.06). *Caveat:* the A1 numbers above come from a local CPU eval on the **raw** corpus labels (63,449 frags), while A0 was evaluated on the screened corpus (63,372) — val sets overlap but aren't identical (e.g. archaea n=5 vs n=10). Margins are large enough that the verdict is unaffected; for the paper table re-evaluate A0 on identical inputs.
+
 ---
 
 ## 3. Step 0 — free analysis before any GPU spend (local, day 1)
