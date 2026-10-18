@@ -1,0 +1,15 @@
+{
+  "id": "daniellecallan/omniphyl-a25-stack",
+  "title": "omniphyl-a25-stack",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "daniellecallan/omniphyl-5group-mini-corpus"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}
