@@ -56,7 +56,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).parent))
 from train_omniphyl import (OmniPhyl, FragmentDataset, build_cell_lut,
                              build_split, RANKS, CONT_TARGETS,
-                             encode_cont_labels)
+                             encode_cont_labels, MS_KS, rc_index_map)
 
 RANK_ORDER = RANKS  # domain -> ... -> species
 TOPK_CONS = 512     # sparse log-prob entries stored per frag per rank
@@ -161,9 +161,11 @@ def main():
     cls_targets = [t for t in all_targets if t in vocab]
     n_classes = {t: len(vocab[t]) + 1 for t in cls_targets}
     n_classes.update({t: 1 for t in all_targets if t not in n_classes})
+    base_ch = len(MS_KS) if train_args.get("backbone") == "msfcgr" else 1
     model = OmniPhyl(n_classes,
                      width=train_args.get("width", 64),
-                     cin=3 if train_args.get("pos_channels") else 1,
+                     cin=base_ch + 2 if train_args.get("pos_channels")
+                     else base_ch,
                      backbone=train_args.get("backbone", "resnet"),
                      side=1 << k,
                      targets=all_targets,
@@ -213,11 +215,15 @@ def main():
     cont = encode_cont_labels(meta)
 
     lut = build_cell_lut(k)
+    ms_maps = ({kk: build_cell_lut(kk) for kk in MS_KS},
+               {kk: rc_index_map(kk) for kk in MS_KS}) \
+        if train_args.get("backbone") == "msfcgr" else (None, None)
     ds = FragmentDataset(args.fragments, encoded, k, lut,
                          pos=train_args.get("pos_channels", False),
                          targets=cls_targets, cont=cont,
                          seq=train_args.get("backbone") == "seq",
-                         seq_len=int(train_args.get("seq_len", 500)))
+                         seq_len=int(train_args.get("seq_len", 500)),
+                         ms_luts=ms_maps[0], ms_canons=ms_maps[1])
     loader = torch.utils.data.DataLoader(
         ds, args.batch_size, shuffle=False,
         num_workers=args.num_workers)

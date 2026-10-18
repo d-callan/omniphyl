@@ -62,6 +62,23 @@ def build_cell_lut(k: int) -> np.ndarray:
     return lut
 
 
+MS_KS = (4, 5, 6)  # coarse->fine FCGR pyramid scales (backbone="msfcgr")
+
+
+def rc_index_map(k: int) -> np.ndarray:
+    """base-4 kmer index -> canonical index = min(idx, RC(idx)).
+
+    Complement of base-4 digit d is 3-d (A<->T, C<->G); RC reverses digit
+    order. Mapping every observed kmer through its canonical index makes
+    FCGR counts strand-invariant at zero runtime cost.
+    """
+    idx = np.arange(4 ** k, dtype=np.int64)
+    rc = np.zeros_like(idx)
+    for i in range(k):
+        rc |= (3 - ((idx >> (2 * i)) & 3)) << (2 * (k - 1 - i))
+    return np.minimum(idx, rc).astype(np.int32)
+
+
 # vertex coords for CGR points; index by code+1 so N (-1) -> center pull
 VTX = np.array([[0.5, 0.5],  # invalid/N
                 [0.0, 0.0],  # A
@@ -72,16 +89,23 @@ VTX = np.array([[0.5, 0.5],  # invalid/N
 
 def fcgr_encode(seq: str, k: int, lut: np.ndarray,
                 perm: np.ndarray | None = None,
-                pos: bool = False) -> np.ndarray:
+                pos: bool = False,
+                canon: np.ndarray | None = None,
+                norm: str = "max") -> np.ndarray:
     """sequence -> FCGR tensor [C, side, side] float32.
 
-    Channel 0 = log-normalized k-mer frequency. With pos=True, channels 1-2
+    Channel 0 = normalized k-mer frequency. With pos=True, channels 1-2
     hold the mean CGR (x, y) coordinate per cell (PhageCGRNet): within-cell
     offsets summarize the context preceding each k-mer, extending effective
     context beyond k. Empty cells get their cell-center coordinate.
 
     perm: optional permutation of the 4 corner vertices (label-preserving
     augmentation, Dick & Green 2019) applied as a digit remap.
+    canon: optional canonical index map (rc_index_map) making counts
+    strand-invariant.
+    norm: "max" = log1p then divide by cell max (v0 default);
+          "enrich" = log1p(count / expected-under-uniform), insensitive
+          to a single repeated k-mer.
     """
     side = 1 << k
     codes = BASE2DIGIT[np.frombuffer(seq.encode("ascii", "replace"),
@@ -99,6 +123,8 @@ def fcgr_encode(seq: str, k: int, lut: np.ndarray,
     w = win[valid]
     # base-4 index, leftmost base most significant
     kidx = (w * (4 ** np.arange(k - 1, -1, -1))).sum(axis=1)
+    if canon is not None:
+        kidx = canon[kidx]
     cells = lut[kidx]
     np.add.at(freq, cells, 1.0)
     if pos:
@@ -121,9 +147,41 @@ def fcgr_encode(seq: str, k: int, lut: np.ndarray,
         my = np.where(freq > 0, sy / (freq + 1e-9), (ys + 0.5) / side)
         out[1] = mx.reshape(side, side)
         out[2] = my.reshape(side, side)
-    img = np.log1p(freq)
-    img /= img.max() + 1e-9
+    if norm == "enrich":
+        # log enrichment over the uniform expectation (n_kmers / n_cells)
+        img = np.log1p(freq / max(freq.sum(), 1.0) * side * side)
+    else:
+        img = np.log1p(freq)
+        img /= img.max() + 1e-9
     out[0] = img.reshape(side, side)
+    return out
+
+
+def fcgr_encode_ms(seq: str, luts: dict[int, np.ndarray],
+                   canons: dict[int, np.ndarray],
+                   ks: tuple = MS_KS,
+                   perm: np.ndarray | None = None,
+                   pos: bool = False) -> np.ndarray:
+    """Multi-scale RC-canonical FCGR pyramid -> [len(ks)+2*pos, S, S].
+
+    Each scale is RC-canonicalized and log-enrichment normalized, then
+    repeated up to the finest scale's resolution so the channels stack —
+    the coarse maps land exactly on quadtree-aligned blocks. pos channels
+    are computed at the finest k only.
+    """
+    k_hi = ks[-1]
+    side_hi = 1 << k_hi
+    out = np.zeros((len(ks) + (2 if pos else 0), side_hi, side_hi),
+                   dtype=np.float32)
+    for ci, k in enumerate(ks):
+        want_pos = pos and k == k_hi
+        img = fcgr_encode(seq, k, luts[k], perm, pos=want_pos,
+                          canon=canons[k], norm="enrich")
+        rep = side_hi // (1 << k)
+        out[ci] = (img[0] if rep == 1 else
+                   np.repeat(np.repeat(img[0], rep, axis=0), rep, axis=1))
+        if want_pos:
+            out[-2], out[-1] = img[1], img[2]
     return out
 
 
@@ -152,7 +210,9 @@ class FragmentDataset(Dataset):
                  lut: np.ndarray, augment: bool = False, pos: bool = False,
                  targets: list[str] | None = None,
                  cont: dict[str, tuple] | None = None,
-                 seq: bool = False, seq_len: int = 500):
+                 seq: bool = False, seq_len: int = 500,
+                 ms_luts: dict[int, np.ndarray] | None = None,
+                 ms_canons: dict[int, np.ndarray] | None = None):
         self.fasta = Path(fasta)
         self.k = k
         self.lut = lut
@@ -160,6 +220,8 @@ class FragmentDataset(Dataset):
         self.pos = pos
         self.seq = seq
         self.seq_len = seq_len
+        self.ms_luts = ms_luts      # set -> multi-scale RC-canonical FCGR
+        self.ms_canons = ms_canons
         self.labels = labels  # frag_id -> {target: int}
         self.cont = cont or {}  # frag_id -> (coding_frac, boundary_offset)
         self.ids = list(labels.keys())
@@ -205,6 +267,9 @@ class FragmentDataset(Dataset):
         perm = np.random.permutation(4) if self.augment else None
         s = self._read_seq(fid)
         img = (seq_encode(s, self.seq_len, perm) if self.seq
+               else fcgr_encode_ms(s, self.ms_luts, self.ms_canons,
+                                   perm=perm, pos=self.pos)
+               if self.ms_luts is not None
                else fcgr_encode(s, self.k, self.lut, perm, self.pos))
         lab = np.array([self.labels[fid].get(t, 0) for t in self.targets],
                        dtype=np.int64)
@@ -214,14 +279,21 @@ class FragmentDataset(Dataset):
 
 
 class Block(nn.Module):
-    def __init__(self, cin, cout, stride=1):
+    def __init__(self, cin, cout, stride=1, qt=False):
         super().__init__()
-        self.c1 = nn.Conv2d(cin, cout, 3, stride, 1, bias=False)
+        if qt and stride == 2:
+            # quadtree-aligned downsample: a 2x2 block is exactly the four
+            # extensions of one (k-1)-mer prefix; 3x3s2 convs straddle
+            # quadtree boundaries and mix unrelated prefixes.
+            self.c1 = nn.Conv2d(cin, cout, 2, 2, 0, bias=False)
+            self.short = nn.Conv2d(cin, cout, 2, 2, 0, bias=False)
+        else:
+            self.c1 = nn.Conv2d(cin, cout, 3, stride, 1, bias=False)
+            self.short = (nn.Conv2d(cin, cout, 1, stride, bias=False)
+                          if stride != 1 or cin != cout else nn.Identity())
         self.b1 = nn.BatchNorm2d(cout)
         self.c2 = nn.Conv2d(cout, cout, 3, 1, 1, bias=False)
         self.b2 = nn.BatchNorm2d(cout)
-        self.short = (nn.Conv2d(cin, cout, 1, stride, bias=False)
-                      if stride != 1 or cin != cout else nn.Identity())
 
     def forward(self, x):
         s = self.short(x)
@@ -231,16 +303,24 @@ class Block(nn.Module):
 
 
 class ResNetEncoder(nn.Module):
-    def __init__(self, cin: int, width: int, stem_stride: int = 2):
+    def __init__(self, cin: int, width: int, stem_stride: int = 2,
+                 qt: bool = False):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(cin, width, 5, stem_stride, 2, bias=False),
+            # qt: 3x3 stride-1 stem preserves the finest FCGR resolution;
+            # all halving happens in the quadtree-aligned stage blocks.
+            nn.Conv2d(cin, width, 3 if qt else 5,
+                      1 if qt else stem_stride,
+                      1 if qt else 2, bias=False),
             nn.BatchNorm2d(width), nn.ReLU())
         self.stages = nn.Sequential(
-            Block(width, width), Block(width, width),
-            Block(width, width * 2, 2), Block(width * 2, width * 2),
-            Block(width * 2, width * 4, 2), Block(width * 4, width * 4),
-            Block(width * 4, width * 8, 2), Block(width * 8, width * 8),
+            Block(width, width, qt=qt), Block(width, width, qt=qt),
+            Block(width, width * 2, 2, qt),
+            Block(width * 2, width * 2, qt=qt),
+            Block(width * 2, width * 4, 2, qt),
+            Block(width * 4, width * 4, qt=qt),
+            Block(width * 4, width * 8, 2, qt),
+            Block(width * 8, width * 8, qt=qt),
         )
         self.latent = width * 8
 
@@ -413,6 +493,8 @@ class OmniPhyl(nn.Module):
             self.encoder = ViTEncoder(cin, side, dim=width * 4)
         elif backbone == "seq":
             self.encoder = SeqEncoder(width)
+        elif backbone == "msfcgr":
+            self.encoder = ResNetEncoder(cin, width, qt=True)
         else:
             self.encoder = ResNetEncoder(cin, width, stem_stride)
         self.latent = self.encoder.latent
@@ -533,11 +615,13 @@ def main():
     ap.add_argument("--pos-channels", action="store_true",
                     help="add mean-CGR-(x,y) channels per cell "
                          "(PhageCGRNet positional features)")
-    ap.add_argument("--backbone", choices=["resnet", "vit", "seq"],
+    ap.add_argument("--backbone", choices=["resnet", "vit", "seq", "msfcgr"],
                     default="resnet",
                     help="encoder: resnet=FCGR CNN (default), vit=FCGR "
                          "global attention, seq=1D CNN over one-hot bases "
-                         "(keeps motif/positional info FCGR discards)")
+                         "(keeps motif/positional info FCGR discards), "
+                         "msfcgr=RC-canonical k4/5/6 pyramid + "
+                         "quadtree-aligned 2x2 resnet (A2)")
     ap.add_argument("--stem-stride", type=int, default=2,
                     help="resnet stem conv stride; 1 keeps full FCGR "
                          "resolution (stride-2 merges each k-mer's "
@@ -608,24 +692,30 @@ def main():
     cont_val = encode_cont_labels(val_meta)
 
     use_seq = args.backbone == "seq"
+    ms_maps = ({k: build_cell_lut(k) for k in MS_KS},
+               {k: rc_index_map(k) for k in MS_KS}) \
+        if args.backbone == "msfcgr" else (None, None)
     train_ds = FragmentDataset(args.fragments, encode_labels(train_meta),
                                args.k, lut,
                                augment=args.vertex_permute_augment,
                                pos=args.pos_channels,
                                targets=cls_targets, cont=cont_train,
-                               seq=use_seq, seq_len=args.seq_len)
+                               seq=use_seq, seq_len=args.seq_len,
+                               ms_luts=ms_maps[0], ms_canons=ms_maps[1])
     val_ds = FragmentDataset(args.fragments, encode_labels(val_meta),
                              args.k, lut, pos=args.pos_channels,
                              targets=cls_targets, cont=cont_val,
-                             seq=use_seq, seq_len=args.seq_len)
+                             seq=use_seq, seq_len=args.seq_len,
+                             ms_luts=ms_maps[0], ms_canons=ms_maps[1])
     train_ld = DataLoader(train_ds, args.batch_size, shuffle=True,
                           num_workers=args.num_workers, drop_last=True,
                           persistent_workers=args.num_workers > 0)
     val_ld = DataLoader(val_ds, args.batch_size, shuffle=False,
                         num_workers=args.num_workers)
 
+    base_ch = len(MS_KS) if args.backbone == "msfcgr" else 1
     model = OmniPhyl(n_classes, args.width,
-                     cin=3 if args.pos_channels else 1,
+                     cin=base_ch + 2 if args.pos_channels else base_ch,
                      backbone=args.backbone, side=1 << args.k,
                      targets=all_targets, dropout=args.dropout,
                      stem_stride=args.stem_stride,

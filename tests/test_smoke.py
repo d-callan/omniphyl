@@ -27,7 +27,8 @@ from fetch_refseq_corpus import (  # noqa: E402
     veupath_intervals, _collect_bed_items)
 from train_omniphyl import (  # noqa: E402
     encode_cont_labels, CONT_TARGETS, RANKS, FragmentDataset,
-    build_cell_lut, load_labels, build_tree, OmniPhyl)
+    build_cell_lut, load_labels, build_tree, OmniPhyl,
+    fcgr_encode_ms, rc_index_map, MS_KS)
 
 PASS, FAIL = [], []
 
@@ -171,6 +172,45 @@ def test_tree_head():
 
 
 # ----------------------------------------------------------- end to end ---
+
+def test_msfcgr():
+    print("[msfcgr / A2]")
+    import numpy as np
+    import torch
+    rng = random.Random(3)
+    seq = "".join(rng.choice("ACGT") for _ in range(500))
+    rc = seq.translate(str.maketrans("ACGT", "TGCA"))[::-1]
+
+    luts = {k: build_cell_lut(k) for k in MS_KS}
+    canons = {k: rc_index_map(k) for k in MS_KS}
+
+    # the core invariant: a fragment and its reverse complement must
+    # produce identical inputs
+    a = fcgr_encode_ms(seq, luts, canons)
+    b = fcgr_encode_ms(rc, luts, canons)
+    check("RC-invariant encoding", bool((a == b).all()))
+
+    check("pyramid shape", a.shape == (len(MS_KS), 64, 64), a.shape)
+    ap = fcgr_encode_ms(seq, luts, canons, pos=True)
+    check("pos adds 2 channels", ap.shape == (len(MS_KS) + 2, 64, 64),
+          ap.shape)
+
+    # canonical palindromes collapse: each canonical index has <=2 raw
+    # preimages, so the map is a valid idempotent projection
+    for k in MS_KS:
+        c = canons[k]
+        check(f"k={k} canon idempotent", bool((c[c] == c).all()))
+
+    # quadtree encoder: spatial halving is exact 2x2 at every stage
+    n_classes = {r: 3 for r in RANKS}
+    model = OmniPhyl(n_classes, width=8, cin=len(MS_KS),
+                     backbone="msfcgr", targets=RANKS)
+    model.eval()
+    with torch.no_grad():
+        _, logits = model(torch.randn(2, len(MS_KS), 64, 64))
+    check("msfcgr forward -> rank logits",
+          all(logits[r].shape == (2, 3) for r in RANKS))
+
 
 def make_corpus(tmp: Path):
     """2 accessions x 24 frags, mixture of pure/boundary/no-label rows."""
@@ -345,7 +385,7 @@ def test_contaminant_screen():
 
 def main():
     for t in (test_label_math, test_veupath_helpers,
-              test_slicing_and_encoding, test_tree_head,
+              test_slicing_and_encoding, test_tree_head, test_msfcgr,
               test_contaminant_screen, test_end_to_end):
         t()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
