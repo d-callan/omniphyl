@@ -1,30 +1,24 @@
 #!/usr/bin/env python3
 """Sequence-based contaminant screen for OmniPhyl pilot fragments.
 
-Three layers, cheapest first (no external dependencies — pure Python + stdlib):
+Two layers (no external dependencies — pure Python + stdlib):
 
   1. Ambiguity gate: fragments with >MAX_AMB_FRAC non-ACGT bases are rejected.
      (Already applied in fetch_refseq_corpus.py at 5%; this step re-checks and
      allows tuning independently of the fetch step.)
 
-  2. k-mer self-consistency: for each assembly, build a reference 21-mer sketch
-     from all sequences in the downloaded FASTA.  Compute per-fragment Jaccard
-     containment of its 21-mers in that sketch.  Fragments below
-     --min-self-containment are flagged as inconsistent with their source
-     assembly (potential inserted contamination or mis-assembly).
-
-     Threshold note: the distribution of containment across 500 bp fragments
-     from real RefSeq assemblies is strongly bimodal — most fragments cluster
-     near 1.0, with a low tail at <0.3 from repetitive/low-complexity regions
-     that share few unique k-mers with the rest of the assembly.  The default
-     of 0.5 cuts the fat tail without touching the main distribution.
-     Inspect the containment histogram in the rejection log before changing it.
-
-  3. Known-contaminant screen: reject fragments with containment > MAX_CONT_HIT
+  2. Known-contaminant screen: reject fragments with containment > MAX_CONT_HIT
      in any of: human GRCh38 (Alu/repeat source), phiX174 (sequencing spike-in),
      UniVec core (vector/adapter).  Sketches are built on first run and cached.
      The human sketch is large (~1 GB of 21-mers for the full genome); use
      --human-fasta to point at a local GRCh38 FASTA, or omit to skip this layer.
+     Accessions that are themselves a contaminant species (most fragments hit)
+     are exempted rather than deleted — see --contam-acc-frac.
+
+NOTE: this screen cannot see contamination *inside* deposited assemblies — a
+foreign contig in a deposit is self-consistent with it and matches none of
+the lab-contaminant sketches.  Catching deposit contamination needs a
+taxonomic-concordance check, which is a different tool.
 
 Outputs in --outdir:
   fragments_screened.fna     passing fragments
@@ -54,8 +48,15 @@ UNIVEC_URL = "https://ftp.ncbi.nlm.nih.gov/pub/UniVec/UniVec_Core"
 
 KMER_K = 21
 MAX_AMB_FRAC = 0.05
-MIN_SELF_CONTAINMENT = 0.5
 MAX_CONT_HIT = 0.10
+# An accession whose contaminant-hit fraction exceeds this is itself a
+# contaminant-species member (e.g. phiX174 deliberately sampled as a viral
+# genome — UniVec contains phiX sequence, so all its fragments "hit").
+# Its fragments are kept: rejecting them would silently delete a legitimate
+# corpus member rather than contamination.  0.5 is the natural split between
+# "assembly mostly contaminant" and "isolated contamination island"; a tie
+# is treated as contamination (conservative).
+CONTAM_ACC_FRAC = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -215,32 +216,24 @@ def main():
     ap.add_argument("--labels", required=True, type=Path,
                     help="labels.tsv from fetch_refseq_corpus.py")
     ap.add_argument("--outdir", required=True, type=Path)
-    ap.add_argument("--genomes-dir", type=Path, default=None,
-                    help="directory containing <accession>.fna.gz files "
-                         "(default: --outdir/genomes)")
     ap.add_argument("--human-fasta", type=Path, default=None,
                     help="path to local GRCh38 FASTA for human contaminant "
                          "screen (optional; layer skipped if absent)")
     ap.add_argument("--max-amb-frac", type=float, default=MAX_AMB_FRAC)
-    ap.add_argument("--min-self-containment", type=float,
-                    default=MIN_SELF_CONTAINMENT,
-                    help="minimum Jaccard containment of fragment 21-mers "
-                         "within source assembly sketch")
     ap.add_argument("--max-cont-hit", type=float, default=MAX_CONT_HIT,
                     help="maximum containment in any known-contaminant sketch "
                          "before rejection")
-    ap.add_argument("--skip-self-check", action="store_true",
-                    help="skip layer 2 (self-consistency); useful for quick "
-                         "contaminant-only runs")
+    ap.add_argument("--contam-acc-frac", type=float, default=CONTAM_ACC_FRAC,
+                    help="accessions whose contaminant-hit fraction exceeds "
+                         "this are contaminant-species members; their "
+                         "fragments are kept (default 0.5)")
     ap.add_argument("--skip-contaminant-check", action="store_true",
-                    help="skip layer 3 (known contaminants)")
+                    help="skip layer 2 (known contaminants)")
     args = ap.parse_args()
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     cache_dir = args.outdir / "_screen_cache"
     cache_dir.mkdir(exist_ok=True)
-    genomes_dir = args.genomes_dir or (args.outdir / "genomes")
-
     # Load labels
     labels: dict[str, dict] = {}
     with open(args.labels, newline="") as f:
@@ -252,20 +245,7 @@ def main():
     print("indexing fragments ...")
     offsets = iter_fasta_index(args.fragments)
 
-    # Build per-assembly self-consistency sketches (layer 2)
-    asm_sketches: dict[str, set[str]] = {}
-    if not args.skip_self_check:
-        accs = sorted({r["accession"] for r in labels.values()})
-        print(f"building assembly sketches for {len(accs)} assemblies ...")
-        for acc in accs:
-            fna = genomes_dir / f"{acc}.fna.gz"
-            if not fna.exists():
-                print(f"  WARNING: {fna} not found; self-check skipped for {acc}",
-                      file=sys.stderr)
-                continue
-            asm_sketches[acc] = load_or_build_sketch(fna, cache_dir)
-
-    # Load known-contaminant sketches (layer 3)
+    # Load known-contaminant sketches (layer 2)
     cont_sketches: dict[str, set[str]] = {}
     if not args.skip_contaminant_check:
         print("loading known-contaminant sketches ...")
@@ -273,8 +253,10 @@ def main():
         print(f"  contaminant sources: {list(cont_sketches.keys())}")
 
     # Screen each fragment
-    pass_ids: list[str] = []
     rejected: list[dict] = []
+    # Contaminant hits are held per accession: an accession that is itself a
+    # contaminant species is exempted wholesale in the post-pass below.
+    pending_contam: dict[str, list] = {}
 
     for fid, meta in labels.items():
         seq = read_seq_at(args.fragments, offsets[fid])
@@ -289,19 +271,7 @@ def main():
 
         frag_k = kmers(seq_upper)
 
-        # Layer 2: self-consistency
-        if not args.skip_self_check:
-            acc = meta["accession"]
-            asm_sk = asm_sketches.get(acc)
-            if asm_sk is not None:
-                sc = containment(frag_k, asm_sk)
-                if sc < args.min_self_containment:
-                    rejected.append({"frag_id": fid,
-                                     "reason": "low_self_containment",
-                                     "detail": f"self_containment={sc:.3f}"})
-                    continue
-
-        # Layer 3: known contaminants
+        # Layer 2: known contaminants
         if not args.skip_contaminant_check:
             hit = None
             hit_score = 0.0
@@ -310,18 +280,42 @@ def main():
                 if sc > args.max_cont_hit and sc > hit_score:
                     hit, hit_score = cname, sc
             if hit is not None:
-                rejected.append({"frag_id": fid, "reason": "contaminant_hit",
-                                 "detail": f"source={hit} containment={hit_score:.3f}"})
-                continue
+                pending_contam.setdefault(meta["accession"], []).append(
+                    (fid, hit, hit_score))
 
-        pass_ids.append(fid)
+    # Accessions that are themselves a contaminant species trip the
+    # contaminant screen on most of their fragments (e.g. phiX174 sampled as
+    # a viral genome).  Rejecting them would silently delete a legitimate
+    # corpus member, so above --contam-acc-frac the accession's hits are
+    # forgiven; below it, isolated hits are contamination islands and are
+    # rejected.
+    contam_members: list[str] = []
+    if pending_contam:
+        acc_totals: dict[str, int] = {}
+        for meta in labels.values():
+            a = meta["accession"]
+            acc_totals[a] = acc_totals.get(a, 0) + 1
+        for acc, hits in pending_contam.items():
+            if len(hits) / acc_totals[acc] > args.contam_acc_frac:
+                contam_members.append(acc)
+            else:
+                rejected.extend(
+                    {"frag_id": fid, "reason": "contaminant_hit",
+                     "detail": f"source={src} containment={sc:.3f}"}
+                    for fid, src, sc in hits)
+        if contam_members:
+            print(f"  contaminant-species members exempted: "
+                  f"{sorted(contam_members)}")
+
+    rejected_ids = {r["frag_id"] for r in rejected}
+    pass_ids = [fid for fid in labels if fid not in rejected_ids]
 
     print(f"passed: {len(pass_ids)}  rejected: {len(rejected)}")
 
     # Emit passing fragments FASTA
     out_fna = args.outdir / "fragments_screened.fna"
     pass_set = set(pass_ids)
-    with open(out_fna, "w") as ff:
+    with open(out_fna, "w") as ff:  # pass_set kept for label filtering below
         for fid, seq in ((fid, read_seq_at(args.fragments, offsets[fid]))
                          for fid in pass_ids):
             ff.write(f">{fid}\n")
@@ -360,6 +354,9 @@ def main():
         "n_passed": len(pass_ids),
         "n_rejected": len(rejected),
         "rejection_reasons": reasons,
+        "contaminant_member_accessions": sorted(contam_members),
+        "n_exempt_member_frags": sum(len(pending_contam[a])
+                                     for a in contam_members),
         "args": {k: str(v) for k, v in vars(args).items()},
     }
     (args.outdir / "screen_manifest.json").write_text(

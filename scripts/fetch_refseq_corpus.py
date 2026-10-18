@@ -65,7 +65,10 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-NCBI_BASE = "https://ftp.ncbi.nlm.nih.gov/genomes/refseq"
+NCBI_BASE = {
+    "refseq": "https://ftp.ncbi.nlm.nih.gov/genomes/refseq",
+    "genbank": "https://ftp.ncbi.nlm.nih.gov/genomes/genbank",
+}
 TAXDUMP_URL = "https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/new_taxdump/new_taxdump.tar.gz"
 UCSC_API = "https://api.genome.ucsc.edu"
 UCSC_HUBS = "https://hgdownload.soe.ucsc.edu/hubs"
@@ -110,11 +113,17 @@ def download(url: str, dest: Path, retries: int = 3, timeout: int = 300) -> Path
     return dest
 
 
-def load_summary(group: str, cache: Path) -> list[dict]:
-    """Download + parse assembly_summary.txt for one RefSeq group."""
-    p = cache / f"assembly_summary_{group}.txt"
+def load_summary(group: str, cache: Path,
+                 source: str = "refseq") -> list[dict]:
+    """Download + parse assembly_summary.txt for one group.
+
+    source selects the RefSeq or GenBank FTP tree (identical file
+    format; GenBank rows carry gbrs_paired_asm pointing at any RefSeq
+    twin, which main() uses to keep only genuinely new assemblies).
+    """
+    p = cache / f"assembly_summary_{source}_{group}.txt"
     if not p.exists():
-        download(f"{NCBI_BASE}/{group}/assembly_summary.txt", p)
+        download(f"{NCBI_BASE[source]}/{group}/assembly_summary.txt", p)
     rows = []
     with open(p, encoding="utf-8", errors="replace") as f:
         header = None
@@ -155,8 +164,19 @@ def select_assemblies(rows: list[dict], levels: set[str],
                       tax_resolver=None,
                       cache: Path | None = None,
                       per_rank_n: int = 1,
-                      require_gff: bool = True) -> list[dict]:
+                      require_gff: bool = True,
+                      covered: set | None = None,
+                      covered_n: int = 0,
+                      mark_unresolved: bool = True) -> list[dict]:
     """Filter to eligible assemblies, then sample.
+
+    covered/covered_n implement gap-filling from a second source: rank
+    keys already picked by a previous call (each kept row is tagged
+    _rank_key) get at most covered_n picks instead of per_rank_n, so a
+    GenBank pass fills only values RefSeq missed (covered_n=0) or adds
+    a bounded supplement. mark_unresolved=False keeps supplementary
+    picks train-only: they never get the _rank_unresolved test-only
+    flag.
 
     require_gff gates a HEAD sweep dropping picks without a RefSeq GFF;
     with it off, picks are taken directly and GFF-missing genomes train
@@ -229,32 +249,43 @@ def select_assemblies(rows: list[dict], levels: set[str],
     else:
         candidates = [(None, [r]) for r in keep]
 
-    def members_with_gff(grp):
-        # up to per_rank_n GFF-available members, scanning a couple of
+    covered = covered or set()
+
+    def quota(key):
+        return covered_n if key in covered else per_rank_n
+
+    def members_with_gff(grp, q):
+        # up to q GFF-available members, scanning a couple of
         # alternates so dead FTP dirs don't starve the rank value
         got = []
-        for r in grp[:per_rank_n + 2]:
+        for r in grp[:q + 2]:
             if has_gff(r):
                 got.append(r)
-                if len(got) == per_rank_n:
+                if len(got) == q:
                     break
         return got
+
+    # drop rank keys whose gap-fill quota is 0 before the GFF sweep
+    candidates = [c for c in candidates if quota(c[0]) > 0]
 
     if require_gff:
         # GFF HEAD checks in parallel over picks (or all rows ungrouped)
         print(f"  checking GFF availability for {len(candidates)} picks ...")
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            picks = list(ex.map(lambda c: members_with_gff(c[1]),
+            picks = list(ex.map(lambda c: members_with_gff(c[1],
+                                                         quota(c[0])),
                                 candidates))
     else:
-        picks = [grp[:per_rank_n] for _, grp in candidates]
+        picks = [grp[:quota(key)] for key, grp in candidates]
     keep = []
     for (key, grp), got in zip(candidates, picks):
         if not got:
             skipped.append({"accession": grp[0]["assembly_accession"],
                             "group": grp[0]["group"], "reason": "no_gff"})
             continue
-        if key == "_unresolved":
+        for r in got:
+            r["_rank_key"] = key
+        if key == "_unresolved" and mark_unresolved:
             for r in got:
                 r["_rank_unresolved"] = "1"
         keep.extend(got)
@@ -616,6 +647,24 @@ def main():
                     help="prefer VEuPathDB gene models (UCSC GenArk contrib "
                          "track VEuPathDBGeneModels) over RefSeq GFF when "
                          "available; falls back per-assembly")
+    ap.add_argument("--genbank-groups", nargs="+", default=[],
+                    choices=GROUPS, metavar="GROUP",
+                    help="groups that additionally draw picks from GenBank "
+                         "assemblies with no RefSeq twin (gbrs_paired_asm=na). "
+                         "Use for underrepresented groups; picks are marked "
+                         "seq_source=genbank in labels.tsv and are train-only "
+                         "(build_split keeps val purely RefSeq, so label "
+                         "noise in submitter-declared taxonomy can't leak "
+                         "into the benchmark)")
+    ap.add_argument("--genbank-extra", type=int, default=0,
+                    help="genbank picks allowed for rank values already "
+                         "covered by refseq (default 0 = pure gap-fill: "
+                         "genbank only adds rank values refseq missed)")
+    ap.add_argument("--genbank-levels",
+                    default="Complete Genome,Chromosome,Scaffold,Contig",
+                    help="assembly levels eligible for genbank picks; "
+                         "broader than --levels since genbank is mostly "
+                         "draft assemblies")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -628,6 +677,8 @@ def main():
     skipped: list[dict] = []
 
     # 1-2. summaries + selection (with GFF HEAD-check pre-filter)
+    gb_groups = set(args.genbank_groups)
+    gb_levels = set(args.genbank_levels.split(","))
     selected = []
     for g in args.groups:
         rows = load_summary(g, cache)
@@ -639,8 +690,33 @@ def main():
         if args.group_nt_total and sel:
             for r in sel:
                 r["_nt_budget"] = args.group_nt_total // len(sel)
+        n_refseq = len(sel)
+        n_gb = 0
+        if g in gb_groups:
+            # GenBank pass: keep only assemblies with no RefSeq twin,
+            # then gap-fill rank values the RefSeq pass missed
+            # (--genbank-extra relaxes this to a bounded supplement).
+            # GFF stays optional (genbank annotation is sparse) and picks
+            # are never flagged test-only — genbank rows are train-only
+            # via seq_source.
+            covered = {r["_rank_key"] for r in sel if "_rank_key" in r}
+            gb_rows = [r for r in load_summary(g, cache, source="genbank")
+                       if (r.get("gbrs_paired_asm") or "na").strip()
+                       in ("", "na")]
+            gb_sel = select_assemblies(
+                gb_rows, gb_levels, args.one_per_rank, rng, skipped,
+                args.workers, tax_resolver=resolve_taxonomy, cache=cache,
+                per_rank_n=args.per_rank_n, require_gff=False,
+                covered=covered, covered_n=args.genbank_extra,
+                mark_unresolved=False)
+            for r in gb_sel:
+                r["_seq_source"] = "genbank"
+            n_gb = len(gb_sel)
+            sel.extend(gb_sel)
         tag = "GFF required" if args.require_gff else "GFF optional"
-        print(f"{g}: {len(rows)} assemblies -> {len(sel)} selected ({tag})")
+        print(f"{g}: {len(rows)} assemblies -> {n_refseq} selected"
+              + (f" (+{n_gb} genbank)" if g in gb_groups else "")
+              + f" ({tag})")
         selected.extend(sel)
 
     # 3. download FASTAs + GFFs (parallel)
@@ -676,8 +752,8 @@ def main():
         w = csv.writer(lf, delimiter="\t")
         w.writerow(["frag_id", "accession", "seqid", "start", "end",
                     "length", "taxid", "group", "rank_unresolved",
-                    "coding", "label_source", "coding_frac", "boundary",
-                    "n_boundaries", "boundary_offset"] + RANKS)
+                    "seq_source", "coding", "label_source", "coding_frac",
+                    "boundary", "n_boundaries", "boundary_offset"] + RANKS)
         for row in ok:
             tax = tax_map.get(row.get("species_taxid", ""), {})
             veu = (fetch_veupathdb_cds(row["assembly_accession"], cache)
@@ -739,6 +815,7 @@ def main():
                     w.writerow([fid, row["assembly_accession"], seqid, s, e,
                                 len(frag), row.get("species_taxid", ""),
                                 row["group"], row.get("_rank_unresolved", "0"),
+                                row.get("_seq_source", "refseq"),
                                 cod, label_source,
                                 frac_s, bnd_s, nb_s, boff_s] +
                                [tax.get(r, "") or "" for r in RANKS])

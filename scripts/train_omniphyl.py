@@ -20,7 +20,7 @@ import json
 import math
 import random
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -307,11 +307,107 @@ class ViTEncoder(nn.Module):
         return self.norm(self.enc(t + self.pe))[:, 0]
 
 
+def build_tree(meta: dict[str, dict], vocab: dict[str, dict],
+               ranks: list[str]) -> dict:
+    """Sibling-conditional tree structure for the A1 head.
+
+    For each rank r and shifted class id c (1..C-1):
+      parent_of[r][c] = shifted id of the parent-rank class seen on the
+      training rows carrying name c; 0 = parent missing/out-of-vocab ->
+      the class joins the catch-all root group.
+      log_prior[r][c] = log nu(c | parent) with add-one smoothing inside
+      each sibling group; applied as a tau*log(nu) logit offset during
+      training only (removed at inference for balanced conditionals).
+
+    Parent names are resolved by majority vote over training rows, which
+    absorbs the occasional lineage inconsistency in RefSeq labels.
+    """
+    counts = {r: np.zeros(len(vocab[r]) + 1) for r in ranks}
+    parent_votes = {r: defaultdict(Counter) for r in ranks[1:]}
+    for m in meta.values():
+        for ri, r in enumerate(ranks):
+            c = vocab[r].get(m.get(r, ""))
+            if c is None:
+                continue
+            counts[r][c + 1] += 1
+            if ri:
+                parent_votes[r][m[r]][m.get(ranks[ri - 1], "")] += 1
+    parent_of: dict[str, torch.Tensor] = {}
+    log_prior: dict[str, torch.Tensor] = {}
+    for ri, r in enumerate(ranks):
+        n = len(vocab[r]) + 1
+        po = np.zeros(n, dtype=np.int64)
+        for name, c in vocab[r].items():
+            if ri and parent_votes[r].get(name):
+                pname = parent_votes[r][name].most_common(1)[0][0]
+                po[c + 1] = vocab[ranks[ri - 1]].get(pname, -1) + 1
+        parent_of[r] = torch.tensor(po)
+        groups = defaultdict(list)
+        for c in range(1, n):
+            groups[int(po[c])].append(c)
+        lp = np.zeros(n)
+        for cs in groups.values():
+            tot = counts[r][cs].sum() + len(cs)  # add-one smoothing
+            for c in cs:
+                lp[c] = float(np.log((counts[r][c] + 1) / tot))
+        log_prior[r] = torch.tensor(lp, dtype=torch.float32)
+    return {"parent_of": parent_of, "log_prior": log_prior}
+
+
+class TreeRankHead(nn.Module):
+    """Cosine-prototype head for one taxonomy rank (A1 arm).
+
+    Logit for class c is a scaled cosine similarity against unit-norm
+    prototype w_c, which removes the weight-norm advantage majority
+    classes get from plain Linear heads. Class probabilities normalize
+    *within sibling groups* (classes sharing the same parent id), not
+    across the whole rank, so predictions chain into a coherent tree.
+    """
+
+    def __init__(self, latent: int, n_classes: int,
+                 parent_of, log_prior):
+        super().__init__()
+        self.proto = nn.Parameter(
+            F.normalize(torch.randn(n_classes - 1, latent), dim=1))
+        self.scale = nn.Parameter(torch.tensor(10.0))
+        self.register_buffer("parent_of",
+                             torch.as_tensor(parent_of, dtype=torch.long))
+        self.register_buffer("log_prior",
+                             torch.as_tensor(log_prior, dtype=torch.float32))
+
+    def cond_logits(self, z, tau: float = 0.0):
+        """log P(c | parent(c), z) for classes 1..C-1 as a [B, C-1] tensor."""
+        zn = F.normalize(z, dim=1)
+        w = F.normalize(self.proto, dim=1)
+        lg = self.scale * (zn @ w.T)
+        if tau:
+            lg = lg + tau * self.log_prior[1:]
+        pidx = self.parent_of[1:].expand(lg.size(0), -1)
+        n_groups = int(self.parent_of.max().item()) + 1
+        denom = torch.zeros(lg.size(0), n_groups,
+                            dtype=lg.dtype, device=lg.device)
+        denom.scatter_add_(1, pidx, lg.exp())
+        return lg - denom.gather(1, pidx).clamp_min(1e-30).log()
+
+    def marginal_logp(self, z, prev_ext=None):
+        """Chained log-marginals for classes 1..C-1.
+
+        prev_ext: [B, C_prev] log-marginals of the previous rank with a
+        leading 0 column (log 1) so orphan classes (parent_of==0) inherit
+        root mass 1.0.
+        """
+        cond = self.cond_logits(z)  # inference strips the prior offset
+        if prev_ext is None:
+            return cond
+        pidx = self.parent_of[1:].expand(z.size(0), -1)
+        return cond + prev_ext.gather(1, pidx)
+
+
 class OmniPhyl(nn.Module):
     def __init__(self, n_classes: dict[str, int], width: int = 64,
                  cin: int = 1, backbone: str = "resnet", side: int = 128,
                  targets: list[str] | None = None, dropout: float = 0.0,
-                 stem_stride: int = 2):
+                 stem_stride: int = 2, head: str = "flat", tree=None):
         super().__init__()
         if backbone == "vit":
             self.encoder = ViTEncoder(cin, side, dim=width * 4)
@@ -322,12 +418,34 @@ class OmniPhyl(nn.Module):
         self.latent = self.encoder.latent
         self.drop = nn.Dropout(dropout)
         keys = targets if targets is not None else list(n_classes.keys())
+        tree_po = (tree or {}).get("parent_of", {}) if head == "tree" else {}
         self.heads = nn.ModuleDict(
-            {t: nn.Linear(self.latent, n_classes[t]) for t in keys})
+            {t: (TreeRankHead(self.latent, n_classes[t],
+                              tree["parent_of"][t], tree["log_prior"][t])
+                 if t in tree_po else nn.Linear(self.latent, n_classes[t]))
+             for t in keys})
+
+    def cond_logps(self, z, tau: float = 0.0):
+        """Per-rank sibling-conditional log-probs (tree heads only)."""
+        return {t: h.cond_logits(z, tau) for t, h in self.heads.items()
+                if isinstance(h, TreeRankHead)}
 
     def forward(self, x):
         z = self.drop(self.encoder(x))
-        return z, {r: h(z) for r, h in self.heads.items()}
+        logits = {}
+        prev_ext = None  # [B, C_prev] chained log-marginals, col 0 = log 1
+        for t, h in self.heads.items():
+            if isinstance(h, TreeRankHead):
+                logm = h.marginal_logp(z, prev_ext)
+                prev_ext = torch.cat(
+                    [logm.new_zeros(logm.size(0), 1), logm], 1)
+                # col 0 (unknown class) gets a large negative so argmax
+                # never lands there; cols 1.. are log-marginals
+                logits[t] = torch.cat(
+                    [logm.new_full((logm.size(0), 1), -1e4), logm], 1)
+            else:
+                logits[t] = h(z)
+        return z, logits
 
 
 def load_labels(path: Path) -> dict[str, dict]:
@@ -366,15 +484,27 @@ def build_split(meta: dict[str, dict], val_frac: float, genus_holdout: float,
     # test-only: never trained on, always held out (OOD probe set)
     forced_val = {m["accession"] for m in meta.values()
                   if m.get("rank_unresolved") == "1"}
-    accs = sorted({m["accession"] for m in meta.values()} - forced_val)
+    # genbank-sourced genomes are train-only: their taxonomy is
+    # submitter-declared (no RefSeq QC), so keeping the held-out set
+    # purely RefSeq keeps the benchmark clean when measuring whether
+    # genbank augmentation helps underrepresented groups
+    forced_train = {m["accession"] for m in meta.values()
+                    if m.get("seq_source") == "genbank"}
+    forced_val -= forced_train
+    gb_genera = {m["genus"] for m in meta.values()
+                 if m["accession"] in forced_train}
+    accs = sorted({m["accession"] for m in meta.values()}
+                  - forced_val - forced_train)
     rng.shuffle(accs)
     n_val = max(1, int(len(accs) * val_frac))
     val_accs = set(accs[:n_val]) | forced_val
 
     holdout_genera = set()
     if genus_holdout > 0:
+        # genera containing any train-only (genbank) member are excluded:
+        # holding one out would drag its genbank members into val anyway
         train_genera = sorted({m["genus"] for m in meta.values()
-                               if m["genus"]
+                               if m["genus"] and m["genus"] not in gb_genera
                                and m["accession"] not in val_accs})
         holdout_genera = set(rng.sample(
             train_genera, max(1, int(len(train_genera) * genus_holdout))))
@@ -422,6 +552,12 @@ def main():
                          "honest for the abstention metric")
     ap.add_argument("--wd", type=float, default=1e-4,
                     help="AdamW weight decay (default 1e-4)")
+    ap.add_argument("--head", choices=["flat", "tree"], default="flat",
+                    help="tree = cosine-prototype heads with sibling-"
+                         "conditional softmax + prior logit adjustment")
+    ap.add_argument("--prior-tau", type=float, default=1.0,
+                    help="tau for the tau*log(nu) sibling-prior offset "
+                         "(tree head, applied during training only)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cpu", action="store_true")
     args = ap.parse_args()
@@ -455,6 +591,8 @@ def main():
     all_targets = cls_targets + CONT_TARGETS
     n_classes = {r: len(vocab[r]) + 1 for r in cls_targets}  # +1 = unknown
     n_classes.update({t: 1 for t in CONT_TARGETS})  # scalar heads
+    tree = (build_tree(train_meta, vocab, cls_targets)
+            if args.head == "tree" else None)
 
     def encode_labels(rows):
         out = {}
@@ -490,7 +628,8 @@ def main():
                      cin=3 if args.pos_channels else 1,
                      backbone=args.backbone, side=1 << args.k,
                      targets=all_targets, dropout=args.dropout,
-                     stem_stride=args.stem_stride).to(device)
+                     stem_stride=args.stem_stride,
+                     head=args.head, tree=tree).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.wd)
     steps = len(train_ld) * args.epochs
@@ -509,15 +648,33 @@ def main():
             x, y, yc = x.to(device), y.to(device), yc.to(device)
             with torch.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=amp):
-                _, logits = model(x)
-                # skip heads whose batch labels are all masked —
-                # cross_entropy(ignore_index=0) returns NaN there (val
-                # batches whose rank labels are entirely out-of-vocab)
-                terms = [F.cross_entropy(logits[t], y[:, i],
-                                         ignore_index=0,
-                                         label_smoothing=args.label_smoothing)
-                         for i, t in enumerate(cls_targets)
-                         if (y[:, i] != 0).any()]
+                z, logits = model(x)
+                if args.head == "tree":
+                    # sibling-conditional NLL with prior offset; the
+                    # conditional softmax is the training target while
+                    # accuracy below still reads the chained marginals
+                    clp = model.cond_logps(z, tau=args.prior_tau)
+                    terms = []
+                    for i, t in enumerate(cls_targets):
+                        m = y[:, i] != 0
+                        if not m.any():
+                            continue
+                        ce = -clp[t][m].gather(
+                            1, (y[m, i] - 1)[:, None]).squeeze(1)
+                        if args.label_smoothing:
+                            ce = ((1 - args.label_smoothing) * ce
+                                  - args.label_smoothing
+                                  * clp[t][m].mean(1))
+                        terms.append(ce.mean())
+                else:
+                    # skip heads whose batch labels are all masked —
+                    # cross_entropy(ignore_index=0) returns NaN there (val
+                    # batches whose rank labels are entirely out-of-vocab)
+                    terms = [F.cross_entropy(logits[t], y[:, i],
+                                             ignore_index=0,
+                                             label_smoothing=args.label_smoothing)
+                             for i, t in enumerate(cls_targets)
+                             if (y[:, i] != 0).any()]
                 fm = yc[:, 0] >= 0          # coding_frac label present
                 btgt = ((yc[:, 0] > 0) & (yc[:, 0] < 1)).float()
                 if fm.any():
@@ -575,11 +732,17 @@ def main():
         mean_acc = float(np.mean(list(accs.values())))
         if mean_acc > best:
             best = mean_acc
-            torch.save({"model": model.state_dict(), "vocab": vocab,
-                        "k": args.k, "targets": all_targets,
-                        "args": {k: str(v) if isinstance(v, Path) else v
-                                 for k, v in vars(args).items()}},
-                       args.out / "best.pt")
+            ckpt = {"model": model.state_dict(), "vocab": vocab,
+                    "k": args.k, "targets": all_targets,
+                    "args": {k: str(v) if isinstance(v, Path) else v
+                             for k, v in vars(args).items()}}
+            if tree is not None:
+                ckpt["tree"] = {
+                    "parent_of": {r: tree["parent_of"][r].tolist()
+                                  for r in cls_targets},
+                    "log_prior": {r: tree["log_prior"][r].tolist()
+                                  for r in cls_targets}}
+            torch.save(ckpt, args.out / "best.pt")
     (args.out / "vocab.json").write_text(json.dumps(vocab, indent=1))
     print(f"done. best mean val acc {best:.3f} -> {args.out}/best.pt")
 

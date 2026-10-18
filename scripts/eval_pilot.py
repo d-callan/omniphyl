@@ -16,6 +16,16 @@ Metrics emitted:
   - RefSeq coverage gap report: which phyla in the labelled set have only a
     single assembly represented (culture-bias flag for the full corpus plan).
   - Confusion matrices (saved as TSV) for domain and phylum.
+  - Calibration: ECE + reliability bins over held-out genome fragments
+    (calibration.tsv), and risk-vs-coverage AURC (risk_coverage.tsv).
+  - Per-class recall tables (per_class_<rank>.tsv) on held-out genomes.
+  - Genome consensus: pooled log-prob accuracy per accession at M=1/5/20/all
+    fragments (genome_consensus in results.json).
+  - Per-fragment predictions dump (predictions.tsv).
+
+Subset flags: --val-only restricts inference to held-out val genomes
+(recommended for CPU evals); --max-genomes N caps how many held-out
+accessions are evaluated/probability-stored (0 = all).
 
 Reads:
   best.pt         OmniPhyl checkpoint (includes vocab, targets, k, args)
@@ -49,13 +59,23 @@ from train_omniphyl import (OmniPhyl, FragmentDataset, build_cell_lut,
                              encode_cont_labels)
 
 RANK_ORDER = RANKS  # domain -> ... -> species
+TOPK_CONS = 512     # sparse log-prob entries stored per frag per rank
 
 
-def load_labels(path: Path) -> dict[str, dict]:
+def load_labels(path: Path, keep: set | None = None,
+                cols: set | None = None) -> dict[str, dict]:
+    """Load labels.tsv. ``keep`` restricts to a set of frag_ids; ``cols``
+    restricts the stored fields per row (frag_id is the key, not stored).
+    Both are RAM savers for --val-only CPU evals on large corpora."""
     rows = {}
     with open(path, newline="") as f:
         for r in csv.DictReader(f, delimiter="\t"):
-            rows[r["frag_id"]] = r
+            fid = r["frag_id"]
+            if keep is not None and fid not in keep:
+                continue
+            if cols is not None:
+                r = {c: r.get(c, "") for c in cols}
+            rows[fid] = r
     return rows
 
 
@@ -120,6 +140,10 @@ def main():
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--cpu", action="store_true")
+    ap.add_argument("--val-only", action="store_true",
+                    help="restrict inference to held-out val genomes")
+    ap.add_argument("--max-genomes", type=int, default=0,
+                    help="cap held-out accessions evaluated (0 = all)")
     args = ap.parse_args()
 
     args.outdir.mkdir(parents=True, exist_ok=True)
@@ -142,7 +166,11 @@ def main():
                      cin=3 if train_args.get("pos_channels") else 1,
                      backbone=train_args.get("backbone", "resnet"),
                      side=1 << k,
-                     targets=all_targets)
+                     targets=all_targets,
+                     dropout=train_args.get("dropout", 0.0),
+                     stem_stride=train_args.get("stem_stride", 2),
+                     head=train_args.get("head", "flat"),
+                     tree=ckpt.get("tree"))
     model.load_state_dict(ckpt["model"])
     model.to(device).eval()
 
@@ -152,15 +180,44 @@ def main():
         id2name[t] = {idx + 1: name for name, idx in v.items()}
         id2name[t][0] = "<unknown>"
 
-    # Load labels
-    meta = load_labels(args.labels)
+    # Load labels; reproduce the training genome split up front so
+    # --val-only can filter the eval set before dataset construction.
+    # Two-pass read under --val-only: pass 1 keeps only the columns
+    # build_split needs (461k full rows = ~2 GB; slim rows ~50 MB); pass 2
+    # loads full rows for eval fragments only.
+    SPLIT_COLS = {"accession", "rank_unresolved", "genus"}
+    if args.val_only:
+        meta_split = load_labels(args.labels, cols=SPLIT_COLS)
+        val_accs, _ = build_split(
+            meta_split,
+            float(train_args.get("val_frac", 0.1)),
+            float(train_args.get("holdout_genus_frac", 0.0)),
+            int(train_args.get("seed", 0)))
+        eval_accs = set(sorted(val_accs)[:args.max_genomes or None])
+        keep = {fid for fid, m in meta_split.items()
+                if m.get("accession") in eval_accs}
+        meta = load_labels(args.labels, keep=keep)
+        fid_acc = {fid: m.get("accession", "")
+                   for fid, m in meta_split.items()}
+        del meta_split
+    else:
+        meta = load_labels(args.labels)
+        val_accs, _ = build_split(
+            meta,
+            float(train_args.get("val_frac", 0.1)),
+            float(train_args.get("holdout_genus_frac", 0.0)),
+            int(train_args.get("seed", 0)))
+        eval_accs = set(sorted(val_accs)[:args.max_genomes or None])
+        fid_acc = {fid: m.get("accession", "") for fid, m in meta.items()}
     encoded = encode_labels_from_vocab(meta, vocab, cls_targets)
     cont = encode_cont_labels(meta)
 
     lut = build_cell_lut(k)
     ds = FragmentDataset(args.fragments, encoded, k, lut,
                          pos=train_args.get("pos_channels", False),
-                         targets=cls_targets, cont=cont)
+                         targets=cls_targets, cont=cont,
+                         seq=train_args.get("backbone") == "seq",
+                         seq_len=int(train_args.get("seq_len", 500)))
     loader = torch.utils.data.DataLoader(
         ds, args.batch_size, shuffle=False,
         num_workers=args.num_workers)
@@ -172,11 +229,20 @@ def main():
     cont_out: dict[str, list[float]] = {t: [] for t in CONT_TARGETS}
     cont_true: list[tuple] = []
     frag_ids = ds.ids
+    # Frag positions (held-out genomes) whose full log-probs get stored for
+    # calibration/consensus metrics; float16 rows keep RAM bounded.
+    consensus_pos = {i for i, fid in enumerate(frag_ids)
+                     if fid_acc.get(fid) in eval_accs}
+    cons_pos_list: list[int] = []
+    cons_logp: dict[str, list] = {t: [] for t in cls_targets}
 
     with torch.no_grad():
+        pos = 0
         for x, y, yc in loader:
             x = x.to(device)
             _, logits = model(x)
+            logp = {t: F.log_softmax(logits[t], 1).cpu()
+                    for t in cls_targets}
             for i, t in enumerate(cls_targets):
                 all_preds[t].extend(logits[t].argmax(1).cpu().tolist())
                 all_confs[t].extend(
@@ -187,6 +253,16 @@ def main():
                     cont_out[t].extend(
                         torch.sigmoid(logits[t][:, 0]).cpu().tolist())
             cont_true.extend(yc.tolist())
+            for j in range(x.size(0)):
+                if pos + j in consensus_pos:
+                    cons_pos_list.append(pos + j)
+                    for t in cls_targets:
+                        kk = min(TOPK_CONS, logp[t].size(1))
+                        v, i = torch.topk(logp[t][j], kk)
+                        cons_logp[t].append(
+                            (i.numpy().astype(np.int32),
+                             v.numpy().astype(np.float16)))
+            pos += x.size(0)
 
     # -----------------------------------------------------------------------
     # 1. Per-target accuracy + macro-F1
@@ -216,7 +292,7 @@ def main():
         Boundary recall vs flag rate is the cascade-economics gate
         (open question 1 in docs/annotation-cascade.md).
         """
-        sel = np.asarray(idxs)
+        sel = np.asarray(idxs, dtype=np.int64)
         ft, ot = frac_true[sel], off_true[sel]
         fmk, omk = ft >= 0, ot >= 0
         out = {}
@@ -263,13 +339,8 @@ def main():
     #     separately. per_target mixes memorized train frags with held-out
     #     frags; the val column is the real generalization readout.
     # -----------------------------------------------------------------------
-    val_accs, _ = build_split(
-        meta,
-        float(train_args.get("val_frac", 0.1)),
-        float(train_args.get("holdout_genus_frac", 0.0)),
-        int(train_args.get("seed", 0)))
     val_set = {i for i, fid in enumerate(frag_ids)
-               if meta[fid].get("accession") in val_accs}
+               if fid_acc.get(fid) in val_accs}
     val_idxs = sorted(val_set)
     train_idxs = [i for i in all_idxs if i not in val_set]
     results["split_metrics"] = {
@@ -391,6 +462,177 @@ def main():
         cm_path = args.outdir / f"confusion_{t}.tsv"
         cm_path.write_text(cm)
         print(f"wrote {cm_path}")
+
+    # -----------------------------------------------------------------------
+    # 7. Calibration: 10-bin ECE + reliability table; risk-coverage AURC.
+    #    Computed on held-out-genome fragments (eval_accs subset).
+    # -----------------------------------------------------------------------
+    calib_pos = cons_pos_list
+    edges = np.linspace(0.0, 1.0, 11)
+    calib_rows = ["rank\tbin_lo\tbin_hi\tn\tacc\tconf"]
+    rc_rows = ["rank\tcoverage\trisk\tn"]
+    ece_by_rank: dict[str, float] = {}
+    aurc_by_rank: dict[str, float] = {}
+    for t in cls_targets:
+        conf = np.array([all_confs[t][p] for p in calib_pos])
+        true = np.array([all_true[t][p] for p in calib_pos])
+        pred = np.array([all_preds[t][p] for p in calib_pos])
+        known = true != 0
+        if not known.any():
+            continue
+        conf, pred, true = conf[known], pred[known], true[known]
+        ece = 0.0
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            m = (conf >= lo) & (conf <= hi if hi >= 1.0 else conf < hi)
+            if not m.any():
+                continue
+            acc_b = float((pred[m] == true[m]).mean())
+            conf_b = float(conf[m].mean())
+            calib_rows.append(f"{t}\t{lo:.2f}\t{hi:.2f}\t{int(m.sum())}\t"
+                              f"{acc_b:.4f}\t{conf_b:.4f}")
+            ece += m.sum() / len(conf) * abs(acc_b - conf_b)
+        ece_by_rank[t] = round(float(ece), 4)
+        order = np.argsort(-conf)
+        corr = (pred[order] == true[order]).astype(float)
+        risks = []
+        for c in np.arange(0.05, 1.0001, 0.05):
+            k_ = max(1, int(round(c * len(order))))
+            r = float(1 - corr[:k_].mean())
+            risks.append(r)
+            rc_rows.append(f"{t}\t{c:.2f}\t{r:.4f}\t{k_}")
+        aurc_by_rank[t] = round(float(np.mean(risks)), 4)
+    (args.outdir / "calibration.tsv").write_text("\n".join(calib_rows) + "\n")
+    (args.outdir / "risk_coverage.tsv").write_text("\n".join(rc_rows) + "\n")
+    results["calibration_ece"] = ece_by_rank
+    results["risk_coverage_aurc"] = aurc_by_rank
+    print("\nCalibration (held-out frags):")
+    for t in cls_targets:
+        if t in ece_by_rank:
+            print(f"  {t:10s}  ECE={ece_by_rank[t]}  AURC={aurc_by_rank[t]}")
+
+    # -----------------------------------------------------------------------
+    # 8. Per-class recall tables on held-out frags
+    # -----------------------------------------------------------------------
+    for t in cls_targets:
+        sup: dict[int, list] = defaultdict(lambda: [0, 0, 0])
+        for p in calib_pos:
+            tr, pr = all_true[t][p], all_preds[t][p]
+            if tr == 0:
+                continue
+            sup[tr][0] += 1
+            sup[tr][1] += int(pr == tr)
+            sup[pr][2] += 1
+        rows = ["class\tname\tsupport\trecall\tn_predicted"]
+        for c, (n, tp, npred) in sorted(sup.items(), key=lambda kv: -kv[1][0]):
+            rows.append(f"{c}\t{id2name[t].get(c, str(c))}\t{n}\t"
+                        f"{tp / max(n, 1):.4f}\t{npred}")
+        (args.outdir / f"per_class_{t}.tsv").write_text("\n".join(rows) + "\n")
+    print(f"wrote {args.outdir}/per_class_<rank>.tsv")
+
+    # -----------------------------------------------------------------------
+    # 9. Per-fragment predictions dump (all evaluated frags)
+    # -----------------------------------------------------------------------
+    hdr = "frag_id\taccession\tgroup\t" + "\t".join(
+        f"{t}_true\t{t}_pred\t{t}_conf" for t in cls_targets)
+    pred_rows = [hdr]
+    for i, fid in enumerate(frag_ids):
+        cols = [fid, fid_acc.get(fid, ""), meta[fid].get("group", "")]
+        for t in cls_targets:
+            cols += [id2name[t].get(all_true[t][i], str(all_true[t][i])),
+                     id2name[t].get(all_preds[t][i], str(all_preds[t][i])),
+                     f"{all_confs[t][i]:.4f}"]
+        pred_rows.append("\t".join(cols))
+    (args.outdir / "predictions.tsv").write_text("\n".join(pred_rows) + "\n")
+    print(f"wrote {args.outdir/'predictions.tsv'}")
+
+    # -----------------------------------------------------------------------
+    # 10. Genome consensus: pooled log-probs per accession, M-frag sweep.
+    #     Tests whether contig-level aggregation rescues per-frag weakness.
+    # -----------------------------------------------------------------------
+    acc_to_local: dict[str, list[int]] = defaultdict(list)
+    for li, gp in enumerate(cons_pos_list):
+        acc_to_local[fid_acc.get(frag_ids[gp], "")].append(li)
+    acc_group = {acc: meta[frag_ids[cons_pos_list[l[0]]]].get("group", "")
+                 for acc, l in acc_to_local.items()}
+    rng = np.random.default_rng(0)
+
+    # fragments-per-genome distribution per group: contextualizes M=20 vs
+    # "all" — a small-genome group where the corpus only sampled ~10 frags
+    # makes M=20 effectively whole-genome, which inflates apparent lift.
+    fpg_rows = ["group\tn_genomes\tfrags_mean\tfrags_median\tfrags_max"]
+    fpg_stats: dict[str, dict] = {}
+    for g in sorted(set(acc_group.values())):
+        ns = [len(l) for acc, l in acc_to_local.items() if acc_group[acc] == g]
+        if not ns:
+            continue
+        fpg_stats[g] = {"n_genomes": len(ns), "mean": round(np.mean(ns), 1),
+                        "median": int(np.median(ns)), "max": max(ns)}
+        fpg_rows.append(f"{g}\t{len(ns)}\t{np.mean(ns):.1f}\t"
+                        f"{int(np.median(ns))}\t{max(ns)}")
+    (args.outdir / "frags_per_genome.tsv").write_text(
+        "\n".join(fpg_rows) + "\n")
+    results["frags_per_genome"] = fpg_stats
+    print("\nFragments per held-out genome:")
+    for r in fpg_rows:
+        print(f"  {r}")
+
+    def pool_vote(t, take) -> int:
+        pooled: dict[int, float] = defaultdict(float)
+        for li in np.atleast_1d(take):
+            idx, val = cons_logp[t][li]
+            # topk values are sorted desc: val[-1] is the floor
+            # every non-topK class would contribute. Subtract it
+            # so stored entries are logp - floor; classes absent
+            # from a frag's topK then get 0 marginal advantage.
+            floor = float(val[-1])
+            for c, v in zip(idx.tolist(), val.tolist()):
+                pooled[c] += v - floor
+        return max(pooled.items(), key=lambda kv: kv[1])[0] if pooled else 0
+
+    consensus: dict[str, dict] = {}
+    consensus_by_group: dict[str, dict] = defaultdict(dict)
+    cbg_rows = ["group\trank\tM\tacc\tn_genomes"]
+    print("\nGenome consensus accuracy (held-out accessions):")
+    for t in cls_targets:
+        if not cons_logp[t]:
+            continue
+        per_m = {}
+        for m in (1, 5, 20, 0):
+            correct = total = 0
+            grp_stat: dict[str, list] = defaultdict(lambda: [0, 0])
+            for acc, locs in acc_to_local.items():
+                gi = cons_pos_list[locs[0]]
+                if all_true[t][gi] == 0:
+                    continue
+                take = (locs if m == 0 else
+                        rng.choice(locs, min(m, len(locs)), replace=False))
+                pred_c = pool_vote(t, take)
+                hit = int(pred_c == all_true[t][gi])
+                correct += hit
+                total += 1
+                grp_stat[acc_group[acc]][0] += hit
+                grp_stat[acc_group[acc]][1] += 1
+            key = "all" if m == 0 else f"M{m}"
+            per_m[key] = {"acc": round(correct / total, 4) if total else None,
+                          "n_genomes": total}
+            for g, (hit, n) in sorted(grp_stat.items()):
+                consensus_by_group[g].setdefault(t, {})[key] = {
+                    "acc": round(hit / n, 4) if n else None, "n_genomes": n}
+                cbg_rows.append(f"{g}\t{t}\t{key}\t"
+                                f"{round(hit / n, 4) if n else ''}\t{n}")
+        consensus[t] = per_m
+        print(f"  {t:10s}  " + "  ".join(
+            f"{k}={v['acc']}" for k, v in per_m.items()))
+    results["genome_consensus"] = consensus
+    results["genome_consensus_by_group"] = dict(consensus_by_group)
+    (args.outdir / "consensus_by_group.tsv").write_text(
+        "\n".join(cbg_rows) + "\n")
+    print(f"wrote {args.outdir/'consensus_by_group.tsv'}")
+    print("\nConsensus by group (all-frags pooled):")
+    for g, ranks in sorted(consensus_by_group.items()):
+        print(f"  {g:20s}  " + "  ".join(
+            f"{t}:{ranks[t]['all']['acc']}(n={ranks[t]['all']['n_genomes']})"
+            for t in cls_targets if t in ranks))
 
     # -----------------------------------------------------------------------
     # Write full results JSON

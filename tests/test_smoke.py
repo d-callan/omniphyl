@@ -27,7 +27,7 @@ from fetch_refseq_corpus import (  # noqa: E402
     veupath_intervals, _collect_bed_items)
 from train_omniphyl import (  # noqa: E402
     encode_cont_labels, CONT_TARGETS, RANKS, FragmentDataset,
-    build_cell_lut, load_labels)
+    build_cell_lut, load_labels, build_tree, OmniPhyl)
 
 PASS, FAIL = [], []
 
@@ -102,6 +102,72 @@ def test_slicing_and_encoding():
     check("encoded frac+offset", enc["f1"] == (0.5, 0.25), enc["f1"])
     check("missing -> -1 sentinel", enc["f2"] == (-1.0, -1.0))
     check("non-numeric offset -> -1", enc["f3"] == (0.0, -1.0))
+
+
+def test_tree_head():
+    print("[tree head / A1]")
+    import torch
+    rng = random.Random(2)
+    # 2 phyla, each with 2 families; species nested under families
+    rows = {}
+    vocab = {r: {} for r in RANKS}
+    lin = [("Bacteria", "P1", "C1", "O1", "F1", "G1", "S1"),
+           ("Bacteria", "P1", "C1", "O1", "F2", "G2", "S2"),
+           ("Bacteria", "P2", "C2", "O2", "F3", "G3", "S3")]
+    for i, lin_row in enumerate(lin):
+        rows[f"f{i}"] = {r: v for r, v in zip(RANKS, lin_row)}
+    for m in rows.values():
+        for r in RANKS:
+            if m[r] not in vocab[r]:
+                vocab[r][m[r]] = len(vocab[r])
+    tree = build_tree(rows, vocab, RANKS)
+    check("parent_of covers ranks", set(tree["parent_of"]) == set(RANKS))
+    po = tree["parent_of"]["family"]  # [0, F1, F2, F3] -> parents O1,O1,O2
+    fam_ids = [vocab["family"][n] + 1 for n in ("F1", "F2", "F3")]
+    check("families link to their orders",
+          [po[c].item() for c in fam_ids]
+          == [vocab["order"][o] + 1 for o in ("O1", "O1", "O2")],
+          po.tolist())
+    # priors normalized within sibling groups
+    lp = tree["log_prior"]["family"]
+    g = {po[c].item() for c in fam_ids}
+    check("one entry per parent group", len(g) == 2, g)
+
+    n_classes = {r: len(vocab[r]) + 1 for r in RANKS}
+    n_classes.update({t: 1 for t in CONT_TARGETS})
+    model = OmniPhyl(n_classes, width=16, cin=1, side=8,
+                     targets=RANKS + CONT_TARGETS, head="tree",
+                     tree=tree)
+    model.eval()
+    with torch.no_grad():
+        _, logits = model(torch.randn(4, 1, 8, 8))
+        # marginal probs must be non-increasing down the tree for the
+        # argmax lineage (tree coherence guarantee)
+        marg = {t: logits[t][:, 1:].exp() for t in RANKS}
+        cond = model.cond_logps(model.drop(torch.randn(4, 16 * 8)), tau=0.0)
+    # marg(c) <= marg(parent(c)) for every class — the tree invariant;
+    # root/orphan groups (parent 0) inherit mass 1 and are skipped
+    mono = True
+    for i in range(1, len(RANKS)):
+        po = tree["parent_of"][RANKS[i]][1:]
+        linked = po > 0
+        if not bool(linked.any()):
+            continue
+        child = marg[RANKS[i]][:, linked]
+        par = marg[RANKS[i - 1]][:, po[linked] - 1]
+        mono &= bool((child <= par + 1e-5).all())
+    check("marginals non-increasing down ranks", mono)
+    # conditional probs sum to 1 within each sibling group
+    ok = True
+    for i in range(1, len(RANKS)):
+        po = tree["parent_of"][RANKS[i]][1:]
+        pc = cond[RANKS[i]].exp()
+        for g in po.unique().tolist():
+            s = pc[:, po == g].sum(1)
+            ok &= bool(((s - 1).abs() < 1e-4).all())
+    check("sibling conditionals sum to 1", ok)
+    check("logit col0 pinned to -inf",
+          bool((logits["species"][:, 0] < -1e3).all()))
 
 
 # ----------------------------------------------------------- end to end ---
@@ -217,9 +283,70 @@ def test_end_to_end():
               res.get("annotation_heads", {}).get("boundary", {}))
 
 
+def test_contaminant_screen():
+    """Layer-3 accession exemption: an accession that is itself a contaminant
+    species keeps its fragments; isolated hits are still rejected."""
+    import screen_contaminants as sc
+
+    tmp = Path(tempfile.mkdtemp())
+    fna, lab, out = tmp / "fragments.fna", tmp / "labels.tsv", tmp / "out"
+    contam_seq = "A" * 200          # every 21-mer = poly-A canonical k-mer
+    clean_seq = "ACGT" * 50         # real-looking, no poly-A k-mers
+    # GCF_X: all frags contaminant-like -> accession exempted wholesale
+    # GCF_Y: 1 of 4 frags contaminated -> just that frag rejected
+    rows = ([("X|0", "GCF_X.1", contam_seq), ("X|1", "GCF_X.1", contam_seq),
+             ("Y|0", "GCF_Y.1", contam_seq)] +
+            [(f"Y|{i}", "GCF_Y.1", clean_seq) for i in (1, 2, 3)])
+    with open(fna, "w") as f:
+        for fid, _, seq in rows:
+            f.write(f">{fid}\n{seq}\n")
+    with open(lab, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["frag_id", "accession"])
+        for fid, acc, _ in rows:
+            w.writerow([fid, acc])
+
+    old_argv, old_loader = sys.argv, sc.load_contaminant_sketches
+    sys.argv = ["screen_contaminants.py", "--fragments", str(fna),
+                "--labels", str(lab), "--outdir", str(out)]
+    sc.load_contaminant_sketches = lambda cd, hf: {"fake": sc.kmers(contam_seq)}
+    try:
+        sc.main()
+        ran = True
+    except Exception as e:
+        print(f"    screen raised: {e!r}")
+        ran = False
+    finally:
+        sys.argv, sc.load_contaminant_sketches = old_argv, old_loader
+    check("screen runs on synthetic corpus", ran)
+    if not ran:
+        return
+
+    man = json.loads((out / "screen_manifest.json").read_text())
+    check("contaminant-species member exempted",
+          man["contaminant_member_accessions"] == ["GCF_X.1"],
+          str(man["contaminant_member_accessions"]))
+    check("isolated hit still rejected",
+          man["n_rejected"] == 1 and man["n_passed"] == 5,
+          f"passed={man['n_passed']} rejected={man['n_rejected']}")
+    with open(out / "labels_screened.tsv") as f:
+        passed = {r["frag_id"]
+                  for r in csv.DictReader(f, delimiter="\t")}
+    check("member frags + clean frags kept",
+          passed == {"X|0", "X|1", "Y|1", "Y|2", "Y|3"},
+          str(sorted(passed)))
+    with open(out / "fragments_rejected.tsv") as f:
+        rej = list(csv.DictReader(f, delimiter="\t"))
+    check("rejected row is the contamination island",
+          len(rej) == 1 and rej[0]["frag_id"] == "Y|0" and
+          rej[0]["reason"] == "contaminant_hit",
+          str(rej))
+
+
 def main():
     for t in (test_label_math, test_veupath_helpers,
-              test_slicing_and_encoding, test_end_to_end):
+              test_slicing_and_encoding, test_tree_head,
+              test_contaminant_screen, test_end_to_end):
         t()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
