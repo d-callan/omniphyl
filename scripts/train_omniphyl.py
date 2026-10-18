@@ -572,14 +572,15 @@ class TreeRankHead(nn.Module):
         denom.scatter_add_(1, pidx, lg.exp())
         return lg - denom.gather(1, pidx).clamp_min(1e-30).log()
 
-    def marginal_logp(self, z, prev_ext=None):
+    def marginal_logp(self, z, prev_ext=None, tau: float = 0.0):
         """Chained log-marginals for classes 1..C-1.
 
         prev_ext: [B, C_prev] log-marginals of the previous rank with a
         leading 0 column (log 1) so orphan classes (parent_of==0) inherit
-        root mass 1.0.
+        root mass 1.0. tau reinstates the training-time prior offset for
+        MAP decisions; tau=0 gives prior-balanced conditionals instead.
         """
-        cond = self.cond_logits(z)  # inference strips the prior offset
+        cond = self.cond_logits(z, tau)
         if prev_ext is None:
             return cond
         pidx = self.parent_of[1:].expand(z.size(0), -1)
@@ -611,6 +612,7 @@ class OmniPhyl(nn.Module):
                                       nn.LayerNorm(aux_dim), nn.ReLU())
                         if "aa" in self.aux else None)
         self.latent = self.encoder.latent + aux_dim * len(self.aux)
+        self.infer_tau = 0.0   # prior offset at inference (MAP if >0)
         self.drop = nn.Dropout(dropout)
         keys = targets if targets is not None else list(n_classes.keys())
         tree_po = (tree or {}).get("parent_of", {}) if head == "tree" else {}
@@ -640,7 +642,7 @@ class OmniPhyl(nn.Module):
         prev_ext = None  # [B, C_prev] chained log-marginals, col 0 = log 1
         for t, h in self.heads.items():
             if isinstance(h, TreeRankHead):
-                logm = h.marginal_logp(z, prev_ext)
+                logm = h.marginal_logp(z, prev_ext, self.infer_tau)
                 prev_ext = torch.cat(
                     [logm.new_zeros(logm.size(0), 1), logm], 1)
                 # col 0 (unknown class) gets a large negative so argmax

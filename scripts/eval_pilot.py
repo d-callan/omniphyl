@@ -141,6 +141,10 @@ def main():
     ap.add_argument("--outdir", required=True, type=Path)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--infer-tau", type=float, default=None,
+                    help="tree head: prior offset at inference. Default "
+                         "= the checkpoint's training --prior-tau (MAP "
+                         "decisions); 0 gives prior-balanced conditionals")
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--val-only", action="store_true",
                     help="restrict inference to held-out val genomes")
@@ -178,6 +182,14 @@ def main():
                      aux={a for a in train_args.get("aux", "").split(",")
                           if a})
     model.load_state_dict(ckpt["model"])
+    # The tree head is trained so softmax(logits + tau*log nu) = P(y);
+    # evaluating at that same tau restores the posterior the model was
+    # fit to. tau=0 instead reports P/nu (rare-class-inflated ratios).
+    model.infer_tau = (args.infer_tau if args.infer_tau is not None
+                       else float(train_args.get("prior_tau", 0.0))
+                       if train_args.get("head") == "tree" else 0.0)
+    if train_args.get("head") == "tree":
+        print(f"tree head: infer_tau={model.infer_tau}")
     model.to(device).eval()
 
     # Build reverse vocab (id -> name) for reporting
