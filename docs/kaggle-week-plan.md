@@ -70,33 +70,27 @@ Order follows the proposal's ablation ladder, re-sorted so the highest-informati
 
 ### Arm results — 5group-mini corpus (2,874 genomes, 63,372 screened frags)
 
-**A0 (flat)** — kernel `omniphyl-a0-flat` v2, `~/omniphyl-work/a0_out/`:
+**Same-inputs comparison** (both `best.pt`s re-evaluated locally on the raw corpus labels + fragments, identical val split — avoids screened-vs-raw corpus skew):
 
-| rank | frag acc | macro-F1 | consensus (all frags) |
-|---|---|---|---|
-| domain | 0.662 | 0.266 | 0.768 |
-| phylum | 0.531 | 0.035 | 0.624 |
-| class | 0.492 | 0.015 | 0.553 |
-| order | 0.135 | 0.010 | 0.172 |
-| family–species | n=0 (no in-vocab val labels) | — | — |
+| rank | A0 frag acc | A1 frag acc | A0 macro-F1 | A1 macro-F1 | A0 consensus | A1 consensus |
+|---|---|---|---|---|---|---|
+| domain | 0.755 | **0.873** | 0.373 | **0.482** | 0.841 | **0.928** |
+| phylum | 0.539 | **0.665** | 0.051 | **0.104** | 0.603 | **0.713** |
+| class | 0.501 | 0.504 | 0.028 | 0.041 | 0.566 | 0.523 |
+| order | **0.173** | 0.117 | 0.018 | 0.015 | **0.230** | 0.101 |
+| family | **0.120** | 0.056 | **0.013** | 0.005 | **0.205** | 0.079 |
+| genus | **0.095** | 0.034 | **0.010** | 0.003 | **0.238** | 0.049 |
+| species | **0.095** | 0.040 | **0.010** | 0.003 | **0.218** | 0.052 |
 
-Collapse check (predicted-class entropy from `predictions.tsv`): phylum H=1.72 nats, Uroviricota takes 50.8% of all phylum calls — the v4 collapse is reproduced on the frozen corpus.
+Collapse check (predicted-class entropy): phylum H 1.72→2.12 nats, Uroviricota top-share 50.8%→41.5% — the v4 collapse is undone.
 
-**A1 (tree head)** — kernel `omniphyl-a1-tree` v5. First read looked catastrophic (val domain 0.19, deep ranks 0.000), but that was an **eval artifact, not a training failure**: the head is trained so `softmax(logits + τ·log ν) = P(y)` with `PRIOR_TAU=1.0`, while the evaluator computed marginals at τ=0 — i.e. argmax over `P/ν` odds-over-prior ratios, which systematically inflates rare taxa (9,820 Bacteria frags called *Singelaviria*; a rare chytrid lineage took 61.6% of genus calls). Re-running eval with `--infer-tau 1.0` (MAP, `f6eceba` — now the default for tree ckpts) on the same `best.pt`:
+**A1 (tree head)** — kernel `omniphyl-a1-tree` v5. First read looked catastrophic (val domain 0.19, deep ranks 0.000), but that was an **eval artifact, not a training failure**: the head is trained so `softmax(logits + τ·log ν) = P(y)` with `PRIOR_TAU=1.0`, while the evaluator computed marginals at τ=0 — i.e. argmax over `P/ν` odds-over-prior ratios, which systematically inflates rare taxa (9,820 Bacteria frags called *Singelaviria*; a rare chytrid lineage took 61.6% of genus calls). Re-running eval with `--infer-tau 1.0` (MAP, `f6eceba` — now the default for tree ckpts) on the same `best.pt` gives the table above.
 
-| rank | frag acc | macro-F1 | consensus |
-|---|---|---|---|
-| domain | **0.873** | **0.482** | **0.928** |
-| phylum | **0.665** | **0.104** | **0.713** |
-| class | 0.504 | 0.041 | 0.523 |
-| order | 0.118 | 0.016 | 0.101 |
-| family | 0.056 | 0.005 | 0.079 |
-| genus | 0.034 | 0.003 | 0.049 |
-| species | 0.040 | 0.003 | 0.052 |
+**Gate: passed, with a real caveat.** The stated gate passes — phylum macro-F1 ~2× A0, entropy up, collapse undone, domain/phylum consensus up 9–11 pts. But the same-inputs table reveals a systematic **deep-rank regression** the gate didn't anticipate: order and below, the tree head is 2–4× *worse* on both frag acc and consensus. Mechanism: chained marginals compound errors — once a parent conditional misses, the child marginal inherits mass under the wrong ancestor, and on held-out genera (unseen deep classes) the prior-conditioned chain guesses worse than independent flat softmaxes. The tree head buys shallow-rank structure and weak-group rescue at the cost of deep-rank guessing.
 
-**Gate: passed.** Phylum macro-F1 3× A0, domain ~2×, class ~3×; phylum entropy 1.72→2.12 with Uroviricota top-share 50.8→41.5 (collapse undone); calibration also improves (domain ECE 0.31→0.07). Family macro-F1 is formally unevaluable for A0 (n=0 on val) but the macro-F1 trend favors the tree head at every comparable rank. Deep-rank *accuracy* stays low on held-out genera — expected: those classes are unseen by construction. A1 ships to scale; tree head becomes the default for cumulative arms pending A2's backbone verdict.
+**Where the gains come from** (group consensus, A0→A1): archaea jumps from ~0.2 domain / 0.0 phylum to 0.80 / 0.50 / 0.33 class — the prior-sibling structure borrows strength for undersampled groups. Fungi class 0.42→0.42 flat (frag) but phylum 0.52→0.73. Regressions: bacterial order −0.15, and deep ranks broadly.
 
-**Where the gains come from** (group consensus, A0→A1): archaea was 0.000 at *every* rank under the flat head and reaches domain 0.80 / phylum 0.50 / class 0.33 under the tree head — the prior-sibling structure effectively borrows strength for undersampled groups. Fungi class jumps 0.067→0.419. The only regressions are where the flat head already had signal (bacterial order −0.12, viral class −0.06). *Caveat:* the A1 numbers above come from a local CPU eval on the **raw** corpus labels (63,449 frags), while A0 was evaluated on the screened corpus (63,372) — val sets overlap but aren't identical (e.g. archaea n=5 vs n=10). Margins are large enough that the verdict is unaffected; for the paper table re-evaluate A0 on identical inputs.
+**Design implication for A5:** a hybrid head — tree/conditional at shallow ranks (domain–class) + flat at deep ranks (order–species) — would capture the win without the chained-marginal penalty where classes are unseen by construction. Worth a cheap variant before scale-up if A2's timing permits; otherwise ship tree-everywhere and note the trade.
 
 ---
 
