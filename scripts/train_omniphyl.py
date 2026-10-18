@@ -185,6 +185,96 @@ def fcgr_encode_ms(seq: str, luts: dict[int, np.ndarray],
     return out
 
 
+# ------------------------------------------------------- aux branches ---
+
+HASH_K = 11                    # canonical marker-kmer length (A3)
+HASH_BUCKETS = 1 << 16         # EmbeddingBag rows
+HASH_PAD = HASH_BUCKETS        # padding_idx for variable-length bags
+HASH_LEN = 512                 # padded bag size (500bp -> ~490 11-mers)
+AA_LETTERS = "ACDEFGHIKLMNPQRSTVWY"  # 20 standard AAs; index 20 = stop
+AA_ALPHA = len(AA_LETTERS) + 1
+AA_DIM = AA_ALPHA ** 3         # 9261-dim tripeptide spectrum
+
+
+def _build_aa_lut() -> np.ndarray:
+    """codon base-4 index (A,C,G,T digit order) -> AA letter idx; 20=stop."""
+    # standard genetic code, rows = first base, cols = second*4+third
+    # in T,C,A,G order
+    rows = {"T": "FFLLSSSSYY**CC*W",
+            "C": "LLLLPPPPHHQQRRRR",
+            "A": "IIIMTTTTNNKKSSRR",
+            "G": "VVVVAAAADDEEGGGG"}
+    tcag = {0: 2, 1: 1, 2: 3, 3: 0}      # our digit -> T,C,A,G position
+    first = {0: "A", 1: "C", 2: "G", 3: "T"}
+    lut = np.full(64, -1, dtype=np.int64)
+    for d0 in range(4):
+        row = rows[first[d0]]
+        for d1 in range(4):
+            for d2 in range(4):
+                aa = row[tcag[d1] * 4 + tcag[d2]]
+                lut[d0 * 16 + d1 * 4 + d2] = (
+                    AA_ALPHA - 1 if aa == "*" else AA_LETTERS.index(aa))
+    return lut
+
+
+_AA_LUT = _build_aa_lut()
+
+
+def hash_encode(seq: str, canon: np.ndarray) -> np.ndarray:
+    """sequence -> padded hash-bucket ids [HASH_LEN] int64 (A3 branch).
+
+    Canonical 11-mers are multiplicatively hashed into HASH_BUCKETS rows;
+    HASH_PAD fills the tail. Strand-invariant via the rc canon map.
+    """
+    out = np.full(HASH_LEN, HASH_PAD, dtype=np.int64)
+    codes = BASE2DIGIT[np.frombuffer(seq.encode("ascii", "replace"),
+                                     dtype=np.uint8)]
+    if len(codes) < HASH_K:
+        return out
+    win = np.lib.stride_tricks.sliding_window_view(codes, HASH_K)
+    valid = (win >= 0).all(axis=1)
+    if not valid.any():
+        return out
+    w = win[valid]
+    kidx = (w * (4 ** np.arange(HASH_K - 1, -1, -1, dtype=np.int64))).sum(1)
+    cidx = canon[kidx]
+    buckets = (cidx.astype(np.uint64) * np.uint64(2654435761)) \
+        % np.uint64(HASH_BUCKETS)
+    n = min(len(buckets), HASH_LEN)
+    out[:n] = buckets[:n].astype(np.int64)
+    return out
+
+
+def aa_encode(seq: str) -> np.ndarray:
+    """sequence -> 6-frame AA 3-mer spectrum [AA_DIM] float32 (A3 branch).
+
+    Translates all 3 frames on both strands (stop = letter 20), counts
+    tripeptides, log-enrichment normalized. Codons touching an N are
+    dropped. Synonymous 3rd-position drift cancels inside each tripeptide
+    bin, preserving signal where nucleotide k-mers saturate.
+    """
+    codes = BASE2DIGIT[np.frombuffer(seq.encode("ascii", "replace"),
+                                     dtype=np.uint8)]
+    vec = np.zeros(AA_DIM, dtype=np.float32)
+    for c in (codes, 3 - codes[::-1]):      # forward + reverse-complement
+        for off in range(3):
+            n = (len(c) - off) // 3 * 3
+            if n <= 0:
+                continue
+            trip = c[off:off + n].reshape(-1, 3)
+            ok = (trip >= 0).all(axis=1)
+            cidx = np.clip(trip[:, 0] * 16 + trip[:, 1] * 4 + trip[:, 2],
+                           0, 63)
+            aa = np.where(ok, _AA_LUT[cidx], -1)
+            aa = aa[aa >= 0]
+            if len(aa) < 3:
+                continue
+            w = np.lib.stride_tricks.sliding_window_view(aa, 3)
+            idx = (w * np.array([AA_ALPHA ** 2, AA_ALPHA, 1])).sum(axis=1)
+            np.add.at(vec, idx, 1.0)
+    return np.log1p(vec / max(vec.sum(), 1.0) * AA_DIM)
+
+
 def seq_encode(seq: str, seq_len: int,
                perm: np.ndarray | None = None) -> np.ndarray:
     """sequence -> one-hot tensor [4, seq_len] float32; N -> all-zero col.
@@ -212,7 +302,9 @@ class FragmentDataset(Dataset):
                  cont: dict[str, tuple] | None = None,
                  seq: bool = False, seq_len: int = 500,
                  ms_luts: dict[int, np.ndarray] | None = None,
-                 ms_canons: dict[int, np.ndarray] | None = None):
+                 ms_canons: dict[int, np.ndarray] | None = None,
+                 aux: set | None = None,
+                 hash_canon: np.ndarray | None = None):
         self.fasta = Path(fasta)
         self.k = k
         self.lut = lut
@@ -222,6 +314,8 @@ class FragmentDataset(Dataset):
         self.seq_len = seq_len
         self.ms_luts = ms_luts      # set -> multi-scale RC-canonical FCGR
         self.ms_canons = ms_canons
+        self.aux = aux or set()   # {"hash","aa"} extra input branches (A3)
+        self.hash_canon = hash_canon
         self.labels = labels  # frag_id -> {target: int}
         self.cont = cont or {}  # frag_id -> (coding_frac, boundary_offset)
         self.ids = list(labels.keys())
@@ -274,7 +368,14 @@ class FragmentDataset(Dataset):
         lab = np.array([self.labels[fid].get(t, 0) for t in self.targets],
                        dtype=np.int64)
         c = self.cont.get(fid, (-1.0, -1.0))  # -1 = unlabeled/missing
-        return (torch.from_numpy(img), torch.from_numpy(lab),
+        x = torch.from_numpy(img)
+        if self.aux:
+            x = {"x": x}
+            if "hash" in self.aux:
+                x["hash"] = torch.from_numpy(hash_encode(s, self.hash_canon))
+            if "aa" in self.aux:
+                x["aa"] = torch.from_numpy(aa_encode(s))
+        return (x, torch.from_numpy(lab),
                 torch.tensor(c, dtype=torch.float32))
 
 
@@ -489,7 +590,8 @@ class OmniPhyl(nn.Module):
     def __init__(self, n_classes: dict[str, int], width: int = 64,
                  cin: int = 1, backbone: str = "resnet", side: int = 128,
                  targets: list[str] | None = None, dropout: float = 0.0,
-                 stem_stride: int = 2, head: str = "flat", tree=None):
+                 stem_stride: int = 2, head: str = "flat", tree=None,
+                 aux: set | None = None):
         super().__init__()
         if backbone == "vit":
             self.encoder = ViTEncoder(cin, side, dim=width * 4)
@@ -499,7 +601,16 @@ class OmniPhyl(nn.Module):
             self.encoder = ResNetEncoder(cin, width, qt=True)
         else:
             self.encoder = ResNetEncoder(cin, width, stem_stride)
-        self.latent = self.encoder.latent
+        self.aux = aux or set()
+        aux_dim = 128
+        self.hash_bag = (nn.EmbeddingBag(HASH_BUCKETS + 1, aux_dim,
+                                         mode="mean",
+                                         padding_idx=HASH_PAD)
+                         if "hash" in self.aux else None)
+        self.aa_proj = (nn.Sequential(nn.Linear(AA_DIM, aux_dim),
+                                      nn.LayerNorm(aux_dim), nn.ReLU())
+                        if "aa" in self.aux else None)
+        self.latent = self.encoder.latent + aux_dim * len(self.aux)
         self.drop = nn.Dropout(dropout)
         keys = targets if targets is not None else list(n_classes.keys())
         tree_po = (tree or {}).get("parent_of", {}) if head == "tree" else {}
@@ -515,7 +626,16 @@ class OmniPhyl(nn.Module):
                 if isinstance(h, TreeRankHead)}
 
     def forward(self, x):
-        z = self.drop(self.encoder(x))
+        if isinstance(x, dict):
+            parts = [self.encoder(x["x"])]
+            if self.hash_bag is not None:
+                h = self.hash_bag(x["hash"])
+                parts.append(F.layer_norm(h, (h.size(1),)))
+            if self.aa_proj is not None:
+                parts.append(self.aa_proj(x["aa"]))
+            z = self.drop(torch.cat(parts, 1))
+        else:
+            z = self.drop(self.encoder(x))
         logits = {}
         prev_ext = None  # [B, C_prev] chained log-marginals, col 0 = log 1
         for t, h in self.heads.items():
@@ -624,6 +744,10 @@ def main():
                          "(keeps motif/positional info FCGR discards), "
                          "msfcgr=RC-canonical k4/5/6 pyramid + "
                          "quadtree-aligned 2x2 resnet (A2)")
+    ap.add_argument("--aux", type=str, default="",
+                    help="comma list of extra input branches fused into "
+                         "the latent (A3): hash=canonical 11-mer "
+                         "EmbeddingBag, aa=6-frame AA 3-mer spectrum")
     ap.add_argument("--stem-stride", type=int, default=2,
                     help="resnet stem conv stride; 1 keeps full FCGR "
                          "resolution (stride-2 merges each k-mer's "
@@ -697,18 +821,22 @@ def main():
     ms_maps = ({k: build_cell_lut(k) for k in MS_KS},
                {k: rc_index_map(k) for k in MS_KS}) \
         if args.backbone == "msfcgr" else (None, None)
+    aux = {a for a in args.aux.split(",") if a}
+    hash_canon = rc_index_map(HASH_K) if "hash" in aux else None
     train_ds = FragmentDataset(args.fragments, encode_labels(train_meta),
                                args.k, lut,
                                augment=args.vertex_permute_augment,
                                pos=args.pos_channels,
                                targets=cls_targets, cont=cont_train,
                                seq=use_seq, seq_len=args.seq_len,
-                               ms_luts=ms_maps[0], ms_canons=ms_maps[1])
+                               ms_luts=ms_maps[0], ms_canons=ms_maps[1],
+                               aux=aux, hash_canon=hash_canon)
     val_ds = FragmentDataset(args.fragments, encode_labels(val_meta),
                              args.k, lut, pos=args.pos_channels,
                              targets=cls_targets, cont=cont_val,
                              seq=use_seq, seq_len=args.seq_len,
-                             ms_luts=ms_maps[0], ms_canons=ms_maps[1])
+                             ms_luts=ms_maps[0], ms_canons=ms_maps[1],
+                             aux=aux, hash_canon=hash_canon)
     train_ld = DataLoader(train_ds, args.batch_size, shuffle=True,
                           num_workers=args.num_workers, drop_last=True,
                           persistent_workers=args.num_workers > 0)
@@ -721,7 +849,7 @@ def main():
                      backbone=args.backbone, side=1 << args.k,
                      targets=all_targets, dropout=args.dropout,
                      stem_stride=args.stem_stride,
-                     head=args.head, tree=tree).to(device)
+                     head=args.head, tree=tree, aux=aux).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.wd)
     steps = len(train_ld) * args.epochs
@@ -737,7 +865,11 @@ def main():
         frac_err = frac_n = bnd_ok = bnd_n = off_n = 0
         off_err = 0.0
         for x, y, yc in loader:
-            x, y, yc = x.to(device), y.to(device), yc.to(device)
+            if isinstance(x, dict):
+                x = {kk: v.to(device) for kk, v in x.items()}
+            else:
+                x = x.to(device)
+            y, yc = y.to(device), yc.to(device)
             with torch.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=amp):
                 z, logits = model(x)

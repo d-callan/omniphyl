@@ -78,6 +78,7 @@ SCREEN_CONTAM="${SCREEN_CONTAM:-1}"   # 1 = screen all fragments for contaminant
 HUMAN_FASTA="${HUMAN_FASTA:-}"        # optional GRCh38 fasta for human sketch
 SMOKE="${SMOKE:-1}"
 NUM_WORKERS="${NUM_WORKERS:-4}"   # dataloader workers; Kaggle VMs have 4 vCPU
+AUX="${AUX:-}"                    # comma list: hash,aa (A3 aux branches)
 
 mkdir -p "$WORKDIR" "$OUTDIR"
 cd "$WORKDIR"
@@ -176,6 +177,7 @@ python3 scripts/train_omniphyl.py \
     --backbone "$BACKBONE" --stem-stride "$STEM_STRIDE" \
     --head "$HEAD" --prior-tau "$PRIOR_TAU" \
     --num-workers "$NUM_WORKERS" \
+    --aux "$AUX" \
     --seq-len "$FRAG_LEN" \
     $POS_FLAG
 

@@ -28,7 +28,9 @@ from fetch_refseq_corpus import (  # noqa: E402
 from train_omniphyl import (  # noqa: E402
     encode_cont_labels, CONT_TARGETS, RANKS, FragmentDataset,
     build_cell_lut, load_labels, build_tree, OmniPhyl,
-    fcgr_encode_ms, rc_index_map, MS_KS)
+    fcgr_encode_ms, rc_index_map, MS_KS,
+    hash_encode, aa_encode, _AA_LUT, AA_LETTERS, AA_ALPHA,
+    HASH_K, HASH_BUCKETS, HASH_PAD, HASH_LEN)
 
 PASS, FAIL = [], []
 
@@ -212,6 +214,60 @@ def test_msfcgr():
           all(logits[r].shape == (2, 3) for r in RANKS))
 
 
+def test_aux_branches():
+    print("[aux branches / A3]")
+    import numpy as np
+    import torch
+    rng = random.Random(4)
+    seq = "".join(rng.choice("ACGT") for _ in range(500))
+    rc = seq.translate(str.maketrans("ACGT", "TGCA"))[::-1]
+
+    # codon table: ATG->M (index of 'M'), TAA/TAG/TGA -> stop (20)
+    import train_omniphyl as tr
+    atg = 0 * 16 + 3 * 4 + 2          # A=0,T=3,G=2 digit order
+    check("ATG -> M", _AA_LUT[atg] == AA_LETTERS.index("M"),
+          int(_AA_LUT[atg]))
+    check("stops -> 20",
+          all(_AA_LUT[i] == AA_ALPHA - 1 for i in
+              (3 * 16 + 0 * 4 + 0,   # TAA
+               3 * 16 + 0 * 4 + 2,   # TAG
+               3 * 16 + 2 * 4 + 0)))  # TGA
+
+    canon11 = rc_index_map(HASH_K)
+    a = hash_encode(seq, canon11)
+    check("hash bag shape+dtype", a.shape == (HASH_LEN,) and
+          a.dtype == np.int64, (a.shape, a.dtype))
+    used = a[a != HASH_PAD]
+    check("buckets in range",
+          bool(((used >= 0) & (used < HASH_BUCKETS)).all()) and
+          len(used) == len(seq) - HASH_K + 1, len(used))
+    b = hash_encode(rc, canon11)
+    check("hash RC-invariant multiset",
+          sorted(used.tolist()) == sorted(b[b != HASH_PAD].tolist()))
+
+    av = aa_encode(seq)
+    check("aa spectrum shape", av.shape == (AA_ALPHA ** 3,),
+          av.shape)
+    check("aa RC-invariant multiset",
+          sorted(av.tolist()) ==
+          sorted(aa_encode(rc).tolist()))
+
+    # dict-input forward through a fused model
+    n_classes = {r: 3 for r in RANKS}
+    model = OmniPhyl(n_classes, width=8, cin=1, backbone="resnet",
+                     side=8, targets=RANKS, aux={"hash", "aa"})
+    check("aux widens latent", model.latent == 8 * 8 + 2 * 128,
+          model.latent)
+    model.eval()
+    xb = {"x": torch.randn(2, 1, 8, 8),
+          "hash": torch.randint(0, HASH_BUCKETS, (2, HASH_LEN)),
+          "aa": torch.rand(2, AA_ALPHA ** 3)}
+    with torch.no_grad():
+        _, logits = model(xb)
+    check("aux forward -> rank logits",
+          all(logits[r].shape == (2, 3) for r in RANKS))
+
+
 def make_corpus(tmp: Path):
     """2 accessions x 24 frags, mixture of pure/boundary/no-label rows."""
     rng = random.Random(1)
@@ -390,7 +446,7 @@ def test_contaminant_screen():
 def main():
     for t in (test_label_math, test_veupath_helpers,
               test_slicing_and_encoding, test_tree_head, test_msfcgr,
-              test_contaminant_screen, test_end_to_end):
+              test_aux_branches, test_contaminant_screen, test_end_to_end):
         t()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

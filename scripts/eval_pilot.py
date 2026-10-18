@@ -57,7 +57,8 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).parent))
 from train_omniphyl import (OmniPhyl, FragmentDataset, build_cell_lut,
                              build_split, RANKS, CONT_TARGETS,
-                             encode_cont_labels, MS_KS, rc_index_map)
+                             encode_cont_labels, MS_KS, HASH_K,
+                             rc_index_map)
 
 RANK_ORDER = RANKS  # domain -> ... -> species
 TOPK_CONS = 512     # sparse log-prob entries stored per frag per rank
@@ -173,7 +174,9 @@ def main():
                      dropout=train_args.get("dropout", 0.0),
                      stem_stride=train_args.get("stem_stride", 2),
                      head=train_args.get("head", "flat"),
-                     tree=ckpt.get("tree"))
+                     tree=ckpt.get("tree"),
+                     aux={a for a in train_args.get("aux", "").split(",")
+                          if a})
     model.load_state_dict(ckpt["model"])
     model.to(device).eval()
 
@@ -219,12 +222,16 @@ def main():
     ms_maps = ({kk: build_cell_lut(kk) for kk in MS_KS},
                {kk: rc_index_map(kk) for kk in MS_KS}) \
         if train_args.get("backbone") == "msfcgr" else (None, None)
+    aux = {a for a in train_args.get("aux", "").split(",") if a}
     ds = FragmentDataset(args.fragments, encoded, k, lut,
                          pos=train_args.get("pos_channels", False),
                          targets=cls_targets, cont=cont,
                          seq=train_args.get("backbone") == "seq",
                          seq_len=int(train_args.get("seq_len", 500)),
-                         ms_luts=ms_maps[0], ms_canons=ms_maps[1])
+                         ms_luts=ms_maps[0], ms_canons=ms_maps[1],
+                         aux=aux,
+                         hash_canon=rc_index_map(HASH_K)
+                         if "hash" in aux else None)
     loader = torch.utils.data.DataLoader(
         ds, args.batch_size, shuffle=False,
         num_workers=args.num_workers)
@@ -251,7 +258,8 @@ def main():
     with torch.no_grad():
         pos = 0
         for x, y, yc in loader:
-            x = x.to(device)
+            x = ({kk: v.to(device) for kk, v in x.items()}
+                 if isinstance(x, dict) else x.to(device))
             z, logits = model(x)
             if tree_po:
                 cond = model.cond_logps(z, tau=0.0)
