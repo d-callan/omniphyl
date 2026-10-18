@@ -44,6 +44,7 @@ Usage:
 import argparse
 import csv
 import json
+import math
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -241,12 +242,34 @@ def main():
                      if fid_acc.get(fid) in eval_accs}
     cons_pos_list: list[int] = []
     cons_logp: dict[str, list] = {t: [] for t in cls_targets}
+    # per-sibling conditional entropy (tree heads): the open-set signal —
+    # unseen child clades of a known parent should produce near-uniform
+    # conditionals over that parent's children
+    tree_po = (ckpt.get("tree") or {}).get("parent_of")
+    sib_ent: dict[str, list] = {t: [] for t in cls_targets}
 
     with torch.no_grad():
         pos = 0
         for x, y, yc in loader:
             x = x.to(device)
-            _, logits = model(x)
+            z, logits = model(x)
+            if tree_po:
+                cond = model.cond_logps(z, tau=0.0)
+                for ri in range(1, len(RANK_ORDER)):
+                    t, par_t = RANK_ORDER[ri], RANK_ORDER[ri - 1]
+                    if t not in cond or par_t not in logits:
+                        continue
+                    po_t = torch.as_tensor(tree_po[t][1:],
+                                           device=z.device)
+                    pred_par = logits[par_t].argmax(1)
+                    for b in range(x.size(0)):
+                        sel = po_t == pred_par[b]
+                        n = int(sel.sum())
+                        if n < 2:
+                            continue
+                        l = cond[t][b, sel]
+                        sib_ent[t].append(
+                            float(-(l.exp() * l).sum() / math.log(n)))
             logp = {t: F.log_softmax(logits[t], 1).cpu()
                     for t in cls_targets}
             for i, t in enumerate(cls_targets):
@@ -360,6 +383,44 @@ def main():
           f"frags ({len(val_accs)} held-out genomes)")
     for t, m in results["split_metrics"]["val"]["per_target"].items():
         print(f"  val {t:12s}  acc={m['accuracy']}  n={m['n']}")
+
+    # -----------------------------------------------------------------------
+    # 1b. Predicted-class distribution: how concentrated argmax calls are
+    # across the vocab (the v4 "41.7% -> Uroviricota" collapse metric),
+    # plus mean per-sibling conditional entropy for tree heads.
+    # -----------------------------------------------------------------------
+    inv_name = {t: {i + 1: n for n, i in vocab[t].items()}
+                for t in cls_targets}
+    results["predicted_class_entropy"] = {}
+    print("\nPredicted-class distribution (collapse check):")
+    for t in cls_targets:
+        preds = np.asarray(all_preds[t])
+        preds = preds[preds != 0]
+        if len(preds) == 0:
+            continue
+        cnt = np.bincount(preds)
+        nz = cnt[cnt > 0]
+        h = float(-(nz / nz.sum() * np.log(nz / nz.sum())).sum())
+        top = int(cnt.argmax())
+        ent = {"n_predicted": int(nz.size),
+               "top_class": inv_name[t].get(top, str(top)),
+               "top_share": round(float(cnt[top] / len(preds)), 4),
+               "entropy_nats": round(h, 4),
+               "entropy_norm": round(h / math.log(nz.size), 4)
+               if nz.size > 1 else 0.0}
+        results["predicted_class_entropy"][t] = ent
+        print(f"  {t:10s}  H={ent['entropy_nats']} "
+              f"({ent['entropy_norm']} norm)  top={ent['top_class']} "
+              f"{ent['top_share']:.1%} of {nz.size} predicted")
+    if tree_po:
+        results["sibling_entropy"] = {
+            t: {"mean_norm_entropy": round(float(np.mean(v)), 4),
+                "n": len(v)}
+            for t, v in sib_ent.items() if v}
+        print("\nPer-sibling conditional entropy (normalized):")
+        for t, m in results["sibling_entropy"].items():
+            print(f"  {t:10s}  H_norm={m['mean_norm_entropy']} "
+                  f"n={m['n']}")
 
     # -----------------------------------------------------------------------
     # 2. Deepest-confident-rank: deepest RANK where pred != 0 (unknown)

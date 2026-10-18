@@ -321,6 +321,10 @@ def test_end_to_end():
         check("boundary recall@flag-rate emitted",
               "recall_at_flag_rate" in
               res.get("annotation_heads", {}).get("boundary", {}))
+        check("predicted_class_entropy section present",
+              "predicted_class_entropy" in res and
+              "phylum" in res["predicted_class_entropy"],
+              list(res.get("predicted_class_entropy", {})))
 
 
 def test_contaminant_screen():
