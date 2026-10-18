@@ -1,0 +1,15 @@
+{
+  "id": "daniellecallan/omniphyl-a4-stride1",
+  "title": "daniellecallan/omniphyl-a4-stride1",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "daniellecallan/omniphyl-5group-mini-corpus"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}
