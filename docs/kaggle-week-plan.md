@@ -90,7 +90,7 @@ Collapse check (predicted-class entropy): phylum H 1.72→2.12 nats, Uroviricota
 
 **Where the gains come from** (group consensus, A0→A1): archaea jumps from ~0.2 domain / 0.0 phylum to 0.80 / 0.50 / 0.33 class — the prior-sibling structure borrows strength for undersampled groups. Fungi class 0.42→0.42 flat (frag) but phylum 0.52→0.73. Regressions: bacterial order −0.15, and deep ranks broadly.
 
-**Design implication for A5:** a hybrid head — tree/conditional at shallow ranks (domain–class) + flat at deep ranks (order–species) — would capture the win without the chained-marginal penalty where classes are unseen by construction. Worth a cheap variant before scale-up if A2's timing permits; otherwise ship tree-everywhere and note the trade.
+**Design implication — confounded, do not act yet.** The deep-rank regression has two candidate explanations and the current data can't separate them: (a) chained-marginal error compounding (architecture), or (b) insufficient supervision at deep ranks (data artifact). The supervision table favors (b): training density is 6,982 frags/class at domain, 565 phylum, 244 class — all won-or-tied by the tree head — then falls to 71 at order and ~30 at family+, exactly where the regression starts. A conditional-prototype head has strictly more structure to estimate per class than a flat linear head, so a scaling threshold around ~70–250 frags/class is expected, not anomalous. Hold the tree head as-is for A5; the v4 corpus's deeper coverage is the discriminating experiment — if tree still regresses at deep ranks where v4 gives dense supervision, *then* it's architecture. No hybrid variant until then.
 
 ---
 
