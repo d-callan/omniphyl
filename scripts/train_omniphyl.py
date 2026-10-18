@@ -703,14 +703,14 @@ def main():
                                    == y[:, i][m]).sum())
             if fm.any():
                 p_frac = torch.sigmoid(logits["coding_frac"][:, 0][fm])
-                frac_err += float((p_frac - yc[fm, 0]).abs().sum())
+                frac_err += float((p_frac - yc[fm, 0]).detach().abs().sum())
                 frac_n += int(fm.sum())
                 p_bnd = torch.sigmoid(logits["boundary"][:, 0][fm]) > 0.5
                 bnd_ok += int((p_bnd == btgt[fm].bool()).sum())
                 bnd_n += int(fm.sum())
             if om.any():
                 p_off = torch.sigmoid(logits["offset"][:, 0][om])
-                off_err += float((p_off - yc[om, 1]).abs().sum())
+                off_err += float((p_off - yc[om, 1]).detach().abs().sum())
                 off_n += int(om.sum())
         accs = {t: correct[t] / max(total[t], 1) for t in cls_targets}
         extras = {

@@ -77,6 +77,7 @@ PRIOR_TAU="${PRIOR_TAU:-1}"
 SCREEN_CONTAM="${SCREEN_CONTAM:-1}"   # 1 = screen all fragments for contaminants
 HUMAN_FASTA="${HUMAN_FASTA:-}"        # optional GRCh38 fasta for human sketch
 SMOKE="${SMOKE:-1}"
+NUM_WORKERS="${NUM_WORKERS:-4}"   # dataloader workers; Kaggle VMs have 4 vCPU
 
 mkdir -p "$WORKDIR" "$OUTDIR"
 cd "$WORKDIR"
@@ -174,6 +175,7 @@ python3 scripts/train_omniphyl.py \
     --dropout "$DROPOUT" --label-smoothing "$LABEL_SMOOTHING" --wd "$WD" \
     --backbone "$BACKBONE" --stem-stride "$STEM_STRIDE" \
     --head "$HEAD" --prior-tau "$PRIOR_TAU" \
+    --num-workers "$NUM_WORKERS" \
     --seq-len "$FRAG_LEN" \
     $POS_FLAG
 
@@ -183,20 +185,21 @@ python3 scripts/eval_pilot.py --model "$RUN/best.pt" \
     --outdir "$RUN/eval" --num-workers 4
 
 STAMP=$(date +%Y%m%d-%H%M%S)
-# screened outputs land under corpus/ (fresh fetch) or screened/ (mounted
-# read-only corpus); bundle whichever exist, relative to WORKDIR
-SCREENED_FILES=""
+# corpus files exist under corpus/ only on a fresh fetch — with SKIP_FETCH
+# the corpus is a mounted dir outside WORKDIR.  screened outputs land under
+# corpus/ (fresh) or screened/ (mounted).  Bundle whatever exists.
+cd "$WORKDIR"
+BUNDLE_FILES="run/best.pt run/eval"
 for d in corpus screened; do
-    for f in fragments_screened.fna fragments_screened.fna.idx.json \
-             labels_screened.tsv fragments_rejected.tsv screen_manifest.json; do
-        [ -f "$WORKDIR/$d/$f" ] && SCREENED_FILES="$SCREENED_FILES $d/$f"
+    for f in fragments.fna fragments.fna.idx.json labels.tsv skipped.tsv \
+             manifest.json fragments_screened.fna \
+             fragments_screened.fna.idx.json labels_screened.tsv \
+             fragments_rejected.tsv screen_manifest.json; do
+        [ -f "$WORKDIR/$d/$f" ] && BUNDLE_FILES="$BUNDLE_FILES $d/$f"
     done
 done
-tar -czf "$OUTDIR/omniphyl-pilot-$STAMP.tar.gz" \
-    -C "$WORKDIR" "corpus/labels.tsv" "corpus/manifest.json" \
-    "corpus/skipped.tsv" "corpus/fragments.fna" \
-    "corpus/fragments.fna.idx.json" "run/best.pt" "run/eval" \
-    $SCREENED_FILES \
-    $(find run -name "*.log" -o -name "*.json" 2>/dev/null | xargs -r)
+EXTRA=$(find run -name "*.log" -o -name "*.json" 2>/dev/null | tr '\n' ' ')
+tar -czf "$OUTDIR/omniphyl-pilot-$STAMP.tar.gz" -C "$WORKDIR" \
+    $BUNDLE_FILES $EXTRA
 
 echo "==> results: $OUTDIR/omniphyl-pilot-$STAMP.tar.gz"
