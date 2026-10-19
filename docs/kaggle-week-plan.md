@@ -108,6 +108,26 @@ Collapse check (predicted-class entropy): phylum H 1.72→2.12 nats, Uroviricota
 
 **A1 vs A2 are complementary:** tree head wins shallow (dom .873/.928 cons, phy .665/.713) via prior-sibling structure but locks out on parent misses; msfcgr wins deep via representation (genus cons .45 vs .05). Both gates cleared → cumulative arms stack them: A3 = msfcgr + tree + aux(hash,aa), pushed as `omniphyl-a3-aux` v1.
 
+**A2.5 (bridge: msfcgr + tree, no aux) + A3 (full stack)** — kernels `omniphyl-a25-stack` v1 and `omniphyl-a3-aux` v1; A3's in-kernel eval crashed on a dict-batch bug (`x.size(0)` — fixed locally), re-evaled on the same raw corpus. Same-inputs comparison across all five arms:
+
+| rank | A0 | A1 | A2 | A2.5 | A3 (frag acc) |
+|---|---|---|---|---|---|
+| domain | .755 | .873 | .794 | .836 | **.904** |
+| phylum | .539 | .665 | .597 | .653 | **.757** |
+| class | .501 | .504 | .557 | .520 | **.595** |
+| order | .173 | .117 | **.253** | .106 | .236 |
+| family | .120 | .056 | **.189** | .049 | .157 |
+| genus | .095 | .034 | **.152** | .030 | .093 |
+| species | .095 | .040 | **.164** | .036 | .109 |
+
+Consensus (all-frags pooled): A3 wins shallow — domain **.940**, phylum **.795**, phylum macro-F1 **.179** (~2× A1). Deep ranks: A2 still dominates (genus cons .447 vs A3 .117, A2.5 .049).
+
+**The lock-out is head mechanics, not data.** A2.5 vs A2 is the controlled contrast — identical backbone, corpus, split; only the head differs. Flat heads reach genus consensus .447 on the same supervision where the tree head gets .049. The supervision-density hypothesis is ruled out at the head level: same data, the regression switches on purely with head choice. Deep-rank chaining is the bottleneck — a parent miss zeroes the child's mass.
+
+**Aux contributes broad frag-level lift** (A3 vs A2.5: +7 domain, +10 phylum, +13 order acc) and the best phylum macro-F1 of any arm (.179), but cannot compensate for chain lock-out.
+
+**Standing fork for A5:** the two winning ingredients trade against each other — tree head for shallow structure, flat heads for deep-rank reach. A hybrid (tree through class, flat order+) is now directly evidenced rather than speculative. Whether to ship hybrid-A5 or A3-as-is depends on the next section's decision; A4 diagnostics (seq backbone, stem-stride-1) running in parallel to confirm the msfcgr win isn't representation-trivial.
+
 ---
 
 ## 3. Step 0 — free analysis before any GPU spend (local, day 1)
