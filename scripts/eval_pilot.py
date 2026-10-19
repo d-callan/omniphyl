@@ -272,6 +272,7 @@ def main():
         for x, y, yc in loader:
             x = ({kk: v.to(device) for kk, v in x.items()}
                  if isinstance(x, dict) else x.to(device))
+            bs = y.size(0)
             z, logits = model(x)
             if tree_po:
                 cond = model.cond_logps(z, tau=0.0)
@@ -282,7 +283,7 @@ def main():
                     po_t = torch.as_tensor(tree_po[t][1:],
                                            device=z.device)
                     pred_par = logits[par_t].argmax(1)
-                    for b in range(x.size(0)):
+                    for b in range(bs):
                         sel = po_t == pred_par[b]
                         n = int(sel.sum())
                         if n < 2:
@@ -302,7 +303,7 @@ def main():
                     cont_out[t].extend(
                         torch.sigmoid(logits[t][:, 0]).cpu().tolist())
             cont_true.extend(yc.tolist())
-            for j in range(x.size(0)):
+            for j in range(bs):
                 if pos + j in consensus_pos:
                     cons_pos_list.append(pos + j)
                     for t in cls_targets:
@@ -311,7 +312,7 @@ def main():
                         cons_logp[t].append(
                             (i.numpy().astype(np.int32),
                              v.numpy().astype(np.float16)))
-            pos += x.size(0)
+            pos += bs
 
     # -----------------------------------------------------------------------
     # 1. Per-target accuracy + macro-F1
