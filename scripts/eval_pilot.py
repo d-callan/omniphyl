@@ -312,6 +312,14 @@ def main():
                     help="restrict inference to held-out val genomes")
     ap.add_argument("--max-genomes", type=int, default=0,
                     help="cap held-out accessions evaluated (0 = all)")
+    ap.add_argument("--eval-crop-len", type=int, default=0,
+                    help="truncate each fragment to this many bases "
+                         "before encoding (0 = full length); simulates "
+                         "150/250bp single-end reads")
+    ap.add_argument("--eval-paired-len", type=int, default=0,
+                    help="simulate unmerged paired-end reads: prefix and "
+                         "suffix mates of this length joined by an 'N' "
+                         "junction (e.g. 150 -> PE150)")
     ap.add_argument("--no-reconcile-tree", action="store_true",
                     help="skip NCBI cross-rank path-score reconciliation "
                          "and ancestor-veto metrics (saves the per-batch "
@@ -346,7 +354,9 @@ def main():
                      head=train_args.get("head", "flat"),
                      tree=ckpt.get("tree"),
                      aux={a for a in train_args.get("aux", "").split(",")
-                          if a})
+                          if a},
+                     aa_mode=train_args.get("aa_mode", "plain"),
+                     aa_drop=float(train_args.get("aa_drop", 0.0) or 0.0))
     model.load_state_dict(ckpt["model"])
     # The tree head is trained so softmax(logits + tau*log nu) = P(y);
     # evaluating at that same tau restores the posterior the model was
@@ -413,7 +423,10 @@ def main():
                          aux=aux,
                          hash_canon=rc_index_map(HASH_K)
                          if "hash" in aux else None,
-                         jitter=args.jitter_rate)
+                         jitter=args.jitter_rate,
+                         aa_extra=train_args.get("aa_mode") == "gated",
+                         eval_crop=args.eval_crop_len,
+                         eval_paired=args.eval_paired_len)
     loader = torch.utils.data.DataLoader(
         ds, args.batch_size, shuffle=False,
         num_workers=args.num_workers)

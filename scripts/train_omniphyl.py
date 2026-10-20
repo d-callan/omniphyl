@@ -195,6 +195,8 @@ HASH_LEN = 512                 # padded bag size (500bp -> ~490 11-mers)
 AA_LETTERS = "ACDEFGHIKLMNPQRSTVWY"  # 20 standard AAs; index 20 = stop
 AA_ALPHA = len(AA_LETTERS) + 1
 AA_DIM = AA_ALPHA ** 3         # 9261-dim tripeptide spectrum
+AA_EXTRA_DIM = 18              # gated mode: 6 frames x (stop density,
+                               #   longest ORF fraction, TGA share of stops)
 
 
 def _build_aa_lut() -> np.ndarray:
@@ -246,21 +248,30 @@ def hash_encode(seq: str, canon: np.ndarray) -> np.ndarray:
     return out
 
 
-def aa_encode(seq: str) -> np.ndarray:
+def aa_encode(seq: str, extra: bool = False) -> np.ndarray:
     """sequence -> 6-frame AA 3-mer spectrum [AA_DIM] float32 (A3 branch).
 
     Translates all 3 frames on both strands (stop = letter 20), counts
     tripeptides, log-enrichment normalized. Codons touching an N are
     dropped. Synonymous 3rd-position drift cancels inside each tripeptide
     bin, preserving signal where nucleotide k-mers saturate.
+
+    extra=True appends AA_EXTRA_DIM per-frame summaries used by the
+    gated fusion gate: for each of the 6 frames in fixed order
+    (F0,F1,F2,R0,R1,R2) -> [stop_density, longest_orf_frac, tga_ratio].
+    tga_ratio (share of TGA among stops) separates Code-4 Mycoplasma
+    (TGA->Trp) from standard-code genomes.
     """
     codes = BASE2DIGIT[np.frombuffer(seq.encode("ascii", "replace"),
                                      dtype=np.uint8)]
     vec = np.zeros(AA_DIM, dtype=np.float32)
+    feats: list[float] = []
     for c in (codes, 3 - codes[::-1]):      # forward + reverse-complement
         for off in range(3):
             n = (len(c) - off) // 3 * 3
             if n <= 0:
+                if extra:
+                    feats.extend((0.0, 0.0, 0.0))
                 continue
             trip = c[off:off + n].reshape(-1, 3)
             ok = (trip >= 0).all(axis=1)
@@ -268,12 +279,28 @@ def aa_encode(seq: str) -> np.ndarray:
                            0, 63)
             aa = np.where(ok, _AA_LUT[cidx], -1)
             aa = aa[aa >= 0]
+            if extra:
+                n_cod = len(aa)
+                is_stop = aa == (AA_ALPHA - 1)
+                n_st = int(is_stop.sum())
+                sp = np.where(is_stop)[0]
+                runs = np.diff(np.concatenate(([-1], sp, [n_cod]))) - 1
+                # TGA codon id = 3*16 + 2*4 + 0 = 56 (stop #20)
+                tga = int((cidx[ok][is_stop] == 56).sum())
+                feats.extend((n_st / max(n_cod, 1),
+                              float(runs.max()) / max(n_cod, 1)
+                              if len(runs) else 0.0,
+                              tga / max(n_st, 1)))
             if len(aa) < 3:
                 continue
             w = np.lib.stride_tricks.sliding_window_view(aa, 3)
             idx = (w * np.array([AA_ALPHA ** 2, AA_ALPHA, 1])).sum(axis=1)
             np.add.at(vec, idx, 1.0)
-    return np.log1p(vec / max(vec.sum(), 1.0) * AA_DIM)
+    spec = np.log1p(vec / max(vec.sum(), 1.0) * AA_DIM)
+    if extra:
+        spec = np.concatenate(
+            [spec, np.asarray(feats, dtype=np.float32)])
+    return spec
 
 
 def seq_encode(seq: str, seq_len: int,
@@ -323,6 +350,36 @@ def jitter_seq(s: str, rate: float, seed: int) -> str:
     return a.tobytes().decode("ascii")
 
 
+PE_LEN = 150    # unmerged paired-end mate length for var-len augment
+
+
+def varlen_crop(s: str, min_len: int) -> str:
+    """Stochastic read-length crop (E2): 70% uniform contiguous
+    sub-window in [min_len, |s|]; 30% unmerged paired-end
+    (PE_LEN prefix + 'N' + PE_LEN suffix). The 'N' junction breaks
+    cross-insert k-mers and codons: both fcgr_encode and aa_encode
+    drop windows/codons containing it.
+    """
+    if np.random.random() < 0.3 and len(s) >= 2 * PE_LEN:
+        return s[:PE_LEN] + "N" + s[-PE_LEN:]
+    L = int(np.random.randint(min_len, len(s) + 1))
+    o = int(np.random.randint(0, len(s) - L + 1))
+    return s[o:o + L]
+
+
+def eval_crop_seq(s: str, crop: int = 0, paired: int = 0) -> str:
+    """Deterministic eval-time read simulation (E2):
+    paired>0 -> prefix/suffix mates of `paired` bases joined by 'N';
+    crop>0 -> truncate to the first `crop` bases (150/250bp reads).
+    Seqs already <= the target length pass through unchanged.
+    """
+    if paired and len(s) > 2 * paired:
+        return s[:paired] + "N" + s[-paired:]
+    if crop and len(s) > crop:
+        return s[:crop]
+    return s
+
+
 class FragmentDataset(Dataset):
     """Line-offset-indexed FASTA -> (FCGR tensor, per-target label ids)."""
 
@@ -335,7 +392,12 @@ class FragmentDataset(Dataset):
                  ms_canons: dict[int, np.ndarray] | None = None,
                  aux: set | None = None,
                  hash_canon: np.ndarray | None = None,
-                 jitter: float = 0.0):
+                 jitter: float = 0.0,
+                 aa_extra: bool = False,
+                 var_len_prob: float = 0.0,
+                 min_train_len: int = 500,
+                 eval_crop: int = 0,
+                 eval_paired: int = 0):
         self.fasta = Path(fasta)
         self.k = k
         self.lut = lut
@@ -348,6 +410,11 @@ class FragmentDataset(Dataset):
         self.aux = aux or set()   # {"hash","aa"} extra input branches (A3)
         self.hash_canon = hash_canon
         self.jitter = jitter      # eval-only SNP rate; train keeps 0
+        self.aa_extra = aa_extra  # gated aa mode: append frame/stop feats
+        self.var_len_prob = var_len_prob   # E2: stochastic crop prob
+        self.min_train_len = min_train_len
+        self.eval_crop = eval_crop         # E2: deterministic read crop
+        self.eval_paired = eval_paired     # E2: paired-end mate length
         self.labels = labels  # frag_id -> {target: int}
         self.cont = cont or {}  # frag_id -> (coding_frac, boundary_offset)
         self.ids = list(labels.keys())
@@ -395,6 +462,10 @@ class FragmentDataset(Dataset):
         if self.jitter:
             s = jitter_seq(s, self.jitter,
                            zlib.crc32(fid.encode("ascii")))
+        if self.var_len_prob and np.random.random() < self.var_len_prob:
+            s = varlen_crop(s, self.min_train_len)
+        if self.eval_crop or self.eval_paired:
+            s = eval_crop_seq(s, self.eval_crop, self.eval_paired)
         img = (seq_encode(s, self.seq_len, perm) if self.seq
                else fcgr_encode_ms(s, self.ms_luts, self.ms_canons,
                                    perm=perm, pos=self.pos)
@@ -409,7 +480,7 @@ class FragmentDataset(Dataset):
             if "hash" in self.aux:
                 x["hash"] = torch.from_numpy(hash_encode(s, self.hash_canon))
             if "aa" in self.aux:
-                x["aa"] = torch.from_numpy(aa_encode(s))
+                x["aa"] = torch.from_numpy(aa_encode(s, self.aa_extra))
         return (x, torch.from_numpy(lab),
                 torch.tensor(c, dtype=torch.float32))
 
@@ -656,7 +727,8 @@ class OmniPhyl(nn.Module):
                  cin: int = 1, backbone: str = "resnet", side: int = 128,
                  targets: list[str] | None = None, dropout: float = 0.0,
                  stem_stride: int = 2, head: str = "flat", tree=None,
-                 aux: set | None = None):
+                 aux: set | None = None,
+                 aa_mode: str = "plain", aa_drop: float = 0.0):
         super().__init__()
         if backbone == "vit":
             self.encoder = ViTEncoder(cin, side, dim=width * 4)
@@ -672,13 +744,37 @@ class OmniPhyl(nn.Module):
                                          mode="mean",
                                          padding_idx=HASH_PAD)
                          if "hash" in self.aux else None)
-        self.aa_proj = (nn.Sequential(nn.Linear(AA_DIM, aux_dim),
-                                      nn.LayerNorm(aux_dim), nn.ReLU())
-                        if "aa" in self.aux else None)
+        self.aa_mode = aa_mode if "aa" in self.aux else "plain"
+        self.aa_drop = aa_drop
+        aa_in = AA_DIM + (AA_EXTRA_DIM if self.aa_mode == "gated" else 0)
+        if "aa" not in self.aux:
+            self.aa_proj = None
+        elif self.aa_mode == "bottleneck":
+            # force aa evidence through a 64-d bottleneck so it cannot
+            # memorise genome identity and starve msfcgr (A3f pathology)
+            self.aa_proj = nn.Sequential(nn.Linear(aa_in, 64),
+                                         nn.LayerNorm(64), nn.GELU(),
+                                         nn.Linear(64, aux_dim),
+                                         nn.LayerNorm(aux_dim))
+        else:
+            self.aa_proj = nn.Sequential(nn.Linear(aa_in, aux_dim),
+                                         nn.LayerNorm(aux_dim), nn.ReLU())
+        # gated fusion: scalar gate per aux dim driven by z_dna + a
+        # detached coding-fraction estimate + the 18-d frame summary.
+        # coding_frac is predicted from z_dna alone so coding detection
+        # never co-depends on the aa branch it gates.
+        gated = self.aa_mode == "gated"
+        self.coding_head_dna = (nn.Linear(self.encoder.latent, 1)
+                                if gated else None)
+        self.aa_gate = (nn.Linear(
+            self.encoder.latent + 1 + AA_EXTRA_DIM, aux_dim)
+            if gated else None)
         self.latent = self.encoder.latent + aux_dim * len(self.aux)
         self.infer_tau = 0.0   # prior offset at inference (MAP if >0)
         self.drop = nn.Dropout(dropout)
         keys = targets if targets is not None else list(n_classes.keys())
+        if gated:              # coding_frac comes from z_dna, not z
+            keys = [t for t in keys if t != "coding_frac"]
         tree_po = (tree or {}).get("parent_of", {}) if head == "tree" else {}
         self.heads = nn.ModuleDict(
             {t: (TreeRankHead(self.latent, n_classes[t],
@@ -692,13 +788,29 @@ class OmniPhyl(nn.Module):
                 if isinstance(h, TreeRankHead)}
 
     def forward(self, x):
+        lcf = None
         if isinstance(x, dict):
-            parts = [self.encoder(x["x"])]
+            z_dna = self.encoder(x["x"])
+            parts = [z_dna]
             if self.hash_bag is not None:
                 h = self.hash_bag(x["hash"])
                 parts.append(F.layer_norm(h, (h.size(1),)))
+            if self.coding_head_dna is not None:
+                lcf = self.coding_head_dna(z_dna)
             if self.aa_proj is not None:
-                parts.append(self.aa_proj(x["aa"]))
+                za = self.aa_proj(x["aa"])
+                if self.aa_gate is not None:
+                    gi = torch.cat(
+                        [z_dna, lcf.detach(),
+                         x["aa"][:, -AA_EXTRA_DIM:]], 1)
+                    g = torch.sigmoid(self.aa_gate(gi))
+                    if self.training and self.aa_drop > 0:
+                        keep = torch.bernoulli(torch.full(
+                            (za.size(0), 1), 1.0 - self.aa_drop,
+                            device=za.device))
+                        g = g * keep
+                    za = g * za
+                parts.append(za)
             z = self.drop(torch.cat(parts, 1))
         else:
             z = self.drop(self.encoder(x))
@@ -715,6 +827,8 @@ class OmniPhyl(nn.Module):
                     [logm.new_full((logm.size(0), 1), -1e4), logm], 1)
             else:
                 logits[t] = h(z)
+        if lcf is not None:
+            logits["coding_frac"] = lcf
         return z, logits
 
 
@@ -873,6 +987,22 @@ def main():
                          "FLAT heads: adds tau*log(nu) to logits inside "
                          "the training cross-entropy only (Menon et al. "
                          "2021); raw logits stay prior-balanced at eval")
+    ap.add_argument("--aa-mode", choices=["plain", "bottleneck", "gated"],
+                    default="plain",
+                    help="aa aux fusion: plain concat; bottleneck forces a "
+                         "64-d compress; gated adds a z_dna-driven scalar "
+                         "gate + 18-d frame/stop features and moves "
+                         "coding_frac onto a z_dna-only head")
+    ap.add_argument("--aa-drop", type=float, default=0.0,
+                    help="per-sample Bernoulli prob of zeroing the gated "
+                         "aa branch during training (branch dropout)")
+    ap.add_argument("--min-train-len", type=int, default=500,
+                    help="E2: shortest stochastic sub-window when "
+                         "--var-len-prob > 0")
+    ap.add_argument("--var-len-prob", type=float, default=0.0,
+                    help="E2: per-fragment prob of applying a variable "
+                         "length crop (70% contiguous sub-window, 30% "
+                         "unmerged paired-end) during training")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cpu", action="store_true")
     args = ap.parse_args()
@@ -935,6 +1065,7 @@ def main():
         if args.backbone == "msfcgr" else (None, None)
     aux = {a for a in args.aux.split(",") if a}
     hash_canon = rc_index_map(HASH_K) if "hash" in aux else None
+    aa_extra = args.aa_mode == "gated"
     train_ds = FragmentDataset(args.fragments, encode_labels(train_meta),
                                args.k, lut,
                                augment=args.vertex_permute_augment,
@@ -942,13 +1073,17 @@ def main():
                                targets=cls_targets, cont=cont_train,
                                seq=use_seq, seq_len=args.seq_len,
                                ms_luts=ms_maps[0], ms_canons=ms_maps[1],
-                               aux=aux, hash_canon=hash_canon)
+                               aux=aux, hash_canon=hash_canon,
+                               aa_extra=aa_extra,
+                               var_len_prob=args.var_len_prob,
+                               min_train_len=args.min_train_len)
     val_ds = FragmentDataset(args.fragments, encode_labels(val_meta),
                              args.k, lut, pos=args.pos_channels,
                              targets=cls_targets, cont=cont_val,
                              seq=use_seq, seq_len=args.seq_len,
                              ms_luts=ms_maps[0], ms_canons=ms_maps[1],
-                             aux=aux, hash_canon=hash_canon)
+                             aux=aux, hash_canon=hash_canon,
+                             aa_extra=aa_extra)
     train_ld = DataLoader(train_ds, args.batch_size, shuffle=True,
                           num_workers=args.num_workers, drop_last=True,
                           persistent_workers=args.num_workers > 0)
@@ -962,7 +1097,8 @@ def main():
                      targets=all_targets, dropout=args.dropout,
                      stem_stride=args.stem_stride,
                      head=args.head, tree=tree if args.head == "tree" else None,
-                     aux=aux).to(device)
+                     aux=aux, aa_mode=args.aa_mode,
+                     aa_drop=args.aa_drop).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.wd)
     steps = len(train_ld) * args.epochs

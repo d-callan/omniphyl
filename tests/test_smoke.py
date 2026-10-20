@@ -30,7 +30,8 @@ from train_omniphyl import (  # noqa: E402
     build_cell_lut, load_labels, build_tree, build_flat_priors, OmniPhyl,
     fcgr_encode_ms, rc_index_map, MS_KS,
     hash_encode, aa_encode, _AA_LUT, AA_LETTERS, AA_ALPHA,
-    HASH_K, HASH_BUCKETS, HASH_PAD, HASH_LEN)
+    HASH_K, HASH_BUCKETS, HASH_PAD, HASH_LEN,
+    varlen_crop, eval_crop_seq, PE_LEN)
 from eval_pilot import (  # noqa: E402
     ancestor_chains, build_parent_of, path_scores, selective_metrics,
     FIXED_TAUS)
@@ -298,6 +299,25 @@ def test_msfcgr():
     check("msfcgr forward -> rank logits",
           all(logits[r].shape == (2, 3) for r in RANKS))
 
+    # E2 variable-length helpers
+    np.random.seed(7)
+    got_pe = got_sub = False
+    for _ in range(60):
+        c = varlen_crop(seq, 150)
+        if c == seq[:PE_LEN] + "N" + seq[-PE_LEN:]:
+            got_pe = True
+        else:
+            got_sub |= 150 <= len(c) <= 500 and c in seq
+    check("varlen emits both sub-window and PE modes", got_pe and got_sub)
+    check("eval_crop truncates to prefix",
+          eval_crop_seq(seq, crop=250) == seq[:250] and
+          len(eval_crop_seq(seq, crop=250)) == 250)
+    check("eval_paired joins mates on N",
+          eval_crop_seq(seq, paired=150) == seq[:150] + "N" + seq[-150:])
+    check("crop no-ops on short seq",
+          eval_crop_seq("ACGT" * 20, crop=250) == "ACGT" * 20 and
+          eval_crop_seq("ACGT" * 20, paired=150) == "ACGT" * 20)
+
 
 def test_aux_branches():
     print("[aux branches / A3]")
@@ -336,6 +356,38 @@ def test_aux_branches():
     check("aa RC-invariant multiset",
           sorted(av.tolist()) ==
           sorted(aa_encode(rc).tolist()))
+    avx = aa_encode(seq, extra=True)
+    check("aa extra dims", avx.shape == (AA_ALPHA ** 3 + 18,), avx.shape)
+    check("aa extra feats in [0,1]",
+          bool(((avx[-18:] >= 0) & (avx[-18:] <= 1)).all()),
+          avx[-18:].tolist())
+
+    # gated fusion: aa branch gated by z_dna, coding_frac on z_dna only
+    n_classes = {r: 3 for r in RANKS}
+    n_classes["coding_frac"] = 1
+    gmodel = OmniPhyl(n_classes, width=8, cin=1, backbone="resnet",
+                      side=8, targets=RANKS + ["coding_frac"],
+                      aux={"aa"}, aa_mode="gated", aa_drop=0.5)
+    check("gated ckpt params exist",
+          gmodel.aa_gate is not None and
+          gmodel.coding_head_dna is not None and
+          "coding_frac" not in gmodel.heads)
+    gmodel.train()          # exercise branch-dropout path
+    xg = {"x": torch.randn(2, 1, 8, 8),
+          "aa": torch.rand(2, AA_ALPHA ** 3 + 18)}
+    _, lg = gmodel(xg)
+    check("gated forward emits all targets incl coding_frac",
+          all(lg[t].shape[0] == 2 for t in RANKS + ["coding_frac"]) and
+          lg["coding_frac"].shape == (2, 1), lg["coding_frac"].shape)
+
+    bmodel = OmniPhyl(n_classes, width=8, cin=1, backbone="resnet",
+                      side=8, targets=RANKS, aux={"aa"},
+                      aa_mode="bottleneck")
+    bmodel.eval()
+    _, lb = bmodel({"x": torch.randn(2, 1, 8, 8),
+                    "aa": torch.rand(2, AA_ALPHA ** 3)})
+    check("bottleneck forward ok",
+          all(lb[t].shape == (2, 3) for t in RANKS))
 
     # dict-input forward through a fused model
     n_classes = {r: 3 for r in RANKS}
@@ -483,6 +535,40 @@ def test_end_to_end():
               "reconciled" in res and
               "selective_val" in res["reconciled"],
               list(res.get("reconciled", {})))
+
+    # gated aa arm: exercises aa_extra encoding -> gated ckpt ->
+    # eval_pilot reconstruction (aa_mode/aa_extra round-trip)
+    out_g = tmp / "ckpt_gated"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPTS / "train_omniphyl.py"),
+         "--fragments", str(fna), "--labels", str(lab),
+         "--out", str(out_g), "--k", "3", "--width", "16",
+         "--epochs", "2", "--batch-size", "16", "--val-frac", "0.5",
+         "--aux", "aa", "--aa-mode", "gated", "--aa-drop", "0.2",
+         "--num-workers", "0", "--pos-channels", "--cpu"],
+        capture_output=True, text=True, timeout=600)
+    check("gated train exits 0", r.returncode == 0,
+          r.stderr.strip().splitlines()[-1] if r.returncode else "")
+    ckpts_g = list(out_g.glob("*.pt"))
+    if ckpts_g and r.returncode == 0:
+        import torch
+        ckg = torch.load(ckpts_g[0], map_location="cpu",
+                         weights_only=False)
+        check("gated ckpt has gate + dna coding head params",
+              "aa_gate.weight" in ckg["model"] and
+              "coding_head_dna.weight" in ckg["model"] and
+              "heads.coding_frac.weight" not in ckg["model"],
+              sorted(k for k in ckg["model"] if "aa_" in k or
+                     "coding" in k))
+        ev_g = tmp / "eval_gated"
+        r = subprocess.run(
+            [sys.executable, str(SCRIPTS / "eval_pilot.py"),
+             "--model", str(ckpts_g[0]), "--labels", str(lab),
+             "--fragments", str(fna), "--outdir", str(ev_g),
+             "--num-workers", "0", "--cpu"],
+            capture_output=True, text=True, timeout=600)
+        check("gated eval exits 0", r.returncode == 0,
+              r.stderr.strip().splitlines()[-1] if r.returncode else "")
 
 
 def test_contaminant_screen():

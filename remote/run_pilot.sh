@@ -81,6 +81,12 @@ HUMAN_FASTA="${HUMAN_FASTA:-}"        # optional GRCh38 fasta for human sketch
 SMOKE="${SMOKE:-1}"
 NUM_WORKERS="${NUM_WORKERS:-4}"   # dataloader workers; Kaggle VMs have 4 vCPU
 AUX="${AUX:-}"                    # comma list: hash,aa (A3 aux branches)
+AA_MODE="${AA_MODE:-plain}"       # plain | bottleneck | gated (E1)
+AA_DROP="${AA_DROP:-0}"           # branch dropout rate for gated mode
+MIN_TRAIN_LEN="${MIN_TRAIN_LEN:-500}"  # E2: shortest var-len sub-window
+VAR_LEN_PROB="${VAR_LEN_PROB:-0}"      # E2: stochastic crop probability
+EVAL_CROP_LEN="${EVAL_CROP_LEN:-0}"    # E2 eval: single-end read length
+EVAL_PAIRED_LEN="${EVAL_PAIRED_LEN:-0}" # E2 eval: paired-end mate length
 
 mkdir -p "$WORKDIR" "$OUTDIR"
 cd "$WORKDIR"
@@ -180,14 +186,16 @@ python3 scripts/train_omniphyl.py \
     --head "$HEAD" --prior-tau "$PRIOR_TAU" \
     --flat-prior-tau "$FLAT_PRIOR_TAU" \
     --num-workers "$NUM_WORKERS" \
-    --aux "$AUX" \
+    --aux "$AUX" --aa-mode "$AA_MODE" --aa-drop "$AA_DROP" \
+    --min-train-len "$MIN_TRAIN_LEN" --var-len-prob "$VAR_LEN_PROB" \
     --seq-len "$FRAG_LEN" \
     $POS_FLAG
 
 # --- eval + bundle ----------------------------------------------------------
 python3 scripts/eval_pilot.py --model "$RUN/best.pt" \
     --fragments "$FRAG_FILE" --labels "$LAB_FILE" \
-    --outdir "$RUN/eval" --num-workers 4
+    --outdir "$RUN/eval" --num-workers 4 \
+    --eval-crop-len "$EVAL_CROP_LEN" --eval-paired-len "$EVAL_PAIRED_LEN"
 
 STAMP=$(date +%Y%m%d-%H%M%S)
 # corpus files exist under corpus/ only on a fresh fetch — with SKIP_FETCH
