@@ -1,0 +1,16 @@
+{
+  "id": "daniellecallan/omniphyl-eval-baseline-p0",
+  "title": "omniphyl-eval-baseline-p0",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "daniellecallan/omniphyl-pilot-checkpoints",
+    "daniellecallan/omniphyl-v4-corpus"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

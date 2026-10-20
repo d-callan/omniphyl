@@ -20,6 +20,7 @@ import json
 import math
 import random
 import time
+import zlib
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -293,6 +294,35 @@ def seq_encode(seq: str, seq_len: int,
     return out
 
 
+def jitter_seq(s: str, rate: float, seed: int) -> str:
+    """Apply Poisson(rate)-distributed point substitutions per position.
+
+    Deterministic in ``seed`` so a jitter sweep is reproducible and a
+    given fragment mutates identically across workers. Used at eval to
+    probe whether predictions rely on exact long k-mers (instance
+    features) or compositional spectrum: one SNP destroys ~k overlapping
+    k-mers but leaves GC/codon/dinucleotide statistics nearly unchanged,
+    so the accuracy-vs-rate curve traces instance-feature reliance."""
+    a = np.frombuffer(s.upper().encode("ascii"), dtype=np.uint8).copy()
+    rng = np.random.default_rng(seed)
+    n = rng.poisson(rate * len(a))
+    if n == 0:
+        return s
+    pos = rng.choice(len(a), size=min(int(n), len(a)), replace=False)
+    pos = pos[np.isin(a[pos], np.frombuffer(b"ACGT", dtype=np.uint8))]
+    if len(pos) == 0:
+        return s
+    bases = np.frombuffer(b"ACGT", dtype=np.uint8)
+    alt = bases[rng.integers(0, 4, len(pos))]
+    neq = alt != a[pos]
+    while not neq.all():
+        redo = np.nonzero(~neq)[0]
+        alt[redo] = bases[rng.integers(0, 4, len(redo))]
+        neq = alt != a[pos]
+    a[pos] = alt
+    return a.tobytes().decode("ascii")
+
+
 class FragmentDataset(Dataset):
     """Line-offset-indexed FASTA -> (FCGR tensor, per-target label ids)."""
 
@@ -304,7 +334,8 @@ class FragmentDataset(Dataset):
                  ms_luts: dict[int, np.ndarray] | None = None,
                  ms_canons: dict[int, np.ndarray] | None = None,
                  aux: set | None = None,
-                 hash_canon: np.ndarray | None = None):
+                 hash_canon: np.ndarray | None = None,
+                 jitter: float = 0.0):
         self.fasta = Path(fasta)
         self.k = k
         self.lut = lut
@@ -316,6 +347,7 @@ class FragmentDataset(Dataset):
         self.ms_canons = ms_canons
         self.aux = aux or set()   # {"hash","aa"} extra input branches (A3)
         self.hash_canon = hash_canon
+        self.jitter = jitter      # eval-only SNP rate; train keeps 0
         self.labels = labels  # frag_id -> {target: int}
         self.cont = cont or {}  # frag_id -> (coding_frac, boundary_offset)
         self.ids = list(labels.keys())
@@ -360,6 +392,9 @@ class FragmentDataset(Dataset):
         fid = self.ids[i]
         perm = np.random.permutation(4) if self.augment else None
         s = self._read_seq(fid)
+        if self.jitter:
+            s = jitter_seq(s, self.jitter,
+                           zlib.crc32(fid.encode("ascii")))
         img = (seq_encode(s, self.seq_len, perm) if self.seq
                else fcgr_encode_ms(s, self.ms_luts, self.ms_canons,
                                    perm=perm, pos=self.pos)
@@ -535,6 +570,35 @@ def build_tree(meta: dict[str, dict], vocab: dict[str, dict],
     return {"parent_of": parent_of, "log_prior": log_prior}
 
 
+def build_flat_priors(meta: dict[str, dict], vocab: dict[str, dict],
+                      ranks: list[str]) -> dict[str, torch.Tensor]:
+    """Unconditional per-rank class log-priors (flat-head logit adjustment).
+
+    lp[r][c] = log nu(c) with add-one smoothing over TRAIN rows only.
+    lp[r][0] is pinned to a large negative: class 0 is the unknown mask,
+    never a learned prediction, so it must never be boosted.
+    During training, adding tau * lp to the logits before cross-entropy
+    (Menon et al. 2021 logit-adjusted loss) makes the learned raw logit
+    approximate a prior-balanced posterior, undoing majority-class
+    collapse without touching the inference head.
+    """
+    counts = {r: np.zeros(len(vocab[r]) + 1) for r in ranks}
+    for m in meta.values():
+        for r in ranks:
+            c = vocab[r].get(m.get(r, ""))
+            if c is not None:
+                counts[r][c + 1] += 1
+    out: dict[str, torch.Tensor] = {}
+    for r in ranks:
+        n = len(vocab[r]) + 1
+        lp = np.full(n, -20.0, dtype=np.float32)
+        tot = counts[r][1:].sum() + (n - 1)
+        for c in range(1, n):
+            lp[c] = float(np.log((counts[r][c] + 1.0) / tot))
+        out[r] = torch.tensor(lp, dtype=torch.float32)
+    return out
+
+
 class TreeRankHead(nn.Module):
     """Cosine-prototype head for one taxonomy rank (A1 arm).
 
@@ -684,7 +748,16 @@ def encode_cont_labels(rows: dict[str, dict]) -> dict[str, tuple]:
 
 
 def build_split(meta: dict[str, dict], val_frac: float, genus_holdout: float,
-                seed: int):
+                seed: int, frag_val: float = 0.0):
+    """(val_accs, holdout_genera, val_frags).
+
+    frag_val > 0 withholds a CONTIGUOUS span of ~frag_val fragments from
+    every train-side accession as within-genome validation. Contiguous,
+    not random: interleaved holdout leaks through near-identical
+    neighbouring windows, whereas a held-out region tests whether the
+    class signature persists in unsampled sequence context. This is what
+    gives singleton-species genomes (one assembly, so genome-level val
+    can never pair them) species-level val coverage."""
     rng = random.Random(seed)
     # genomes whose requested rank was unresolved in taxonomy are
     # test-only: never trained on, always held out (OOD probe set)
@@ -714,7 +787,28 @@ def build_split(meta: dict[str, dict], val_frac: float, genus_holdout: float,
                                and m["accession"] not in val_accs})
         holdout_genera = set(rng.sample(
             train_genera, max(1, int(len(train_genera) * genus_holdout))))
-    return val_accs, holdout_genera
+
+    val_frags: set = set()
+    if frag_val > 0:
+        acc_genus: dict[str, str] = {}
+        by_acc_seq: dict[str, dict[str, list]] = defaultdict(
+            lambda: defaultdict(list))
+        for fid, m in meta.items():
+            acc = m["accession"]
+            acc_genus.setdefault(acc, m.get("genus", ""))
+            by_acc_seq[acc][m.get("seqid", "")].append(
+                (fid, int(m.get("start") or 0)))
+        for acc, seqs in by_acc_seq.items():
+            if acc in val_accs or acc_genus.get(acc) in holdout_genera:
+                continue
+            big = max(seqs.values(), key=len)
+            big.sort(key=lambda t: t[1])
+            w = int(round(len(big) * frag_val))
+            if w < 1 or len(big) <= w:
+                continue  # too few windows to spare
+            i0 = rng.randint(0, len(big) - w)
+            val_frags.update(fid for fid, _ in big[i0:i0 + w])
+    return val_accs, holdout_genera, val_frags
 
 
 def main():
@@ -732,6 +826,10 @@ def main():
     ap.add_argument("--holdout-genus-frac", type=float, default=0.0,
                     help="fraction of train genera moved to val entirely "
                          "(leave-clade-out probe)")
+    ap.add_argument("--frag-val", type=float, default=0.0,
+                    help="fraction of each train genome's windows withheld "
+                         "as one contiguous span for within-genome val "
+                         "(species coverage for singleton-species genomes)")
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--vertex-permute-augment", action="store_true",
                     help="randomly permute CGR corner vertices per fragment "
@@ -770,6 +868,11 @@ def main():
     ap.add_argument("--prior-tau", type=float, default=1.0,
                     help="tau for the tau*log(nu) sibling-prior offset "
                          "(tree head, applied during training only)")
+    ap.add_argument("--flat-prior-tau", type=float, default=0.0,
+                    help="tau for unconditional prior logit adjustment on "
+                         "FLAT heads: adds tau*log(nu) to logits inside "
+                         "the training cross-entropy only (Menon et al. "
+                         "2021); raw logits stay prior-balanced at eval")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cpu", action="store_true")
     args = ap.parse_args()
@@ -779,17 +882,20 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
 
     meta = load_labels(args.labels)
-    val_accs, holdout_genera = build_split(
-        meta, args.val_frac, args.holdout_genus_frac, args.seed)
+    val_accs, holdout_genera, val_frags = build_split(
+        meta, args.val_frac, args.holdout_genus_frac, args.seed,
+        frag_val=args.frag_val)
     print(f"{len(val_accs)} val genomes, "
-          f"{len(holdout_genera)} holdout genera")
+          f"{len(holdout_genera)} holdout genera, "
+          f"{len(val_frags)} frag-val windows")
 
-    def is_val(m):
+    def is_val(fid, m):
         return (m["accession"] in val_accs
-                or m["genus"] in holdout_genera)
+                or m["genus"] in holdout_genera
+                or fid in val_frags)
 
-    train_meta = {k: v for k, v in meta.items() if not is_val(v)}
-    val_meta = {k: v for k, v in meta.items() if is_val(v)}
+    train_meta = {k: v for k, v in meta.items() if not is_val(k, v)}
+    val_meta = {k: v for k, v in meta.items() if is_val(k, v)}
     print(f"frags: {len(train_meta)} train / {len(val_meta)} val")
 
     # vocab from TRAIN rows only; val rows outside vocab -> -1 (unknown)
@@ -803,8 +909,12 @@ def main():
     all_targets = cls_targets + CONT_TARGETS
     n_classes = {r: len(vocab[r]) + 1 for r in cls_targets}  # +1 = unknown
     n_classes.update({t: 1 for t in CONT_TARGETS})  # scalar heads
-    tree = (build_tree(train_meta, vocab, cls_targets)
-            if args.head == "tree" else None)
+    # build_tree is computed for every head: the sibling priors drive
+    # TreeRankHead, while parent_of is saved into the checkpoint so the
+    # evaluator can reconcile flat-head calls along the taxonomy tree
+    # at inference without retraining.
+    tree = build_tree(train_meta, vocab, cls_targets)
+    flat_priors = build_flat_priors(train_meta, vocab, cls_targets)
 
     def encode_labels(rows):
         out = {}
@@ -851,7 +961,8 @@ def main():
                      backbone=args.backbone, side=1 << args.k,
                      targets=all_targets, dropout=args.dropout,
                      stem_stride=args.stem_stride,
-                     head=args.head, tree=tree, aux=aux).to(device)
+                     head=args.head, tree=tree if args.head == "tree" else None,
+                     aux=aux).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.wd)
     steps = len(train_ld) * args.epochs
@@ -896,11 +1007,17 @@ def main():
                     # skip heads whose batch labels are all masked —
                     # cross_entropy(ignore_index=0) returns NaN there (val
                     # batches whose rank labels are entirely out-of-vocab)
-                    terms = [F.cross_entropy(logits[t], y[:, i],
-                                             ignore_index=0,
-                                             label_smoothing=args.label_smoothing)
-                             for i, t in enumerate(cls_targets)
-                             if (y[:, i] != 0).any()]
+                    terms = []
+                    for i, t in enumerate(cls_targets):
+                        if not (y[:, i] != 0).any():
+                            continue
+                        lg = logits[t]
+                        if train and args.flat_prior_tau > 0:
+                            lg = lg + args.flat_prior_tau * \
+                                flat_priors[t].to(device)
+                        terms.append(F.cross_entropy(
+                            lg, y[:, i], ignore_index=0,
+                            label_smoothing=args.label_smoothing))
                 fm = yc[:, 0] >= 0          # coding_frac label present
                 btgt = ((yc[:, 0] > 0) & (yc[:, 0] < 1)).float()
                 if fm.any():
@@ -962,12 +1079,16 @@ def main():
                     "k": args.k, "targets": all_targets,
                     "args": {k: str(v) if isinstance(v, Path) else v
                              for k, v in vars(args).items()}}
-            if tree is not None:
-                ckpt["tree"] = {
-                    "parent_of": {r: tree["parent_of"][r].tolist()
-                                  for r in cls_targets},
-                    "log_prior": {r: tree["log_prior"][r].tolist()
-                                  for r in cls_targets}}
+            # parent_of + flat priors are saved for every head so
+            # eval_pilot can do cross-rank tree reconciliation and
+            # prior diagnostics without rebuilding them from labels.tsv
+            ckpt["tree"] = {
+                "parent_of": {r: tree["parent_of"][r].tolist()
+                              for r in cls_targets},
+                "log_prior": {r: tree["log_prior"][r].tolist()
+                              for r in cls_targets}}
+            ckpt["flat_log_prior"] = {
+                r: flat_priors[r].tolist() for r in cls_targets}
             torch.save(ckpt, args.out / "best.pt")
     (args.out / "vocab.json").write_text(json.dumps(vocab, indent=1))
     print(f"done. best mean val acc {best:.3f} -> {args.out}/best.pt")

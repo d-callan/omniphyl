@@ -5,10 +5,24 @@ Metrics emitted:
   - Per-rank top-1 accuracy and macro-F1 (taxonomy ranks + coding head)
   - Split metrics: the training genome split is reproduced from the
     checkpoint's saved args; metrics are reported separately for train vs
-    held-out val genomes (memorization vs generalization).
+    held-out val genomes vs within-genome frag-val vs genus-holdout
+    (memorization vs generalization vs leave-clade-out).
   - Deepest-confident-rank: deepest rank whose top-1 softmax probability
     clears a confidence threshold (tau sweep). Real abstention — the mask
     class 0 is never a learned prediction.
+  - Selective precision / FDR among emitted calls (selective_precision.tsv):
+    per-rank coverage, precision, and FDR at tau in {0.5,...,0.95} plus
+    coverage@P90/P95 (max coverage whose running precision clears the
+    target). Emitted calls on out-of-vocabulary fragments (true == 0)
+    count as FALSE POSITIVES, not misses — the asymmetric cost model
+    where a confident wrong name is worse than abstaining.
+  - NCBI cross-rank reconciliation (default on, --no-reconcile-tree):
+    ancestor-path mean-logp rescoring of flat-head calls, a contradiction
+    veto (suppress a rank call when any shallower ancestor prob < tau_anc),
+    and reconciled variants of accuracy/selective metrics.
+  - Unseen-clade safety (genus-holdout fragments): overcall rate = fraction
+    emitted at genus/species where truth is out-of-vocab (hallucination);
+    safe_ancestor_stop = correct family call with genus/species abstained.
   - Per-group accuracy breakdown (domain/phylum/... accuracy split by RefSeq
     group: bacteria/viral/fungi/...)
   - Leave-phylum-out generalisation: separate accuracy for fragments from phyla
@@ -46,7 +60,7 @@ import csv
 import json
 import math
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -57,7 +71,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).parent))
 from train_omniphyl import (OmniPhyl, FragmentDataset, build_cell_lut,
                              build_split, RANKS, CONT_TARGETS,
-                             encode_cont_labels, MS_KS, HASH_K,
+                             encode_cont_labels, MS_KS, HASH_K, HASH_PAD,
                              rc_index_map)
 
 RANK_ORDER = RANKS  # domain -> ... -> species
@@ -131,6 +145,140 @@ def confusion_matrix_tsv(pred: list[int], true: list[int],
     return "\n".join(lines)
 
 
+def build_parent_of(rows_iter, vocab: dict, ranks: list[str]) -> dict:
+    """Majority-vote parent map when the checkpoint lacks ckpt["tree"].
+
+    parent_of[r][c] = shifted class id of the most common parent-rank
+    name on label rows carrying class c; 0 = parent missing/out-of-vocab.
+    Identical construction to train_omniphyl.build_tree's parent vote.
+    """
+    votes = {r: defaultdict(Counter) for r in ranks[1:]}
+    for m in rows_iter:
+        for ri in range(1, len(ranks)):
+            c_name = m.get(ranks[ri], "")
+            if c_name in vocab[ranks[ri]]:
+                votes[ranks[ri]][c_name][m.get(ranks[ri - 1], "")] += 1
+    parent_of = {}
+    for ri, r in enumerate(ranks):
+        po = np.zeros(len(vocab[r]) + 1, dtype=np.int64)
+        if ri:
+            for name, c in vocab[r].items():
+                pv = votes[r].get(name)
+                if pv:
+                    pname = pv.most_common(1)[0][0]
+                    po[c + 1] = vocab[ranks[ri - 1]].get(pname, -1) + 1
+        parent_of[r] = po
+    return parent_of
+
+
+def ancestor_chains(parent_of: dict, ranks: list[str]) -> dict:
+    """chains[r] -> int64 [n_r, ri+1]: col j = ancestor class id at
+    ranks[j] for each class id at rank r (col ri = self; 0 = ancestor
+    exists but is out-of-vocab/mask class; -1 = no parent known)."""
+    chains = {}
+    for ri, r in enumerate(ranks):
+        n = len(parent_of[r])
+        cols = [np.arange(n, dtype=np.int64)]
+        cur = np.arange(n, dtype=np.int64)
+        for k in range(ri, 0, -1):
+            po_k = parent_of[ranks[k]]
+            nxt = np.where(cur > 0, po_k[np.maximum(cur, 0)], -1)
+            cols.insert(0, nxt)
+            cur = nxt
+        chains[r] = np.stack(cols, axis=1)
+    return chains
+
+
+def path_scores(logp: dict, chain: np.ndarray,
+                ranks: list[str]) -> torch.Tensor:
+    """Mean log-probability of each rank-r class's full ancestor path.
+
+    chain: [C_r, L] numpy ancestor ids (col L-1 = self, -1 = missing).
+    logp[rk]: [B, C_rk] log-softmax tensors. Ancestor id 0 (the
+    out-of-vocab mask class) is treated as missing — its logit is an
+    untrained free parameter and carries no signal.
+    Returns [B, C_r] path-consistent scores (geometric-mean log-space).
+    """
+    ch = torch.from_numpy(chain)
+    valid = ch > 0                     # mask of usable ancestor evidence
+    denom = valid.sum(1).float()
+    acc = torch.zeros(next(iter(logp.values())).size(0), ch.size(0))
+    for j in range(ch.size(1)):
+        ids = ch[:, j].clamp(min=0)
+        g = logp[ranks[j]][:, ids]     # [B, C_r]
+        acc += g * valid[:, j].float()
+    # classes with zero usable ancestor evidence (the mask class 0, or
+    # fully-orphaned lineages) must not get score 0.0 — that would beat
+    # every real (negative) mean-logp path score.
+    score = acc / denom.clamp(min=1).unsqueeze(0)
+    score[:, denom == 0] = float("-inf")
+    return score
+
+
+FIXED_TAUS = (0.5, 0.7, 0.8, 0.9, 0.95)
+
+
+def selective_metrics(idxs: list[int], preds: dict, confs: dict,
+                      trues: dict, cls_targets: list[str],
+                      min_anc: dict | None = None,
+                      anc_taus: tuple = (0.1, 0.2, 0.4)) -> dict:
+    """Precision/FDR among emitted calls + coverage at target precision.
+
+    False positives include calls on unseen-clade fragments (true == 0):
+    an emitted confident call where the truth is out-of-vocabulary is a
+    hallucination, not a miss, so it counts in the FP denominator.
+    coverage = fraction of ALL cohort fragments emitted at tau.
+    cov_at_pT = max coverage over the confidence-sorted list whose
+    running precision stays >= T. If min_anc is provided, also sweeps
+    ancestor-consistency vetoes: a call at rank t is additionally
+    vetoed when any shallower-rank ancestor of the argmax has prob <
+    anc_tau (cross-rank contradiction -> false-positive suppressor).
+    """
+    sel = np.asarray(sorted(idxs), dtype=np.int64)
+    out: dict = {}
+    for t in cls_targets:
+        c = np.asarray(confs[t])[sel]
+        p = np.asarray(preds[t])[sel]
+        y = np.asarray(trues[t])[sel]
+        n_all = max(len(sel), 1)
+        rows: dict = {}
+        for tau in FIXED_TAUS:
+            called = c >= tau
+            nc = int(called.sum())
+            tp = int(((p == y) & (y > 0) & called).sum())
+            rows[f"tau_{tau}"] = {
+                "coverage": round(nc / n_all, 4),
+                "precision": round(tp / nc, 4) if nc else None,
+                "fdr": round(1 - tp / nc, 4) if nc else None,
+                "n_called": nc, "n_fp": nc - tp}
+        order = np.argsort(-c)
+        corr = ((p[order] == y[order]) & (y[order] > 0)).astype(float)
+        cump = np.cumsum(corr) / np.arange(1, len(corr) + 1)
+        covf = np.arange(1, len(corr) + 1) / n_all
+        for tgt in (90, 95):
+            ok = cump >= tgt / 100
+            rows[f"cov_at_p{tgt}"] = (round(float(covf[ok].max()), 4)
+                                      if ok.any() else 0.0)
+        if min_anc is not None and t in min_anc:
+            ma = np.asarray(min_anc[t])[sel]
+            veto_rows = {}
+            for at in anc_taus:
+                nc = 0
+                tp = 0
+                for tau in FIXED_TAUS:
+                    called = (c >= tau) & (ma >= at)
+                    n2 = int(called.sum())
+                    t2 = int(((p == y) & (y > 0) & called).sum())
+                    nc += n2
+                    tp += t2
+                    veto_rows[f"t{tau}_a{at}"] = {
+                        "coverage": round(n2 / n_all, 4),
+                        "precision": round(t2 / n2, 4) if n2 else None}
+            rows["ancestor_veto"] = veto_rows
+        out[t] = rows
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -146,10 +294,28 @@ def main():
                          "= the checkpoint's training --prior-tau (MAP "
                          "decisions); 0 gives prior-balanced conditionals")
     ap.add_argument("--cpu", action="store_true")
+    ap.add_argument("--jitter-rate", type=float, default=0.0,
+                    help="SNP substitutions per position applied to eval "
+                         "fragments; sweep this to test instance- vs "
+                         "spectrum-feature reliance (1 SNP kills ~k "
+                         "overlapping k-mers but preserves spectrum)")
+    ap.add_argument("--zero-aux", type=str, default="",
+                    help="comma list of aux branches to zero out at "
+                         "inference (e.g. 'hash' or 'hash,aa') — branch "
+                         "attribution")
+    ap.add_argument("--shuffle-aux", type=str, default="",
+                    help="comma list of aux branches whose per-sample "
+                         "inputs are shuffled across the batch — "
+                         "destroys label alignment while preserving "
+                         "input distribution (permutation control)")
     ap.add_argument("--val-only", action="store_true",
                     help="restrict inference to held-out val genomes")
     ap.add_argument("--max-genomes", type=int, default=0,
                     help="cap held-out accessions evaluated (0 = all)")
+    ap.add_argument("--no-reconcile-tree", action="store_true",
+                    help="skip NCBI cross-rank path-score reconciliation "
+                         "and ancestor-veto metrics (saves the per-batch "
+                         "ancestor-chain gathers on large corpora)")
     args = ap.parse_args()
 
     args.outdir.mkdir(parents=True, exist_ok=True)
@@ -203,28 +369,31 @@ def main():
     # Two-pass read under --val-only: pass 1 keeps only the columns
     # build_split needs (461k full rows = ~2 GB; slim rows ~50 MB); pass 2
     # loads full rows for eval fragments only.
-    SPLIT_COLS = {"accession", "rank_unresolved", "genus"}
+    SPLIT_COLS = {"accession", "rank_unresolved", "genus", "seq_source",
+                  "seqid", "start"}
+    split_args = (float(train_args.get("val_frac", 0.1)),
+                  float(train_args.get("holdout_genus_frac", 0.0)),
+                  int(train_args.get("seed", 0)),
+                  float(train_args.get("frag_val", 0.0)))
     if args.val_only:
         meta_split = load_labels(args.labels, cols=SPLIT_COLS)
-        val_accs, _ = build_split(
-            meta_split,
-            float(train_args.get("val_frac", 0.1)),
-            float(train_args.get("holdout_genus_frac", 0.0)),
-            int(train_args.get("seed", 0)))
+        val_accs, holdout_genera, val_frags = build_split(
+            meta_split, *split_args)
         eval_accs = set(sorted(val_accs)[:args.max_genomes or None])
+        # genus-holdout fragments sit on train-side accessions but were
+        # never trained on; keep them so the unseen-clade safety metrics
+        # (overcall / safe ancestor stop) can be scored under --val-only
         keep = {fid for fid, m in meta_split.items()
-                if m.get("accession") in eval_accs}
+                if m.get("accession") in eval_accs or fid in val_frags
+                or m.get("genus", "") in holdout_genera}
         meta = load_labels(args.labels, keep=keep)
         fid_acc = {fid: m.get("accession", "")
                    for fid, m in meta_split.items()}
         del meta_split
     else:
         meta = load_labels(args.labels)
-        val_accs, _ = build_split(
-            meta,
-            float(train_args.get("val_frac", 0.1)),
-            float(train_args.get("holdout_genus_frac", 0.0)),
-            int(train_args.get("seed", 0)))
+        val_accs, holdout_genera, val_frags = build_split(
+            meta, *split_args)
         eval_accs = set(sorted(val_accs)[:args.max_genomes or None])
         fid_acc = {fid: m.get("accession", "") for fid, m in meta.items()}
     encoded = encode_labels_from_vocab(meta, vocab, cls_targets)
@@ -243,7 +412,8 @@ def main():
                          ms_luts=ms_maps[0], ms_canons=ms_maps[1],
                          aux=aux,
                          hash_canon=rc_index_map(HASH_K)
-                         if "hash" in aux else None)
+                         if "hash" in aux else None,
+                         jitter=args.jitter_rate)
     loader = torch.utils.data.DataLoader(
         ds, args.batch_size, shuffle=False,
         num_workers=args.num_workers)
@@ -267,12 +437,50 @@ def main():
     tree_po = (ckpt.get("tree") or {}).get("parent_of")
     sib_ent: dict[str, list] = {t: [] for t in cls_targets}
 
+    # --- NCBI cross-rank reconciliation setup ---------------------------
+    # parent_of[r][c] maps class id c at rank r to its parent class id at
+    # rank r-1. New checkpoints save it for every head; older flat
+    # checkpoints rebuild it by majority vote over labels.tsv rank
+    # columns (same logic as build_tree's parent vote).
+    reconcile = not args.no_reconcile_tree
+    chains: dict | None = None
+    if reconcile:
+        if tree_po is None:
+            print("no parent map in checkpoint; rebuilding from "
+                  "labels.tsv (majority-vote parents, vocab-restricted)")
+            rows_iter = (meta.values() if not args.val_only else
+                         load_labels(args.labels, cols=set(RANKS)).values())
+            tree_po = {r: build_parent_of(rows_iter, vocab,
+                                          cls_targets)[r].tolist()
+                       for r in cls_targets}
+            del rows_iter
+        chains = {r: np.asarray(tree_po[r]) for r in cls_targets}
+        chains = ancestor_chains(chains, cls_targets)
+        n_orphan = {r: int((chains[r][:, :-1] == -1).all(1).sum())
+                    for r in cls_targets if chains[r].shape[1] > 1}
+        print(f"reconciling ranks over NCBI parent map; "
+              f"rootless classes per rank: {n_orphan}")
+    recon_pred: dict[str, list] = {t: [] for t in cls_targets}
+    recon_conf: dict[str, list] = {t: [] for t in cls_targets}
+    min_anc: dict[str, list] = {t: [] for t in cls_targets}
+
+    zero_aux = {a for a in args.zero_aux.split(",") if a}
+    shuffle_aux = {a for a in args.shuffle_aux.split(",") if a}
+
     with torch.no_grad():
         pos = 0
         for x, y, yc in loader:
             x = ({kk: v.to(device) for kk, v in x.items()}
                  if isinstance(x, dict) else x.to(device))
             bs = y.size(0)
+            if isinstance(x, dict):
+                for a in zero_aux & set(x):
+                    # all-padding bag -> padding_idx -> zero embedding;
+                    # vector branches -> literal zeros
+                    x[a] = (x[a].fill_(HASH_PAD) if a == "hash"
+                            else torch.zeros_like(x[a]))
+                for a in shuffle_aux & set(x):
+                    x[a] = x[a][torch.randperm(bs, device=x[a].device)]
             z, logits = model(x)
             if tree_po:
                 cond = model.cond_logps(z, tau=0.0)
@@ -298,6 +506,29 @@ def main():
                 all_confs[t].extend(
                     logits[t].softmax(1).max(1).values.cpu().tolist())
                 all_true[t].extend(y[:, i].tolist())
+            if chains is not None:
+                for t in cls_targets:
+                    ch = chains[t]
+                    # path-consistent call: mean logp along the full
+                    # NCBI ancestor path; col 0 (unknown) masked out
+                    s = path_scores(logp, ch, cls_targets)
+                    s[:, 0] = -1e9
+                    rp, rs = s.max(1)
+                    recon_pred[t].extend(rp.tolist())
+                    recon_conf[t].extend(torch.exp(rs).tolist())
+                    # veto evidence: weakest ancestor prob of the raw
+                    # argmax call (any shallower-rank rejection)
+                    pmax = logp[t].argmax(1)
+                    crow = torch.from_numpy(ch)[pmax]
+                    minp = torch.ones(bs)
+                    for j in range(crow.size(1) - 1):
+                        ids = crow[:, j]
+                        m = ids > 0
+                        ap = logp[cls_targets[j]].exp().gather(
+                            1, ids.clamp(min=0)[:, None]).squeeze(1)
+                        minp = torch.where(m, torch.minimum(minp, ap),
+                                           minp)
+                    min_anc[t].extend(minp.tolist())
             for t in CONT_TARGETS:
                 if t in logits:
                     cont_out[t].extend(
@@ -391,19 +622,44 @@ def main():
     # -----------------------------------------------------------------------
     val_set = {i for i, fid in enumerate(frag_ids)
                if fid_acc.get(fid) in val_accs}
+    fragval_set = {i for i, fid in enumerate(frag_ids)
+                   if fid in val_frags and i not in val_set}
+    # genus-holdout fragments were excluded from training by is_val() in
+    # train_omniphyl (leave-clade-out), but they sit on train-side
+    # accessions — without this bucket they silently pollute the "train"
+    # metrics, which understates the memorization gap
+    genushold_set = {i for i, fid in enumerate(frag_ids)
+                     if meta[fid].get("genus", "") in holdout_genera}
+    val_genus_set = genushold_set - val_set
     val_idxs = sorted(val_set)
-    train_idxs = [i for i in all_idxs if i not in val_set]
+    fragval_idxs = sorted(fragval_set)
+    val_genus_idxs = sorted(val_genus_set)
+    train_idxs = [i for i in all_idxs
+                  if i not in val_set and i not in fragval_set
+                  and i not in val_genus_set]
     results["split_metrics"] = {
         "n_train": len(train_idxs), "n_val": len(val_idxs),
+        "n_val_frag": len(fragval_idxs), "n_val_genus": len(val_genus_idxs),
         "val_genomes": sorted(val_accs),
+        "holdout_genera": sorted(holdout_genera),
         "train": {"per_target": cls_metrics(train_idxs),
                   "annotation_heads": cont_metrics(train_idxs)},
         "val": {"per_target": cls_metrics(val_idxs),
-                "annotation_heads": cont_metrics(val_idxs)}}
+                "annotation_heads": cont_metrics(val_idxs)},
+        "val_frag": {"per_target": cls_metrics(fragval_idxs),
+                     "annotation_heads": cont_metrics(fragval_idxs)},
+        "val_genus": {"per_target": cls_metrics(val_genus_idxs),
+                      "annotation_heads": cont_metrics(val_genus_idxs)}}
     print(f"\nSplit: {len(train_idxs)} train / {len(val_idxs)} val-genome "
-          f"frags ({len(val_accs)} held-out genomes)")
+          f"frags ({len(val_accs)} held-out genomes) / "
+          f"{len(fragval_idxs)} within-genome held-out frags / "
+          f"{len(val_genus_idxs)} genus-holdout frags "
+          f"({len(holdout_genera)} genera)")
     for t, m in results["split_metrics"]["val"]["per_target"].items():
         print(f"  val {t:12s}  acc={m['accuracy']}  n={m['n']}")
+    if fragval_idxs:
+        for t, m in results["split_metrics"]["val_frag"]["per_target"].items():
+            print(f"  fragval {t:8s}  acc={m['accuracy']}  n={m['n']}")
 
     # -----------------------------------------------------------------------
     # 1b. Predicted-class distribution: how concentrated argmax calls are
@@ -465,6 +721,142 @@ def main():
         results["deepest_confident_rank"][f"tau_{tau}"] = dict(dc)
         print(f"  tau={tau}: " + "  ".join(
             f"{r}:{dc.get(r, 0)}" for r in RANK_ORDER + ["none"]))
+
+    # -----------------------------------------------------------------------
+    # 2b. False-positive-first evaluation: precision/FDR among EMITTED
+    #     calls (conf >= tau), coverage @ target precision, and the
+    #     unseen-clade overcall/hallucination rate. Calls on fragments
+    #     whose truth is out-of-vocabulary (true == 0) count as false
+    #     positives — under the asymmetric cost model a confident wrong
+    #     name is worse than abstaining.
+    # -----------------------------------------------------------------------
+    cohorts = {"val": val_idxs, "val_frag": fragval_idxs,
+               "val_genus": val_genus_idxs}
+    sp_rows = ["cohort\trank\ttau\tcoverage\tprecision\tfdr\tn_called\tn_fp"]
+    results["selective"] = {}
+    for cname, cidx in cohorts.items():
+        if not cidx:
+            continue
+        results["selective"][cname] = selective_metrics(
+            cidx, all_preds, all_confs, all_true, cls_targets)
+        for t, rows in results["selective"][cname].items():
+            for tau in FIXED_TAUS:
+                r = rows[f"tau_{tau}"]
+                sp_rows.append(
+                    f"{cname}\t{t}\t{tau}\t{r['coverage']}\t"
+                    f"{r['precision']}\t{r['fdr']}\t{r['n_called']}\t"
+                    f"{r['n_fp']}")
+    print("\nSelective precision among emitted calls "
+          "(held-out genomes; unseen-clade calls count as FP):")
+    for t in cls_targets:
+        v = results["selective"].get("val", {}).get(t)
+        if not v:
+            continue
+        print(f"  {t:10s}  P@tau0.8={v['tau_0.8']['precision']} "
+              f"FDR={v['tau_0.8']['fdr']} "
+              f"cov={v['tau_0.8']['coverage']}  "
+              f"cov@P90={v['cov_at_p90']}  cov@P95={v['cov_at_p95']}")
+
+    # -----------------------------------------------------------------------
+    # 2c. Reconciled calls: NCBI ancestor-path scoring + contradiction veto
+    # -----------------------------------------------------------------------
+    if chains is not None:
+        results["reconciled"] = {}
+        results["reconciled"]["per_target_val"] = {
+            t: {"accuracy": (round(sum(recon_pred[t][i] == all_true[t][i]
+                                       for i in val_idxs
+                                       if all_true[t][i] != 0)
+                                   / max(sum(1 for i in val_idxs
+                                             if all_true[t][i] != 0), 1), 4)),
+                "n": sum(1 for i in val_idxs if all_true[t][i] != 0)}
+            for t in cls_targets}
+        print("\nReconciled (path-score) val accuracy vs raw flat argmax:")
+        for t in cls_targets:
+            ra = results["reconciled"]["per_target_val"][t]["accuracy"]
+            raw = results["split_metrics"]["val"]["per_target"][t][
+                "accuracy"]
+            print(f"  {t:10s}  raw={raw}  reconciled={ra}")
+        # selective metrics on reconciled calls + ancestor-veto on raw
+        # argmax calls (veto = emit call only if weakest ancestor prob
+        # clears anc_tau)
+        results["reconciled"]["selective_val"] = selective_metrics(
+            val_idxs, recon_pred, recon_conf, all_true, cls_targets)
+        results["ancestor_veto_val"] = selective_metrics(
+            val_idxs, all_preds, all_confs, all_true, cls_targets,
+            min_anc=min_anc)
+        for t in cls_targets:
+            rows = results["reconciled"]["selective_val"][t]
+            for tau in FIXED_TAUS:
+                r = rows[f"tau_{tau}"]
+                sp_rows.append(
+                    f"val_reconciled\t{t}\t{tau}\t{r['coverage']}\t"
+                    f"{r['precision']}\t{r['fdr']}\t{r['n_called']}\t"
+                    f"{r['n_fp']}")
+        print("\nReconciled selective precision (val):")
+        for t in cls_targets:
+            v = results["reconciled"]["selective_val"][t]
+            print(f"  {t:10s}  P@tau0.8={v['tau_0.8']['precision']} "
+                  f"cov={v['tau_0.8']['coverage']}  "
+                  f"cov@P90={v['cov_at_p90']}")
+        veto_rows = ["rank\ttau_conf\ttau_anc\tcoverage\tprecision"]
+        for t in cls_targets:
+            av = results["ancestor_veto_val"][t].get("ancestor_veto", {})
+            for k, r in av.items():
+                tconf, tanc = k.lstrip("t").split("_a")
+                veto_rows.append(f"{t}\t{tconf}\t{tanc}\t"
+                                 f"{r['coverage']}\t{r['precision']}")
+        (args.outdir / "ancestor_veto.tsv").write_text(
+            "\n".join(veto_rows) + "\n")
+    (args.outdir / "selective_precision.tsv").write_text(
+        "\n".join(sp_rows) + "\n")
+    print(f"wrote {args.outdir / 'selective_precision.tsv'}")
+
+    # -----------------------------------------------------------------------
+    # 2d. Unseen-clade safety: on genus-holdout fragments (true genus and
+    #     species are out-of-vocab by construction), a confident deep call
+    #     is a hallucination; the safe behaviour is to stop at the correct
+    #     family (or shallower).
+    # -----------------------------------------------------------------------
+    if val_genus_idxs and {"family", "genus", "species"} <= set(cls_targets):
+        safety = {}
+        print("\nUnseen-clade safety (genus-holdout fragments):")
+        for tau in FIXED_TAUS:
+            n = len(val_genus_idxs)
+            over = sum(1 for i in val_genus_idxs
+                       if (all_confs["genus"][i] >= tau
+                           or all_confs["species"][i] >= tau))
+            safe = sum(1 for i in val_genus_idxs
+                       if all_confs["genus"][i] < tau
+                       and all_confs["species"][i] < tau
+                       and all_confs["family"][i] >= tau
+                       and all_preds["family"][i] == all_true["family"][i])
+            safety[f"tau_{tau}"] = {
+                "n": n,
+                "overcall_rate": round(over / n, 4),
+                "safe_ancestor_stop": round(safe / n, 4)}
+            print(f"  tau={tau}: overcall={over / n:.3f}  "
+                  f"safe-stop={safe / n:.3f}  (n={n})")
+        results["unseen_clade_safety"] = safety
+        if chains is not None:
+            rsafety = {}
+            for tau in FIXED_TAUS:
+                n = len(val_genus_idxs)
+                over = sum(1 for i in val_genus_idxs
+                           if (recon_conf["genus"][i] >= tau
+                               or recon_conf["species"][i] >= tau))
+                safe = sum(1 for i in val_genus_idxs
+                           if recon_conf["genus"][i] < tau
+                           and recon_conf["species"][i] < tau
+                           and recon_conf["family"][i] >= tau
+                           and recon_pred["family"][i]
+                           == all_true["family"][i])
+                rsafety[f"tau_{tau}"] = {
+                    "n": n, "overcall_rate": round(over / n, 4),
+                    "safe_ancestor_stop": round(safe / n, 4)}
+            results["unseen_clade_safety"]["reconciled"] = rsafety
+            print("  reconciled: " + "  ".join(
+                f"tau={t}: over={v['overcall_rate']} safe={v['safe_ancestor_stop']}"
+                for t, v in rsafety.items()))
 
     # -----------------------------------------------------------------------
     # 3. Per-group accuracy (by RefSeq group column)

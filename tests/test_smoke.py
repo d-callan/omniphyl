@@ -27,10 +27,13 @@ from fetch_refseq_corpus import (  # noqa: E402
     veupath_intervals, _collect_bed_items)
 from train_omniphyl import (  # noqa: E402
     encode_cont_labels, CONT_TARGETS, RANKS, FragmentDataset,
-    build_cell_lut, load_labels, build_tree, OmniPhyl,
+    build_cell_lut, load_labels, build_tree, build_flat_priors, OmniPhyl,
     fcgr_encode_ms, rc_index_map, MS_KS,
     hash_encode, aa_encode, _AA_LUT, AA_LETTERS, AA_ALPHA,
     HASH_K, HASH_BUCKETS, HASH_PAD, HASH_LEN)
+from eval_pilot import (  # noqa: E402
+    ancestor_chains, build_parent_of, path_scores, selective_metrics,
+    FIXED_TAUS)
 
 PASS, FAIL = [], []
 
@@ -173,6 +176,88 @@ def test_tree_head():
           bool((logits["species"][:, 0] < -1e3).all()))
 
 
+def test_p0_eval_tools():
+    """P0: flat priors, parent-of fallback, ancestor chains, path scores,
+    and the FP-aware selective metrics."""
+    print("[P0 eval tools]")
+    import numpy as np
+    import torch
+
+    ranks = ["domain", "phylum", "class_"]
+    # use a small synthetic vocab: D0={Bac}; P={Firm,Actino}; C={A,B,X}
+    vocab = {"domain": {"Bac": 0},
+             "phylum": {"Firm": 0, "Actino": 1},
+             "class_": {"A": 0, "B": 1, "X": 2}}
+    rows = []
+    for i in range(10):   # Firm>A x5, Firm>B x4, Actino>X x1
+        d, p, c = (("Bac", "Firm", "A") if i < 5 else
+                   ("Bac", "Firm", "B") if i < 9 else
+                   ("Bac", "Actino", "X"))
+        rows.append({"domain": d, "phylum": p, "class_": c})
+
+    # --- build_flat_priors: unconditional priors over train rows -------
+    fp = build_flat_priors({str(i): m for i, m in enumerate(rows)},
+                           vocab, ranks)
+    check("flat prior shape", fp["class_"].shape == (4,), fp["class_"].shape)
+    check("flat prior col0 pinned -20",
+          float(fp["class_"][0]) == -20.0, fp["class_"].tolist())
+    check("majority class gets largest prior",
+          float(fp["class_"][1]) > float(fp["class_"][3]),
+          fp["class_"].tolist())
+    lp1 = fp["phylum"][1:].exp()
+    check("priors sum ~1 over real classes",
+          abs(float(lp1.sum()) - 1) < 0.02, float(lp1.sum()))
+
+    # --- build_parent_of fallback matches build_tree parent votes ------
+    po = build_parent_of(iter(rows), vocab, ranks)
+    check("fallback parent_of class ids",
+          po["class_"].tolist() == [0, 1, 1, 2], po["class_"].tolist())
+    check("fallback parent_of phylum -> domain",
+          po["phylum"].tolist() == [0, 1, 1], po["phylum"].tolist())
+
+    # --- ancestor chains ------------------------------------------------
+    chains = ancestor_chains(po, ranks)
+    # class A (id 1): path [domain 1, phylum 1(Firm), self 1]
+    check("chain for class A",
+          chains["class_"][1].tolist() == [1, 1, 1],
+          chains["class_"][1].tolist())
+    check("chain for class X (Actino path)",
+          chains["class_"][2 + 1].tolist() == [1, 2, 3],
+          chains["class_"][3].tolist())
+
+    # --- path_scores: consistent path wins over raw argmax flip -------
+    # logits favour class B at class_ rank but its phylum evidence is
+    # weak; class X is less favoured locally yet path-consistent.
+    # (col 0 = unknown mask class; real logit tensors always include it)
+    logp = {
+        "domain": torch.log_softmax(torch.tensor([[-9.0, 8.0]]), 1),
+        "phylum": torch.log_softmax(torch.tensor([[-9.0, 0.1, 4.0]]), 1),
+        "class_": torch.log_softmax(torch.tensor([[-9.0, 2.0, 3.0, 1.0]]), 1)
+    }
+    s = path_scores(logp, chains["class_"], ranks)
+    check("path score picks path-consistent class X",
+          int(s.argmax(1)[0]) == 3, s.tolist())
+
+    # --- selective_metrics: unseen-clade calls count as FP --------------
+    preds = {"phylum": [1, 1, 2, 2]}      # 4 frags
+    confs = {"phylum": [0.9, 0.9, 0.95, 0.3]}
+    trues = {"phylum": [1, 2, 0, 0]}      # 2 correct, 2 OOV (genus-holdout)
+    sm = selective_metrics([0, 1, 2, 3], preds, confs, trues, ["phylum"])
+    r = sm["phylum"]["tau_0.9"]
+    # at tau=0.9: frags 0,1,2 called; frag2 is OOV -> FP; frag1 wrong -> FP
+    check("tau0.9 precision counts OOV as FP",
+          r["n_called"] == 3 and r["n_fp"] == 2 and
+          abs(r["precision"] - 1 / 3) < 0.01, r)
+    check("cov_at_p90 zero when impossible",
+          sm["phylum"]["cov_at_p90"] < 0.3, sm["phylum"]["cov_at_p90"])
+    sm2 = selective_metrics([0, 1], preds, confs, trues, ["phylum"],
+                            min_anc={"phylum": [0.9, 0.05, 0.9, 0.9]})
+    av = sm2["phylum"]["ancestor_veto"]["t0.9_a0.2"]
+    # frag0 emitted (conf .9, anc .9); frag1 vetoed (anc .05 < .2)
+    check("ancestor veto suppresses weak-ancestor call",
+          av["coverage"] == 0.5 and av["precision"] == 1.0, av)
+
+
 # ----------------------------------------------------------- end to end ---
 
 def test_msfcgr():
@@ -269,13 +354,17 @@ def test_aux_branches():
 
 
 def make_corpus(tmp: Path):
-    """2 accessions x 24 frags, mixture of pure/boundary/no-label rows."""
+    """4 accessions x 24 frags in 2 two-genome genera; mixture of
+    pure/boundary/no-label rows. Two genera with 2 genomes each lets the
+    e2e test exercise genus holdout + genome val + a non-empty train set."""
     rng = random.Random(1)
     fna, rows = [], []
-    accs = [("GCA_000001.1", "Alpha proto", "Pseudomonada"),
-            ("GCA_000002.1", "Beta proto", "Cryptosporida")]
+    accs = [("GCA_000001.1", "Alpha proto", "Pseudomonada", "testus"),
+            ("GCA_000002.1", "Alpha proto", "Pseudomonada", "beta"),
+            ("GCA_000003.1", "Beta proto", "Cryptosporida", "testus"),
+            ("GCA_000004.1", "Beta proto", "Cryptosporida", "gamma")]
     n = 0
-    for acc, genus, family in accs:
+    for acc, genus, family, epithet in accs:
         for j in range(24):
             n += 1
             seqid, start, end = "chr1", j * 500, j * 500 + 500
@@ -300,7 +389,7 @@ def make_corpus(tmp: Path):
                 "domain": "Eukaryota", "phylum": "Apicomplexa",
                 "class": "Aconoidasida", "order": "Eucoccidiorida",
                 "family": family, "genus": genus,
-                "species": f"{genus} testus"})
+                "species": f"{genus} {epithet}"})
     fna_path = tmp / "fragments.fna"
     fna_path.write_text("".join(fna))
     lab_path = tmp / "labels.tsv"
@@ -337,6 +426,7 @@ def test_end_to_end():
          "--fragments", str(fna), "--labels", str(lab),
          "--out", str(out), "--k", "3", "--width", "16",
          "--epochs", "2", "--batch-size", "16", "--val-frac", "0.5",
+         "--flat-prior-tau", "1.0", "--holdout-genus-frac", "0.5",
          "--num-workers", "0", "--pos-channels", "--cpu"],
         capture_output=True, text=True, timeout=600)
     check("train exits 0", r.returncode == 0,
@@ -354,6 +444,10 @@ def test_end_to_end():
           ck["targets"])
     check("metric lines emitted",
           "frac_mae" in r.stdout and "boundary_acc" in r.stdout)
+    check("flat ckpt saves parent map + flat priors",
+          "tree" in ck and "parent_of" in ck["tree"] and
+          "flat_log_prior" in ck and "species" in ck["flat_log_prior"],
+          list(ck.get("tree", {})) + list(ck.get("flat_log_prior", {})))
 
     ev = tmp / "eval"
     r = subprocess.run(
@@ -381,6 +475,14 @@ def test_end_to_end():
               "predicted_class_entropy" in res and
               "phylum" in res["predicted_class_entropy"],
               list(res.get("predicted_class_entropy", {})))
+        check("selective precision section + tsv",
+              "selective" in res and "val" in res["selective"] and
+              (ev / "selective_precision.tsv").exists(),
+              list(res.get("selective", {})))
+        check("reconciled block emitted",
+              "reconciled" in res and
+              "selective_val" in res["reconciled"],
+              list(res.get("reconciled", {})))
 
 
 def test_contaminant_screen():
@@ -446,7 +548,8 @@ def test_contaminant_screen():
 def main():
     for t in (test_label_math, test_veupath_helpers,
               test_slicing_and_encoding, test_tree_head, test_msfcgr,
-              test_aux_branches, test_contaminant_screen, test_end_to_end):
+              test_aux_branches, test_p0_eval_tools,
+              test_contaminant_screen, test_end_to_end):
         t()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

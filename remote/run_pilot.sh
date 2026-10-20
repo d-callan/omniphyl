@@ -69,11 +69,13 @@ WD="${WD:-1e-4}"
 BACKBONE="${BACKBONE:-resnet}"      # resnet | vit | seq
 STEM_STRIDE="${STEM_STRIDE:-2}"     # 1 = full-res FCGR stem
 HOLDOUT_GENUS_FRAC="${HOLDOUT_GENUS_FRAC:-0}"
+FRAG_VAL="${FRAG_VAL:-0}"             # within-genome frag holdout fraction (contiguous span)
 FETCH_ONLY="${FETCH_ONLY:-0}"       # 1 = corpus capture run, no training
 SKIP_FETCH="${SKIP_FETCH:-0}"       # 1 = use prebuilt corpus in CORPUS_DIR
 CORPUS_DIR="${CORPUS_DIR:-}"        # empty = $WORKDIR/corpus
 HEAD="${HEAD:-flat}"               # flat | tree (A1 head/loss arm)
 PRIOR_TAU="${PRIOR_TAU:-1}"
+FLAT_PRIOR_TAU="${FLAT_PRIOR_TAU:-0}"  # unconditional prior LA on flat heads
 SCREEN_CONTAM="${SCREEN_CONTAM:-1}"   # 1 = screen all fragments for contaminants
 HUMAN_FASTA="${HUMAN_FASTA:-}"        # optional GRCh38 fasta for human sketch
 SMOKE="${SMOKE:-1}"
@@ -172,10 +174,11 @@ python3 scripts/train_omniphyl.py \
     --fragments "$FRAG_FILE" --labels "$LAB_FILE" \
     --out "$RUN" --k "$K" --width "$WIDTH" --epochs "$EPOCHS" \
     --batch-size "$BATCH" --val-frac "$VAL_FRAC" \
-    --holdout-genus-frac "$HOLDOUT_GENUS_FRAC" \
+    --holdout-genus-frac "$HOLDOUT_GENUS_FRAC" --frag-val "$FRAG_VAL" \
     --dropout "$DROPOUT" --label-smoothing "$LABEL_SMOOTHING" --wd "$WD" \
     --backbone "$BACKBONE" --stem-stride "$STEM_STRIDE" \
     --head "$HEAD" --prior-tau "$PRIOR_TAU" \
+    --flat-prior-tau "$FLAT_PRIOR_TAU" \
     --num-workers "$NUM_WORKERS" \
     --aux "$AUX" \
     --seq-len "$FRAG_LEN" \
