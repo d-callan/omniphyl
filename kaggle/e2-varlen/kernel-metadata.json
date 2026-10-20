@@ -1,0 +1,15 @@
+{
+  "id": "daniellecallan/omniphyl-e2-varlen",
+  "title": "omniphyl-e2-varlen",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "daniellecallan/omniphyl-5group-mini-corpus"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}
