@@ -313,6 +313,11 @@ def test_msfcgr():
         else:
             got_sub |= 150 <= len(c) <= 500 and c in seq
     check("varlen emits both sub-window and PE modes", got_pe and got_sub)
+    # sequences at/below min_len must not hit randint(min_len, len)
+    # with an empty range — they pass through unchanged
+    check("varlen passes through short seqs",
+          varlen_crop("ACGT" * 30, 150) == "ACGT" * 30 and
+          varlen_crop("A" * 150, 150) == "A" * 150)
     check("eval_crop truncates to prefix",
           eval_crop_seq(seq, crop=250) == seq[:250] and
           len(eval_crop_seq(seq, crop=250)) == 250)
@@ -534,6 +539,68 @@ def test_p3_annot():
           subtract_intervals([(0, 900)], [(0, 400), (699, 900)])
           == [(400, 699)])
 
+    # precomputed per-seqid structures: the full-GFF case derives the
+    # intron as mRNA minus (exon ∪ CDS), and the transcript group
+    # carries transcript-oriented start/stop/donor/acceptor coords
+    check("precomputed intron interval",
+          feats["chr1"]["intron"] == [(400, 699)],
+          feats["chr1"]["intron"])
+    tr = feats["chr1"]["trans"]
+    check("precomputed transcript transitions",
+          len(tr) == 1 and tr[0][0] == 99 and tr[0][1] == 850 and
+          tr[0][2] == [400] and tr[0][3] == [699],
+          tr)
+
+    # Parent= must win over protein_id=: two CDSs sharing a Parent but
+    # carrying DIFFERENT protein ids (split-CDS annotation artefact)
+    # must still group into ONE transcript, while a protein_id-only
+    # GFF (no Parent= at all) still groups correctly.
+    gff2 = tmp / "t2.gff"
+    gff2.write_text(
+        "##gff-version 3\n"
+        # tx2: two CDSs, same Parent, divergent protein_ids -> one group,
+        # one internal gap -> intron (400,500)
+        "chrA\tref\tCDS\t100\t400\t.\t+\t0\tParent=tx2;"
+        "protein_id=prot_a\n"
+        "chrA\tref\tCDS\t500\t700\t.\t+\t0\tParent=tx2;"
+        "protein_id=prot_b\n"
+        # tx3: protein_id-only grouping on the minus strand
+        "chrA\tref\tCDS\t900\t1000\t.\t-\t0\tprotein_id=prot_c\n"
+        "chrA\tref\tCDS\t1100\t1200\t.\t-\t0\tprotein_id=prot_c;"
+        "Note=InterPro:IPR999999\n")
+    feats2 = load_gff_features(gff2)
+    check("Parent groups split-CDS transcript",
+          [(t[0], t[1]) for t in feats2["chrA"]["trans"]] ==
+          [(99, 700), (1200, 899)],
+          feats2["chrA"]["trans"])
+    check("inter-CDS gap -> intron (no exon rows)",
+          feats2["chrA"]["intron"] == [(400, 499), (1000, 1099)],
+          feats2["chrA"]["intron"])
+    check("minus-strand donor/acceptor orientation",
+          feats2["chrA"]["trans"][1][2] == [1099] and
+          feats2["chrA"]["trans"][1][3] == [1000],
+          feats2["chrA"]["trans"])
+    # DOMAIN_RE must find ids anywhere in the attributes column, not
+    # only inside Dbxref= tokens
+    cds_with_note = [r for r in feats2["chrA"]["cds_recs"]
+                     if r[5] == ["InterPro:IPR999999"]]
+    check("domain id found outside Dbxref attr",
+          len(cds_with_note) == 1,
+          [r[5] for r in feats2["chrA"]["cds_recs"]])
+
+    # mRNA+CDS but NO exon rows: intron = mRNA minus CDS coverage — the
+    # CDS portion of the transcript must NOT be labelled intronic.
+    gff3 = tmp / "t3.gff"
+    gff3.write_text(
+        "##gff-version 3\n"
+        "chrB\tref\tmRNA\t1\t900\t.\t+\t.\tID=tx4\n"
+        "chrB\tref\tCDS\t100\t400\t.\t+\t0\tParent=tx4\n"
+        "chrB\tref\tCDS\t700\t850\t.\t+\t2\tParent=tx4\n")
+    feats3 = load_gff_features(gff3)
+    check("no-exon GFF intron excludes CDS",
+          feats3["chrB"]["intron"] == [(0, 99), (400, 699), (850, 900)],
+          feats3["chrB"]["intron"])
+
     # --- annot label encoding -----------------------------------------
     rows = {
         "f1": {"coding_frac": "0.5", "intron_frac": "0.25",
@@ -632,6 +699,19 @@ def test_end_to_end():
     check("cont label tuple floats",
           tuple(yc.shape) == (2,) and yc.is_floating_point(),
           yc.tolist())
+
+    # var-len crop: window-derived cont targets describe the full 500bp
+    # window, so a stochastic crop must mask them to -1 (unlabeled).
+    # var_len_prob=1.0 forces a crop on every 500bp frag.
+    import numpy as np
+    np.random.seed(0)
+    ds_v = FragmentDataset(fna, {fid: {} for fid in meta}, 3, lut,
+                           pos=True, targets=[],
+                           cont=encode_cont_labels(meta),
+                           var_len_prob=1.0, min_train_len=150)
+    _, _, yc_v = ds_v[0]
+    check("cropped frag masks cont labels",
+          bool((yc_v == -1.0).all()), yc_v.tolist())
 
     out = tmp / "ckpt"
     r = subprocess.run(
@@ -740,11 +820,25 @@ def test_end_to_end():
                   "region_fracs" in ah and "active_frame" in ah
                   and "struct_flags" in ah and "domains" in ah,
                   list(ah))
+            fs = res.get("split_metrics", {}).get(
+                "val", {}).get("annot_heads", {}).get("frame_scan", {})
             check("annot frame-scan gate ran",
-                  "frame_scan" in res.get("split_metrics", {})
-                  .get("val", {}).get("annot_heads", {}),
-                  list(res.get("split_metrics", {}).get("val", {})
-                       .get("annot_heads", {})))
+                  bool(fs), list(res.get("split_metrics", {})
+                                 .get("val", {})
+                                 .get("annot_heads", {})))
+            check("frame-scan emits unconditional + flagged rates",
+                  not fs or all(
+                      "unconditional_hit_rate_3bp" in fs.get(k, {}) and
+                      "flagged_hit_rate_3bp" in fs.get(k, {})
+                      for k in ("start", "stop")),
+                  fs)
+            rf = res.get("split_metrics", {}).get(
+                "val", {}).get("annot_heads", {}).get("region_fracs", {})
+            check("intron-vs-intergenic AUROC emitted",
+                  not rf or "intron_vs_intergenic_auroc" in rf, rf)
+            check("reconciled genome consensus emitted",
+                  "genome_consensus" in res.get("reconciled", {}),
+                  list(res.get("reconciled", {})))
 
     # gated aa arm: exercises aa_extra encoding -> gated ckpt ->
     # eval_pilot reconstruction (aa_mode/aa_extra round-trip)

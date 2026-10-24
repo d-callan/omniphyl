@@ -403,6 +403,8 @@ def varlen_crop(s: str, min_len: int) -> str:
     cross-insert k-mers and codons: both fcgr_encode and aa_encode
     drop windows/codons containing it.
     """
+    if len(s) <= min_len:
+        return s
     if np.random.random() < 0.3 and len(s) >= 2 * PE_LEN:
         return s[:PE_LEN] + "N" + s[-PE_LEN:]
     L = int(np.random.randint(min_len, len(s) + 1))
@@ -513,8 +515,12 @@ class FragmentDataset(Dataset):
         if self.jitter:
             s = jitter_seq(s, self.jitter,
                            zlib.crc32(fid.encode("ascii")))
+        cropped = False
         if self.var_len_prob and np.random.random() < self.var_len_prob:
+            n0 = len(s)
             s = varlen_crop(s, self.min_train_len)
+            # varlen_crop passes through unchanged when len(s) <= min_len
+            cropped = len(s) != n0
         if self.eval_crop or self.eval_paired:
             s = eval_crop_seq(s, self.eval_crop, self.eval_paired)
         img = (seq_encode(s, self.seq_len, perm) if self.seq
@@ -538,6 +544,14 @@ class FragmentDataset(Dataset):
             x["aa_frame"] = torch.from_numpy(aa_frame_encode(s))
         if self.annot is not None:
             c = c + self.annot.get(fid, self._annot_default)
+        if cropped:
+            # The crop shifts reading frame by (offset % 3), moves or
+            # drops structural transitions, and the coding fraction was
+            # measured on the full window — every window-derived target
+            # (coding_frac, boundary, offset, region, frame, flags,
+            # domains) is wrong for the cropped read. Mask them all to
+            # the -1 unlabeled sentinel the losses already respect.
+            c = (-1.0,) * len(c)
         return (x, torch.from_numpy(lab),
                 torch.tensor(c, dtype=torch.float32))
 

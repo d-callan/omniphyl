@@ -41,12 +41,13 @@ os.environ.setdefault("SKIP_FETCH", "1")
 os.environ.setdefault("CORPUS_DIR", CORPUS)
 # --- arm config -------------------------------------------------------
 # E1b: gated aa fusion (gate input = [z_dna, detached coding logit,
-# 18 frame/stop feats]). Same everything else as a3f.
-os.environ.setdefault("AUX", "hash,aa")
+# 18 frame/stop feats]). AUX=aa only — hash was dropped from the plan.
+os.environ.setdefault("AUX", "aa")
 os.environ.setdefault("AA_MODE", "gated")
 os.environ.setdefault("BACKBONE", "msfcgr")
 os.environ.setdefault("HEAD", "flat")
-os.environ.setdefault("PRIOR_TAU", "1.0")
+os.environ.setdefault("FLAT_PRIOR_TAU", "1.0")
+os.environ.setdefault("FRAG_VAL", "0.1")
 os.environ.setdefault("EPOCHS", "10")
 os.environ.setdefault("WIDTH", "32")
 os.environ.setdefault("DROPOUT", "0.2")
@@ -62,3 +63,26 @@ subprocess.run(["git", "clone", "--depth", "1",
                     "REPO_URL", "https://github.com/d-callan/omniphyl.git"),
                 f"{WORK}/omniphyl"], check=True)
 subprocess.run(["bash", f"{WORK}/omniphyl/remote/run_pilot.sh"], check=True)
+
+# --- E1 gate: --zero-aux aa eval ---------------------------------------
+# The arm only passes if accuracy survives with the aa branch zeroed.
+REPO = f"{WORK}/omniphyl"
+CKPT = f"{WORK}/omniphyl-work/run/best.pt"
+for frag, lab in [
+        (f"{WORK}/omniphyl-work/screened/fragments_screened.fna",
+         f"{WORK}/omniphyl-work/screened/labels_screened.tsv"),
+        (f"{CORPUS}/fragments_screened.fna",
+         f"{CORPUS}/labels_screened.tsv"),
+        (f"{CORPUS}/fragments.fna", f"{CORPUS}/labels.tsv")]:
+    if os.path.exists(frag) and os.path.exists(lab):
+        break
+else:
+    raise SystemExit("no usable fragments/labels for zero-aux eval")
+outdir = f"{WORK}/omniphyl-work/run/eval_zeroaa"
+print(f"=== eval --zero-aux aa -> {outdir} ===", flush=True)
+subprocess.run(
+    [sys.executable, f"{REPO}/scripts/eval_pilot.py",
+     "--model", CKPT, "--fragments", frag, "--labels", lab,
+     "--outdir", outdir, "--num-workers", "4",
+     "--val-only", "--zero-aux", "aa"],
+    check=True)

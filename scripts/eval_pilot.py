@@ -136,6 +136,7 @@ def auprc(y: np.ndarray, s: np.ndarray):
 
 
 STOPS = {"TAA", "TAG", "TGA"}
+STARTS = {"ATG", "GTG", "TTG"}  # ~15-20% of prokaryotic starts are non-ATG
 
 
 def scan_transition(seq: str, frame: int, kind: str,
@@ -153,7 +154,7 @@ def scan_transition(seq: str, frame: int, kind: str,
     s2 = seq[::-1].translate(str.maketrans("ACGT", "TGCA")) if rev else seq
     L = len(s2)
     off = (frame - 3) if rev else frame
-    cands = {"ATG"} if kind == "start" else STOPS
+    cands = STARTS if kind == "start" else STOPS
     best, bd = None, 1e18
     for i in range(off, L - 2, 3):
         if s2[i:i + 3] not in cands:
@@ -749,6 +750,21 @@ def main():
                     m["euk_coding_auroc"] = auroc(
                         coding_bin[euk], p[euk, 0])
                     m["euk_n"] = int(euk.sum())
+                # intron vs intergenic separation (E3 gate): on windows
+                # where intron OR intergenic is the dominant true
+                # region, does predicted intron-minus-intergenic mass
+                # rank them? Splice-aware composition is what the
+                # region head adds over the binary coding scalar.
+                ii_dom = np.maximum(t_[:, 1], t_[:, 3]) > 0.5
+                if ii_dom.any():
+                    y_ii = (t_[ii_dom, 1] > t_[ii_dom, 3]).astype(float)
+                    s_ii = p[ii_dom, 1] - p[ii_dom, 3]
+                    m["intron_vs_intergenic_auroc"] = auroc(y_ii, s_ii)
+                    m["n_intron_intergenic"] = int(ii_dom.sum())
+                    if euk.any():
+                        ee = euk[ii_dom]
+                        m["euk_intron_vs_intergenic_auroc"] = auroc(
+                            y_ii[ee], s_ii[ee])
                 out["region_fracs"] = m
         if ann_out["active_frame"]:
             fm = ya[:, 4] >= 0
@@ -810,9 +826,15 @@ def main():
         # has_start/has_stop windows with exactly one CDS boundary:
         # head predicts bit + frame + coordinate; scanner resolves the
         # coordinate to a canonical triplet in that frame; hit within 3bp.
+        # Two views: "unconditional" asks whether the predicted frame +
+        # offset locate the true edge whenever a start/stop truly exists
+        # in the window (pure localization ability); "flagged" asks the
+        # same on windows where the head actually fired the flag
+        # (end-to-end pathway rate).
         if scan and ann_out["struct_flags"] \
                 and ann_out["active_frame"]:
-            rows = {"start": [0, 0], "stop": [0, 0]}
+            uncond = {"start": [0, 0], "stop": [0, 0]}
+            flagged = {"start": [0, 0], "stop": [0, 0]}
             n_single_bnd = 0
             for pos_i, i in enumerate(sel):
                 fid = frag_ids[i]
@@ -822,28 +844,40 @@ def main():
                 n_single_bnd += 1
                 flg = ann_out["struct_flags"][i]
                 fr = ann_out["active_frame"][i]
-                if fr >= 6:
-                    continue
                 seq = ds._read_seq(fid)
                 flen = len(seq)
                 for bit, kind in ((0, "start"), (1, "stop")):
-                    if ya[pos_i, 5 + bit] < 0.5 or flg[bit] <= 0.5:
+                    if ya[pos_i, 5 + bit] < 0.5:
                         continue
-                    pred_off = (cont_out["offset"][i] * flen
-                                if cont_out["offset"] else flen / 2)
-                    edge = scan_transition(seq, int(fr), kind, pred_off)
-                    if edge is None:
-                        continue
-                    rows[kind][1] += 1
-                    if abs(edge - off_true[i] * flen) <= 3:
-                        rows[kind][0] += 1
+                    # unconditional: every window where this transition
+                    # truly exists counts in the denominator — a wrong
+                    # frame call or a missing triplet is a miss
+                    uncond[kind][1] += 1
+                    hit = False
+                    if fr < 6:
+                        pred_off = (cont_out["offset"][i] * flen
+                                    if cont_out["offset"] else flen / 2)
+                        edge = scan_transition(seq, int(fr), kind,
+                                               pred_off)
+                        hit = (edge is not None
+                               and abs(edge - off_true[i] * flen) <= 3)
+                    uncond[kind][0] += int(hit)
+                    if fr < 6 and flg[bit] > 0.5:
+                        flagged[kind][1] += 1
+                        flagged[kind][0] += int(hit)
             if n_single_bnd:
                 out["frame_scan"] = {
                     "n_single_boundary_windows": n_single_bnd,
-                    **{k: {"hit_rate_3bp": round(v[0] / v[1], 4)
-                           if v[1] else None,
-                           "n": v[1]}
-                       for k, v in rows.items()}}
+                    **{k: {"unconditional_hit_rate_3bp":
+                           round(u[0] / u[1], 4) if u[1] else None,
+                           "n_unconditional": u[1],
+                           "flagged_hit_rate_3bp":
+                           round(fl[0] / fl[1], 4) if fl[1] else None,
+                           "n_flagged": fl[1]}
+                       for k, u, fl in zip(
+                           ("start", "stop"),
+                           (uncond["start"], uncond["stop"]),
+                           (flagged["start"], flagged["stop"]))}}
         return out
 
     results: dict = {}
@@ -1359,6 +1393,67 @@ def main():
         print(f"  {g:20s}  " + "  ".join(
             f"{t}:{ranks[t]['all']['acc']}(n={ranks[t]['all']['n_genomes']})"
             for t in cls_targets if t in ranks))
+
+    # Reconciled consensus: pool first, then score each rank-t class by
+    # the mean pooled evidence along its NCBI ancestor path — the same
+    # cross-rank veto as the per-frag reconciler, applied to aggregated
+    # genome-level posteriors.
+    if chains is not None:
+        n_cls = {t: n_classes[t] for t in cls_targets}
+        recon_cons: dict[str, dict] = {}
+        print("\nReconciled genome consensus (held-out accessions):")
+        for t in cls_targets:
+            if not cons_logp[t]:
+                continue
+            ch = chains[t]
+            per_m = {}
+            for m in (1, 20, 0):
+                correct = total = 0
+                for acc, locs in acc_to_local.items():
+                    gi = cons_pos_list[locs[0]]
+                    if all_true[t][gi] == 0:
+                        continue
+                    take = (locs if m == 0 else
+                            rng.choice(locs, min(m, len(locs)),
+                                       replace=False))
+                    # dense pooled logp (floor-subtracted) per rank
+                    dense: dict[str, np.ndarray] = {}
+                    for t2 in cls_targets:
+                        if not cons_logp[t2]:
+                            continue
+                        d = np.zeros(n_cls[t2], dtype=np.float64)
+                        for li in np.atleast_1d(take):
+                            idx, val = cons_logp[t2][li]
+                            floor = float(val[-1])
+                            np.add.at(d, idx, val - floor)
+                        dense[t2] = d
+                    if t not in dense:
+                        continue
+                    # mean pooled evidence along each class's ancestor
+                    # path (cols of ch); unusable ancestors (id<=0)
+                    # drop out of the mean like path_scores
+                    score = np.zeros(len(dense[t]))
+                    denom = np.zeros(len(dense[t]))
+                    for j, rj in enumerate(cls_targets):
+                        if j > ch.shape[1] - 1 or rj not in dense:
+                            break
+                        ids = np.clip(ch[:, j], 0, len(dense[rj]) - 1)
+                        ok = ch[:, j] > 0
+                        score[ok] += dense[rj][ids[ok]]
+                        denom[ok] += 1
+                    score[denom == 0] = -np.inf
+                    score[0] = -np.inf
+                    pred_c = int(np.argmax(
+                        score / np.maximum(denom, 1)))
+                    correct += int(pred_c == all_true[t][gi])
+                    total += 1
+                key = "all" if m == 0 else f"M{m}"
+                per_m[key] = {"acc": round(correct / total, 4)
+                              if total else None, "n_genomes": total}
+            recon_cons[t] = per_m
+            print(f"  {t:10s}  " + "  ".join(
+                f"{k}={v['acc']}" for k, v in per_m.items()))
+        results.setdefault("reconciled", {})["genome_consensus"] = recon_cons
 
     # -----------------------------------------------------------------------
     # Write full results JSON

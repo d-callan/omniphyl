@@ -41,15 +41,16 @@ os.environ.setdefault("OUTDIR", WORK)
 os.environ.setdefault("SKIP_FETCH", "1")
 os.environ.setdefault("CORPUS_DIR", CORPUS)
 # --- arm config -------------------------------------------------------
-# E2: var-len training on top of the (assumed) E1 winner, gated+drop.
-os.environ.setdefault("AUX", "hash,aa")
+# E2: var-len training on top of the E1 winner base, gated+drop.
+os.environ.setdefault("AUX", "aa")
 os.environ.setdefault("AA_MODE", "gated")
 os.environ.setdefault("AA_DROP", "0.2")
 os.environ.setdefault("MIN_TRAIN_LEN", "150")
 os.environ.setdefault("VAR_LEN_PROB", "0.35")
 os.environ.setdefault("BACKBONE", "msfcgr")
 os.environ.setdefault("HEAD", "flat")
-os.environ.setdefault("PRIOR_TAU", "1.0")
+os.environ.setdefault("FLAT_PRIOR_TAU", "1.0")
+os.environ.setdefault("FRAG_VAL", "0.1")
 os.environ.setdefault("EPOCHS", "10")
 os.environ.setdefault("WIDTH", "32")
 os.environ.setdefault("DROPOUT", "0.2")
@@ -83,6 +84,14 @@ for name, extra in [
     ("pe150", ["--eval-paired-len", "150"]),
     ("pe250", ["--eval-paired-len", "250"]),
 ]:
+    outdir = f"{WORK}/omniphyl-work/run/eval_{name}"
+    print(f"=== eval {name} -> {outdir} ===", flush=True)
+    subprocess.run(
+        [sys.executable, f"{REPO}/scripts/eval_pilot.py",
+         "--model", CKPT, "--fragments", frag, "--labels", lab,
+         "--outdir", outdir, "--num-workers", "4", *extra],
+        check=True)
+print("multi-length eval sweep complete")
     outdir = f"{WORK}/omniphyl-work/run/eval_{name}"
     print(f"=== eval {name} -> {outdir} ===", flush=True)
     subprocess.run(

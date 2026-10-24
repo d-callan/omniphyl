@@ -351,11 +351,30 @@ DOMAIN_RE = re.compile(r"(?:InterPro:IPR\d+|(?:PFAM|Pfam):PF\d+)")
 
 
 def load_gff_features(gff_path: Path) -> dict[str, dict]:
-    """seqid -> {cds, exon, mrna, rna interval lists; cds_recs}.
+    """seqid -> {cds, exon, mrna, rna interval lists; cds_recs;
+    intron, trans}.
 
     cds_recs entries are (start, end, strand, phase, parent, [domains]).
-    Superset of load_gff_cds; the CDS interval list is derivable via
-    feats[seqid]["cds"].
+    Per-seqid ``intron`` intervals and ``trans`` transition coordinate
+    lists are computed ONCE here -- they are properties of the whole
+    chromosome, not of any single window, so deriving them per fragment
+    would redo full-contig interval subtraction + parent-group sorting
+    for every candidate window.
+
+    ``trans`` holds (start_pos, stop_pos, donors, acceptors) per
+    (parent, strand) transcript group, transcript-oriented: donors are
+    the 3' edge of each internal CDS exon, acceptors the 5' edge of the
+    next exon in transcript order. Grouping by ALL CDS records of a
+    parent (not only window-visible ones) prevents an internal exon
+    boundary from masquerading as a translation start or stop.
+
+    ``intron`` = mRNA minus (exon ∪ CDS), UNION internal gaps between
+    consecutive CDS segments of the same transcript, minus CDS. Three
+    GFF shapes are covered: (a) full euk GFF with mRNA+exon+CDS;
+    (b) mRNA+CDS but no exon rows (subtracting exons alone would call
+    the entire mRNA, CDS included, 'intron'); (c) no mRNA/exon at all
+    (prokaryotic/viral CDS-only GFFs), where the only introns are the
+    rare spliced-CDS introns visible as inter-CDS gaps within a parent.
     """
     feats: dict[str, dict] = defaultdict(
         lambda: {"cds": [], "exon": [], "mrna": [], "rna": [],
@@ -374,22 +393,63 @@ def load_gff_features(gff_path: Path) -> dict[str, dict]:
             if ftype == "cds":
                 strand, phase = parts[6], parts[7]
                 attrs = parts[8]
-                parent, domains = "", []
+                # Parent= wins over protein_id=: split CDSs of one
+                # transcript share Parent but may diverge on protein
+                # ids; protein_id is the fallback for CDS-only GFFs
+                # that never emit mRNA rows.
+                parent, protein = "", ""
                 for tok in attrs.split(";"):
-                    if tok.startswith(("Parent=", "protein_id=")):
+                    if tok.startswith("Parent="):
                         parent = tok.split("=", 1)[1]
-                    elif tok.startswith("Dbxref="):
-                        domains += DOMAIN_RE.findall(tok)
+                    elif tok.startswith("protein_id="):
+                        protein = tok.split("=", 1)[1]
+                domains = DOMAIN_RE.findall(attrs)
                 try:
                     phase = int(phase)
                 except ValueError:
                     phase = 0
                 feats[seqid]["cds_recs"].append(
-                    (start, end, strand, phase, parent, domains))
+                    (start, end, strand, phase,
+                     parent or protein, domains))
     for f in feats.values():
         for k in ("cds", "exon", "mrna", "rna"):
             f[k].sort()
+        _derive_transcript_features(f)
     return feats
+
+
+def _derive_transcript_features(f: dict) -> None:
+    """Fill f["trans"] and f["intron"] in place from cds_recs +
+    mRNA/exon/CDS intervals (see load_gff_features docstring)."""
+    by_parent: dict[tuple, list] = defaultdict(list)
+    for s, e, strand, _phase, parent, _doms in f["cds_recs"]:
+        by_parent[(parent or f"{s}-{e}-{strand}", strand)].append((s, e))
+    trans: list[tuple] = []
+    cds_gaps: list[tuple[int, int]] = []
+    for (parent, strand), exs in by_parent.items():
+        exs.sort()
+        # transcript order: 5' -> 3' is ascending on +, descending on -
+        te = exs if strand != "-" else exs[::-1]
+        start_pos = te[0][0] if strand != "-" else te[0][1]
+        stop_pos = te[-1][1] if strand != "-" else te[-1][0]
+        donors = [te[i][1] if strand != "-" else te[i][0]
+                  for i in range(len(te) - 1)]
+        acceptors = [te[i + 1][0] if strand != "-" else te[i + 1][1]
+                     for i in range(len(te) - 1)]
+        trans.append((start_pos, stop_pos, donors, acceptors))
+        for i in range(len(te) - 1):
+            lo, hi = sorted((te[i], te[i + 1]))
+            cds_gaps.append((lo[1], hi[0]))
+    f["trans"] = trans
+    # introns: mRNA minus (exon ∪ CDS) — subtract CDS too so a GFF with
+    # mRNA rows but no exon rows doesn't label the entire transcript
+    # (including coding sequence) as intron. Union the inter-CDS gaps
+    # found above, then subtract CDS to be exact.
+    coding_set = sorted(f["cds"] + f["exon"])
+    intron = subtract_intervals(f["mrna"], coding_set)
+    intron += [(gs, ge) for gs, ge in cds_gaps if ge > gs]
+    intron = subtract_intervals(merge_intervals(intron), f["cds"])
+    f["intron"] = intron
 
 
 def overlap_bases(intervals: list[tuple[int, int]],
@@ -406,6 +466,17 @@ def overlap_bases(intervals: list[tuple[int, int]],
             cov += e2 - max(s2, cur)
             cur = e2
     return cov
+
+
+def merge_intervals(intervals: list[tuple[int, int]]):
+    """Sorted union of possibly-overlapping half-open intervals."""
+    out = []
+    for s, e in sorted(intervals):
+        if out and s <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], e))
+        else:
+            out.append((s, e))
+    return out
 
 
 def subtract_intervals(outer: list[tuple[int, int]],
@@ -464,23 +535,20 @@ def feature_stats(feats: dict, seqid: str, frag_start: int,
         return None
     flen = frag_end - frag_start
     frac, n_bnd, boff = coding_stats_iv(f["cds"], frag_start, frag_end)
-    intron_iv = subtract_intervals(f["mrna"], f["exon"]) if f["mrna"] else []
-    intron = (overlap_bases(intron_iv, frag_start, frag_end) / flen
-              if intron_iv else 0.0)
+    intron = (overlap_bases(f["intron"], frag_start, frag_end) / flen
+              if f["intron"] else 0.0)
     rna = overlap_bases(f["rna"], frag_start, frag_end) / flen
 
-    # active frame: coding coverage per 6-frame index. Parent->exon
-    # groups span ALL CDS records (not just window-overlapping ones):
-    # a multi-exon CDS's true start/stop is the outermost edge of the
-    # whole transcript, and splice sites are between consecutive exons —
-    # restricting the group to visible segments would fabricate
-    # start/stop flags at internal CDS boundaries.
+    # active frame: coding coverage per 6-frame index over the CDS
+    # records that clip this window. Transcript transition coordinates
+    # (start/stop/donor/acceptor) were precomputed per seqid over ALL
+    # CDS records of each parent -- a multi-exon CDS's true start/stop
+    # is the outermost edge of the whole transcript, and splice sites
+    # are between consecutive exons.
     cov = [0] * 6
     flags = 0
     domains: set[str] = set()
-    by_parent: dict[str, list] = defaultdict(list)
-    for s, e, strand, phase, parent, doms in f["cds_recs"]:
-        by_parent[(parent or f"{s}-{e}-{strand}", strand)].append((s, e))
+    for s, e, strand, phase, _parent, doms in f["cds_recs"]:
         if e <= frag_start or s >= frag_end:
             continue
         clip = min(e, frag_end) - max(s, frag_start)
@@ -494,24 +562,19 @@ def feature_stats(feats: dict, seqid: str, frag_start: int,
         top = max(range(6), key=lambda i: cov[i])
         frame = top if cov[top] >= 0.5 * coding_bases else 6
 
-    # structural transitions: group CDS exons by (parent, strand);
-    # transcript order is reversed on the - strand
-    for (parent, strand), exs in by_parent.items():
-        exs.sort()
-        exons = exs if strand != "-" else exs[::-1]
-        start_pos = exons[0][0] if strand != "-" else exons[0][1]
-        stop_pos = exons[-1][1] if strand != "-" else exons[-1][0]
+    for start_pos, stop_pos, donors, acceptors in f["trans"]:
         if frag_start < start_pos < frag_end:
             flags |= 1
         if frag_start < stop_pos < frag_end:
             flags |= 2
-        for i in range(len(exons) - 1):
-            donor = exons[i][1] if strand != "-" else exons[i][0]
-            acceptor = exons[i + 1][0] if strand != "-" else exons[i + 1][1]
-            if frag_start < donor < frag_end:
+        for d in donors:
+            if frag_start < d < frag_end:
                 flags |= 4
-            if frag_start < acceptor < frag_end:
+                break
+        for a in acceptors:
+            if frag_start < a < frag_end:
                 flags |= 8
+                break
     return {"frac": frac, "n_bnd": n_bnd, "boff": boff,
             "intron": intron, "rna": rna, "frame": frame,
             "flags": flags, "domains": sorted(domains)}
