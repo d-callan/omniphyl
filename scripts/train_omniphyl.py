@@ -510,8 +510,18 @@ class FragmentDataset(Dataset):
 
     def __getitem__(self, i):
         fid = self.ids[i]
-        perm = np.random.permutation(4) if self.augment else None
         s = self._read_seq(fid)
+        perm = np.random.permutation(4) if self.augment else None
+        if perm is not None:
+            # Permute at the SEQUENCE level so every encoder — FCGR
+            # image, hash k-mers, AA histogram, frame summary — sees
+            # the same permuted molecule. Digit-remap inside
+            # fcgr_encode alone would leave the aux branches encoding
+            # the unpermuted sequence (mismatched input branches).
+            tbl = str.maketrans("ACGTacgt",
+                                "".join("ACGT"[d] for d in perm) * 2)
+            s = s.translate(tbl)
+            perm = None
         if self.jitter:
             s = jitter_seq(s, self.jitter,
                            zlib.crc32(fid.encode("ascii")))

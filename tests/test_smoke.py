@@ -713,6 +713,23 @@ def test_end_to_end():
     check("cropped frag masks cont labels",
           bool((yc_v == -1.0).all()), yc_v.tolist())
 
+    # vertex-permute augment must feed EVERY encoder the same
+    # permuted molecule — previously only the FCGR image was remapped
+    # while hash/aa/frame branches still saw the raw sequence.
+    np.random.seed(3)
+    ds_p = FragmentDataset(fna, {fid: {} for fid in meta}, 3, lut,
+                           pos=True, targets=[], augment=True,
+                           aux={"aa"})
+    xp, _, _ = ds_p[0]
+    np.random.seed(3)
+    perm = np.random.permutation(4)   # first rng draw inside __getitem__
+    tbl = str.maketrans("ACGTacgt",
+                        "".join("ACGT"[d] for d in perm) * 2)
+    s0 = ds_p._read_seq(ds_p.ids[0])
+    check("permute reaches aa branch",
+          np.allclose(xp["aa"].numpy(), aa_encode(s0.translate(tbl))),
+          xp["aa"].shape)
+
     out = tmp / "ckpt"
     r = subprocess.run(
         [sys.executable, str(SCRIPTS / "train_omniphyl.py"),
