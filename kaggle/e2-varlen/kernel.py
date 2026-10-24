@@ -72,11 +72,21 @@ subprocess.run(["bash", f"{WORK}/omniphyl/remote/run_pilot.sh"], check=True)
 # Benchmark the same checkpoint at each simulated read length.
 REPO = f"{WORK}/omniphyl"
 CKPT = f"{WORK}/omniphyl-work/run/best.pt"
-# prefer the screened corpus run_pilot trained on, else the raw mount
-frag = f"{WORK}/omniphyl-work/screened/fragments_screened.fna"
-lab = f"{WORK}/omniphyl-work/screened/labels_screened.tsv"
-if not os.path.exists(frag):
-    frag, lab = f"{CORPUS}/fragments.fna", f"{CORPUS}/labels.tsv"
+# Prefer the corpus run_pilot.sh actually trained on, in its own
+# fallback order: screened files inside the mounted corpus (runner
+# uses them in place and never writes WORKDIR/screened), screened
+# files the runner wrote to WORKDIR (mounted corpus read-only), then
+# the raw mounted corpus as last resort.
+for frag, lab in [
+        (f"{CORPUS}/fragments_screened.fna",
+         f"{CORPUS}/labels_screened.tsv"),
+        (f"{WORK}/omniphyl-work/screened/fragments_screened.fna",
+         f"{WORK}/omniphyl-work/screened/labels_screened.tsv"),
+        (f"{CORPUS}/fragments.fna", f"{CORPUS}/labels.tsv")]:
+    if os.path.exists(frag) and os.path.exists(lab):
+        break
+else:
+    raise SystemExit("no usable fragments/labels for multi-length eval")
 
 for name, extra in [
     ("len150", ["--eval-crop-len", "150"]),
@@ -84,14 +94,6 @@ for name, extra in [
     ("pe150", ["--eval-paired-len", "150"]),
     ("pe250", ["--eval-paired-len", "250"]),
 ]:
-    outdir = f"{WORK}/omniphyl-work/run/eval_{name}"
-    print(f"=== eval {name} -> {outdir} ===", flush=True)
-    subprocess.run(
-        [sys.executable, f"{REPO}/scripts/eval_pilot.py",
-         "--model", CKPT, "--fragments", frag, "--labels", lab,
-         "--outdir", outdir, "--num-workers", "4", *extra],
-        check=True)
-print("multi-length eval sweep complete")
     outdir = f"{WORK}/omniphyl-work/run/eval_{name}"
     print(f"=== eval {name} -> {outdir} ===", flush=True)
     subprocess.run(

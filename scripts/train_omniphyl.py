@@ -489,8 +489,14 @@ class FragmentDataset(Dataset):
                     offsets[fid] = pos
                 pos = f.tell()
                 line = f.readline()
-        idx_path.write_text(json.dumps(offsets))
-        print(f"indexed {len(offsets)} records -> {idx_path}")
+        try:
+            idx_path.write_text(json.dumps(offsets))
+            print(f"indexed {len(offsets)} records -> {idx_path}")
+        except OSError:
+            # fasta dir may be read-only (mounted corpus); the in-memory
+            # index is still valid, we just can't cache it to disk.
+            print(f"indexed {len(offsets)} records (cache write skipped: "
+                  f"{idx_path} not writable)")
         return offsets
 
     def _read_seq(self, fid: str) -> str:
