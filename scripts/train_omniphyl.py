@@ -1341,6 +1341,15 @@ def main():
                                   * clp[t][m].mean(1))
                         terms.append(ce.mean())
                 else:
+                    # flat-prior logit adjustment applies at train AND
+                    # eval: the model's raw outputs are prior-negated
+                    # (raw = posterior - tau*lp), so every consumer —
+                    # loss, val acc, best-ckpt selection, eval_pilot —
+                    # must score in the same adjusted space.
+                    if args.flat_prior_tau > 0:
+                        for t in cls_targets:
+                            logits[t] = logits[t] + args.flat_prior_tau \
+                                * flat_priors[t].to(device)
                     # skip heads whose batch labels are all masked —
                     # cross_entropy(ignore_index=0) returns NaN there (val
                     # batches whose rank labels are entirely out-of-vocab)
@@ -1348,12 +1357,8 @@ def main():
                     for i, t in enumerate(cls_targets):
                         if not (y[:, i] != 0).any():
                             continue
-                        lg = logits[t]
-                        if train and args.flat_prior_tau > 0:
-                            lg = lg + args.flat_prior_tau * \
-                                flat_priors[t].to(device)
                         terms.append(F.cross_entropy(
-                            lg, y[:, i], ignore_index=0,
+                            logits[t], y[:, i], ignore_index=0,
                             label_smoothing=args.label_smoothing))
                 fm = yc[:, 0] >= 0          # coding_frac label present
                 btgt = ((yc[:, 0] > 0) & (yc[:, 0] < 1)).float()

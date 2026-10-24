@@ -351,6 +351,11 @@ def main():
                     help="tree head: prior offset at inference. Default "
                          "= the checkpoint's training --prior-tau (MAP "
                          "decisions); 0 gives prior-balanced conditionals")
+    ap.add_argument("--flat-prior-tau", type=float, default=None,
+                    help="flat head: prior offset at inference. Default "
+                         "= the checkpoint's training --flat-prior-tau; "
+                         "the trained logits are only meaningful WITH "
+                         "this adjustment (they are prior-negated)")
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--jitter-rate", type=float, default=0.0,
                     help="SNP substitutions per position applied to eval "
@@ -427,6 +432,23 @@ def main():
                        if train_args.get("head") == "tree" else 0.0)
     if train_args.get("head") == "tree":
         print(f"tree head: infer_tau={model.infer_tau}")
+    # The flat head is trained on logits + tau*log_prior, so its raw
+    # outputs are prior-negated — inference must add the same offset
+    # to reproduce the posterior the model was fit to.
+    flat_tau = (args.flat_prior_tau
+                if args.flat_prior_tau is not None
+                else float(train_args.get("flat_prior_tau", 0.0) or 0.0))
+    flat_lp: dict[str, torch.Tensor] = {}
+    if flat_tau and ckpt.get("flat_log_prior"):
+        flat_lp = {t: torch.as_tensor(
+                       ckpt["flat_log_prior"][t], dtype=torch.float32)
+                   for t in cls_targets
+                   if t in ckpt["flat_log_prior"]}
+        print(f"flat head: flat_prior_tau={flat_tau} applied at "
+              f"inference")
+    elif flat_tau:
+        print(f"WARNING: ckpt trained with flat_prior_tau={flat_tau} "
+              "but has no flat_log_prior — raw logits are prior-negated")
     model.to(device).eval()
 
     # Build reverse vocab (id -> name) for reporting
@@ -570,6 +592,8 @@ def main():
                 for a in shuffle_aux & set(x):
                     x[a] = x[a][torch.randperm(bs, device=x[a].device)]
             z, logits = model(x)
+            for t, lp in flat_lp.items():
+                logits[t] = logits[t] + flat_tau * lp.to(logits[t].device)
             if tree_po:
                 cond = model.cond_logps(z, tau=0.0)
                 for ri in range(1, len(RANK_ORDER)):
