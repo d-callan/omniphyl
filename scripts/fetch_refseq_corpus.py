@@ -58,6 +58,7 @@ import gzip
 import io
 import json
 import random
+import re
 import sys
 import tarfile
 import time
@@ -335,6 +336,185 @@ def load_gff_cds(gff_path: Path) -> dict[str, list[tuple[int, int]]]:
     for intervals in cds.values():
         intervals.sort()
     return cds
+
+
+# --- rich GFF features (P3/E3-E5) ---------------------------------------
+# Single-pass parse retaining CDS strand/phase/Parent/Dbxref so windows
+# can be labelled with region composition, active reading frame,
+# structural-transition flags (start/stop/splice sites) and Pfam/InterPro
+# domains. All intervals are 0-based half-open.
+
+FEAT_TYPES = {"CDS": "cds", "exon": "exon",
+              "mRNA": "mrna", "transcript": "mrna",
+              "rRNA": "rna", "tRNA": "rna"}
+DOMAIN_RE = re.compile(r"(?:InterPro:IPR\d+|(?:PFAM|Pfam):PF\d+)")
+
+
+def load_gff_features(gff_path: Path) -> dict[str, dict]:
+    """seqid -> {cds, exon, mrna, rna interval lists; cds_recs}.
+
+    cds_recs entries are (start, end, strand, phase, parent, [domains]).
+    Superset of load_gff_cds; the CDS interval list is derivable via
+    feats[seqid]["cds"].
+    """
+    feats: dict[str, dict] = defaultdict(
+        lambda: {"cds": [], "exon": [], "mrna": [], "rna": [],
+                 "cds_recs": []})
+    opener = gzip.open if str(gff_path).endswith(".gz") else open
+    with opener(gff_path, "rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 9 or parts[2] not in FEAT_TYPES:
+                continue
+            seqid, ftype = parts[0], FEAT_TYPES[parts[2]]
+            start, end = int(parts[3]) - 1, int(parts[4])
+            feats[seqid][ftype].append((start, end))
+            if ftype == "cds":
+                strand, phase = parts[6], parts[7]
+                attrs = parts[8]
+                parent, domains = "", []
+                for tok in attrs.split(";"):
+                    if tok.startswith(("Parent=", "protein_id=")):
+                        parent = tok.split("=", 1)[1]
+                    elif tok.startswith("Dbxref="):
+                        domains += DOMAIN_RE.findall(tok)
+                try:
+                    phase = int(phase)
+                except ValueError:
+                    phase = 0
+                feats[seqid]["cds_recs"].append(
+                    (start, end, strand, phase, parent, domains))
+    for f in feats.values():
+        for k in ("cds", "exon", "mrna", "rna"):
+            f[k].sort()
+    return feats
+
+
+def overlap_bases(intervals: list[tuple[int, int]],
+                  lo: int, hi: int) -> int:
+    """Union-coverage of sorted intervals within [lo, hi)."""
+    cov, cur = 0, lo
+    for s, e in intervals:
+        if e <= lo:
+            continue
+        if s >= hi:
+            break
+        s2, e2 = max(s, lo), min(e, hi)
+        if e2 > cur:
+            cov += e2 - max(s2, cur)
+            cur = e2
+    return cov
+
+
+def subtract_intervals(outer: list[tuple[int, int]],
+                       inner: list[tuple[int, int]]):
+    """outer minus merged(inner); both sorted, 0-based half-open."""
+    out = []
+    i, cur_inner_end = 0, -1
+    merged = []
+    for s, e in inner:
+        if s > cur_inner_end:
+            merged.append([s, e])
+            cur_inner_end = e
+        else:
+            merged[-1][1] = cur_inner_end = max(cur_inner_end, e)
+    for s, e in outer:
+        cursor = s
+        while i < len(merged) and merged[i][1] <= cursor:
+            i += 1
+        j = i
+        while j < len(merged) and merged[j][0] < e:
+            ms, me = merged[j]
+            if ms > cursor:
+                out.append((cursor, min(ms, e)))
+            cursor = max(cursor, me)
+            if cursor >= e:
+                break
+            j += 1
+        if cursor < e:
+            out.append((cursor, e))
+    return out
+
+
+def cds_frame(rec_start: int, rec_end: int, strand: str, phase: int,
+              frag_start: int, frag_end: int) -> int:
+    """0-5 frame index of a CDS record relative to window [fs, fe),
+    aligned with aa_encode's 6 frames (0-2 forward offsets, 3-5 reverse).
+    """
+    if strand == "-":
+        codon0 = rec_end - ((3 - phase) % 3)
+        return 3 + (frag_end - codon0) % 3
+    codon0 = rec_start + ((3 - phase) % 3)
+    return (codon0 - frag_start) % 3
+
+
+def feature_stats(feats: dict, seqid: str, frag_start: int,
+                  frag_end: int):
+    """Rich label tuple for a window, or None if seqid is unannotated.
+
+    Returns dict: frac, n_bnd, boff (as coding_stats), intron, rna,
+    frame (0-5 dominant frame, 6 multi, 7 non-coding), flags (4-bit
+    start/stop/splice-donor/splice-acceptor mask), domains (IPR/PF ids
+    on CDS overlapping the window by >=90bp).
+    """
+    f = feats.get(seqid)
+    if f is None:
+        return None
+    flen = frag_end - frag_start
+    frac, n_bnd, boff = coding_stats_iv(f["cds"], frag_start, frag_end)
+    intron_iv = subtract_intervals(f["mrna"], f["exon"]) if f["mrna"] else []
+    intron = (overlap_bases(intron_iv, frag_start, frag_end) / flen
+              if intron_iv else 0.0)
+    rna = overlap_bases(f["rna"], frag_start, frag_end) / flen
+
+    # active frame: coding coverage per 6-frame index. Parent->exon
+    # groups span ALL CDS records (not just window-overlapping ones):
+    # a multi-exon CDS's true start/stop is the outermost edge of the
+    # whole transcript, and splice sites are between consecutive exons —
+    # restricting the group to visible segments would fabricate
+    # start/stop flags at internal CDS boundaries.
+    cov = [0] * 6
+    flags = 0
+    domains: set[str] = set()
+    by_parent: dict[str, list] = defaultdict(list)
+    for s, e, strand, phase, parent, doms in f["cds_recs"]:
+        by_parent[(parent or f"{s}-{e}-{strand}", strand)].append((s, e))
+        if e <= frag_start or s >= frag_end:
+            continue
+        clip = min(e, frag_end) - max(s, frag_start)
+        cov[cds_frame(s, e, strand, phase, frag_start, frag_end)] += clip
+        if clip >= 90:
+            domains.update(doms)
+    coding_bases = sum(cov)
+    if frac < 0.1:
+        frame = 7
+    else:
+        top = max(range(6), key=lambda i: cov[i])
+        frame = top if cov[top] >= 0.5 * coding_bases else 6
+
+    # structural transitions: group CDS exons by (parent, strand);
+    # transcript order is reversed on the - strand
+    for (parent, strand), exs in by_parent.items():
+        exs.sort()
+        exons = exs if strand != "-" else exs[::-1]
+        start_pos = exons[0][0] if strand != "-" else exons[0][1]
+        stop_pos = exons[-1][1] if strand != "-" else exons[-1][0]
+        if frag_start < start_pos < frag_end:
+            flags |= 1
+        if frag_start < stop_pos < frag_end:
+            flags |= 2
+        for i in range(len(exons) - 1):
+            donor = exons[i][1] if strand != "-" else exons[i][0]
+            acceptor = exons[i + 1][0] if strand != "-" else exons[i + 1][1]
+            if frag_start < donor < frag_end:
+                flags |= 4
+            if frag_start < acceptor < frag_end:
+                flags |= 8
+    return {"frac": frac, "n_bnd": n_bnd, "boff": boff,
+            "intron": intron, "rna": rna, "frame": frame,
+            "flags": flags, "domains": sorted(domains)}
 
 
 def coding_stats(seqid: str, frag_start: int, frag_end: int,
@@ -631,7 +811,7 @@ def slice_assembly(row: dict, gdir: Path, args, cache: Path):
         alias_groups = load_chrom_alias(acc, cache) if veu else {}
         label_source = ("veupathdb" if veu else
                         "refseq_gff" if gff else "none")
-        cds = load_gff_cds(gff) if gff else {}
+        feats = load_gff_features(gff) if gff else {}
         rng = random.Random(f"{args.seed}:{acc}")
         acc_budget = row.get("_nt_budget", args.nt_budget)
         # --nt-budget is per ACCESSION; each seqid draws a
@@ -651,19 +831,26 @@ def slice_assembly(row: dict, gdir: Path, args, cache: Path):
                 else:
                     stats_of = lambda s, e: coding_stats_iv(iv, s, e)
             else:
-                stats_of = lambda s, e: coding_stats(seqid, s, e, cds)
+                stats_of = lambda s, e: feature_stats(feats, seqid, s, e)
             cands = [(s, e, frag, stats_of(s, e))
                      for s, e, frag in slice_fragments(
                          seq, args.frag_len_min, args.frag_len_max,
                          seq_budget, args.max_amb_frac, rng)]
             # Boundary stratification: mixed windows (0 < frac < 1) are
             # rare under uniform sampling but carry the candidacy signal;
-            # subsample each bucket to hit --boundary-frac.
+            # subsample each bucket to hit --boundary-frac. stats may be a
+            # feature_stats dict (refseq tier) or a (frac, n_bnd, boff)
+            # tuple (veupath tier).
             if args.boundary_frac > 0:
+                def _frac(st):
+                    return None if st is None else \
+                        (st["frac"] if isinstance(st, dict) else st[0])
                 mixed = [c for c in cands
-                         if c[3] is not None and 0 < c[3][0] < 1]
+                         if _frac(c[3]) is not None and
+                         0 < _frac(c[3]) < 1]
                 pure = [c for c in cands
-                        if c[3] is None or not 0 < c[3][0] < 1]
+                        if _frac(c[3]) is None or
+                        not 0 < _frac(c[3]) < 1]
                 n_b = min(len(mixed),
                           round(args.boundary_frac * len(cands)))
                 n_nb = min(len(pure), len(cands) - n_b)
@@ -824,7 +1011,10 @@ def main():
         w.writerow(["frag_id", "accession", "seqid", "start", "end",
                     "length", "taxid", "group", "rank_unresolved",
                     "seq_source", "coding", "label_source", "coding_frac",
-                    "boundary", "n_boundaries", "boundary_offset"] + RANKS)
+                    "boundary", "n_boundaries", "boundary_offset"] +
+                   RANKS +
+                   ["intron_frac", "rna_frac", "active_frame",
+                    "struct_flags", "domain_ids"])
         for i in sorted(results):
             row, label_source, frags, n_veu_unmatched = results[i]
             tax = tax_map.get(row.get("species_taxid", ""), {})
@@ -834,22 +1024,39 @@ def main():
                 for i2 in range(0, len(frag), 70):
                     ff.write(frag[i2:i2 + 70] + "\n")
                 if stats is None:
-                    frac_s, bnd_s, nb_s, boff_s = "", "", "", ""
-                else:
+                    frac_s = bnd_s = nb_s = boff_s = ""
+                    intr_s = rna_s = frame_s = flag_s = dom_s = "NA"
+                    frac = None
+                elif isinstance(stats, dict):  # refseq_gff rich tier
+                    frac = stats["frac"]
+                    frac_s = f"{frac:.4f}"
+                    bnd_s = "1" if 0 < frac < 1 else "0"
+                    nb_s = str(stats["n_bnd"])
+                    boff_s = (f"{stats['boff']:.4f}"
+                              if stats["boff"] is not None else "")
+                    intr_s = f"{stats['intron']:.4f}"
+                    rna_s = f"{stats['rna']:.4f}"
+                    frame_s = str(stats["frame"])
+                    flag_s = str(stats["flags"])
+                    # "" = annotated, no domains; "NA" = unannotated
+                    dom_s = ",".join(stats["domains"])
+                else:                        # veupath tuple tier
                     frac, n_bnd, boff = stats
                     frac_s = f"{frac:.4f}"
                     bnd_s = "1" if 0 < frac < 1 else "0"
                     nb_s = str(n_bnd)
                     boff_s = f"{boff:.4f}" if boff is not None else ""
+                    intr_s = rna_s = frame_s = flag_s = dom_s = "NA"
                 cod = ("NA" if stats is None else
-                       "coding" if stats[0] >= 0.5 else "non-coding")
+                       "coding" if frac >= 0.5 else "non-coding")
                 w.writerow([fid, row["assembly_accession"], seqid, s, e,
                             len(frag), row.get("species_taxid", ""),
                             row["group"], row.get("_rank_unresolved", "0"),
                             row.get("_seq_source", "refseq"),
                             cod, label_source,
                             frac_s, bnd_s, nb_s, boff_s] +
-                           [tax.get(r, "") or "" for r in RANKS])
+                           [tax.get(r, "") or "" for r in RANKS] +
+                           [intr_s, rna_s, frame_s, flag_s, dom_s])
                 n_frags += 1
             if n_veu_unmatched:
                 print(f"  {row['assembly_accession']}: "

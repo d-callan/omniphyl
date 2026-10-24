@@ -87,6 +87,9 @@ MIN_TRAIN_LEN="${MIN_TRAIN_LEN:-500}"  # E2: shortest var-len sub-window
 VAR_LEN_PROB="${VAR_LEN_PROB:-0}"      # E2: stochastic crop probability
 EVAL_CROP_LEN="${EVAL_CROP_LEN:-0}"    # E2 eval: single-end read length
 EVAL_PAIRED_LEN="${EVAL_PAIRED_LEN:-0}" # E2 eval: paired-end mate length
+REGION_HEAD="${REGION_HEAD:-0}"       # E3: 4-way region-composition head
+STRUCT_HEAD="${STRUCT_HEAD:-0}"       # E4: active_frame + struct_flags heads
+DOMAIN_HEAD_K="${DOMAIN_HEAD_K:-0}"   # E5: top-K IPR/PF multi-label head
 
 mkdir -p "$WORKDIR" "$OUTDIR"
 cd "$WORKDIR"
@@ -176,6 +179,10 @@ fi
 RUN="$WORKDIR/run"
 POS_FLAG=""
 [ "$POS_CHANNELS" = 1 ] && POS_FLAG="--pos-channels"
+ANNOT_FLAGS=""
+[ "$REGION_HEAD" = 1 ] && ANNOT_FLAGS="$ANNOT_FLAGS --region-head"
+[ "$STRUCT_HEAD" = 1 ] && ANNOT_FLAGS="$ANNOT_FLAGS --struct-head"
+[ "$DOMAIN_HEAD_K" != 0 ] && ANNOT_FLAGS="$ANNOT_FLAGS --domain-head-k $DOMAIN_HEAD_K"
 python3 scripts/train_omniphyl.py \
     --fragments "$FRAG_FILE" --labels "$LAB_FILE" \
     --out "$RUN" --k "$K" --width "$WIDTH" --epochs "$EPOCHS" \
@@ -189,7 +196,7 @@ python3 scripts/train_omniphyl.py \
     --aux "$AUX" --aa-mode "$AA_MODE" --aa-drop "$AA_DROP" \
     --min-train-len "$MIN_TRAIN_LEN" --var-len-prob "$VAR_LEN_PROB" \
     --seq-len "$FRAG_LEN" \
-    $POS_FLAG
+    $POS_FLAG $ANNOT_FLAGS
 
 # --- eval + bundle ----------------------------------------------------------
 python3 scripts/eval_pilot.py --model "$RUN/best.pt" \

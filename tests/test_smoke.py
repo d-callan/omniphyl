@@ -24,16 +24,20 @@ sys.path.insert(0, str(SCRIPTS))
 
 from fetch_refseq_corpus import (  # noqa: E402
     coding_stats, coding_stats_iv, slice_fragments, hub_url,
-    veupath_intervals, _collect_bed_items)
+    veupath_intervals, _collect_bed_items,
+    load_gff_features, feature_stats, cds_frame, subtract_intervals)
 from train_omniphyl import (  # noqa: E402
-    encode_cont_labels, CONT_TARGETS, RANKS, FragmentDataset,
-    build_cell_lut, load_labels, build_tree, build_flat_priors, OmniPhyl,
+    encode_cont_labels, encode_annot_labels, CONT_TARGETS, RANKS,
+    FragmentDataset, build_cell_lut, load_labels, build_tree,
+    build_flat_priors, OmniPhyl,
     fcgr_encode_ms, rc_index_map, MS_KS,
-    hash_encode, aa_encode, _AA_LUT, AA_LETTERS, AA_ALPHA,
+    hash_encode, aa_encode, aa_frame_encode, AA_FRAME_DIM,
+    _AA_LUT, AA_LETTERS, AA_ALPHA,
     HASH_K, HASH_BUCKETS, HASH_PAD, HASH_LEN,
     varlen_crop, eval_crop_seq, PE_LEN)
 from eval_pilot import (  # noqa: E402
     ancestor_chains, build_parent_of, path_scores, selective_metrics,
+    scan_transition, auroc, auprc,
     FIXED_TAUS)
 
 PASS, FAIL = [], []
@@ -441,18 +445,175 @@ def make_corpus(tmp: Path):
                 "domain": "Eukaryota", "phylum": "Apicomplexa",
                 "class": "Aconoidasida", "order": "Eucoccidiorida",
                 "family": family, "genus": genus,
-                "species": f"{genus} {epithet}"})
+                "species": f"{genus} {epithet}",
+                # P3 annot columns: introns on boundary windows, rna
+                # nowhere, frame mirrors the coding mode, start flag on
+                # boundary rows; IPR000001 on every row keeps the domain
+                # vocab above the >=20-frag floor, PF00002 on a minority
+                # stays below it (tests the threshold).
+                "intron_frac": "0.2500" if mode == 1 else "0.0000",
+                "rna_frac": "0.0000",
+                "active_frame": {"0": "0", "1": "6",
+                                 "2": "7"}[str(mode)],
+                "struct_flags": "1" if mode == 1 else "0",
+                "domain_ids": "IPR000001" +
+                              (",PF00002" if mode == 0 else "")})
     fna_path = tmp / "fragments.fna"
     fna_path.write_text("".join(fna))
     lab_path = tmp / "labels.tsv"
     cols = ["frag_id", "accession", "seqid", "start", "end", "length",
             "taxid", "group", "coding", "label_source", "coding_frac",
-            "boundary", "n_boundaries", "boundary_offset"] + RANKS
+            "boundary", "n_boundaries", "boundary_offset"] + RANKS + \
+           ["intron_frac", "rna_frac", "active_frame",
+            "struct_flags", "domain_ids"]
     with open(lab_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, delimiter="\t")
         w.writeheader()
         w.writerows(rows)
     return fna_path, lab_path
+
+
+def test_p3_annot():
+    """P3: rich GFF features -> per-frag labels, annot label encoding,
+    144-d frame summary, annotation heads forward, frame scanner."""
+    print("[P3 annot heads]")
+    import numpy as np
+    import torch
+
+    # --- fetcher: load_gff_features + feature_stats -------------------
+    tmp = Path(tempfile.mkdtemp(prefix="omniphyl_gff_"))
+    gff = tmp / "t.gff"
+    gff.write_text(
+        "##gff-version 3\n"
+        "chr1\tref\tmRNA\t1\t900\t.\t+\t.\tID=tx1;Parent=g1\n"
+        "chr1\tref\texon\t1\t400\t.\t+\t.\tID=e1;Parent=tx1\n"
+        "chr1\tref\texon\t700\t900\t.\t+\t.\tID=e2;Parent=tx1\n"
+        "chr1\tref\tCDS\t100\t400\t.\t+\t0\tID=cds1a;Parent=tx1\n"
+        "chr1\tref\tCDS\t700\t850\t.\t+\t2\tID=cds1b;Parent=tx1;"
+        "Dbxref=InterPro:IPR000001,PFAM:PF00001\n"
+        "chr1\tref\trRNA\t1000\t1100\t.\t+\t.\tID=rrna1\n")
+    feats = load_gff_features(gff)
+    check("gff features parsed",
+          feats["chr1"]["cds"] == [(99, 400), (699, 850)] and
+          feats["chr1"]["exon"] == [(0, 400), (699, 900)] and
+          len(feats["chr1"]["cds_recs"]) == 2,
+          feats["chr1"])
+
+    st = feature_stats(feats, "chr1", 150, 650)
+    check("feature_stats coding frac", abs(st["frac"] - 0.5) < 1e-6,
+          st["frac"])
+    check("feature_stats intron frac",
+          abs(st["intron"] - 0.5) < 1e-6, st["intron"])
+    check("feature_stats rna zero", st["rna"] == 0.0)
+    # CDS1a (+, phase 0, start 99): codon0 = 99 -> (99-150)%3 = 0
+    check("feature_stats active frame", st["frame"] == 0, st["frame"])
+    # splice donor at exon end 400 inside (150,650); start@99 and
+    # acceptor@699 are outside
+    check("feature_stats splice-donor bit", st["flags"] == 4,
+          bin(st["flags"]))
+    check("feature_stats no domains in window", st["domains"] == [],
+          st["domains"])
+
+    st2 = feature_stats(feats, "chr1", 600, 900)
+    # CDS1b clip = 900-699 = 201 >= 90 -> domains present; phase 2 ->
+    # codon0 = 699 + (3-2)%3 = 700 -> (700-600)%3 = 1
+    check("feature_stats domains >=90bp clip",
+          st2["domains"] == ["InterPro:IPR000001", "PFAM:PF00001"],
+          st2["domains"])
+    check("feature_stats phase-aware frame", st2["frame"] == 1,
+          st2["frame"])
+    # start@99 outside; stop@850 inside -> bit1; donor@400 outside;
+    # acceptor@699 inside -> bit3  => 0b1010
+    check("feature_stats stop+acceptor bits", st2["flags"] == 0b1010,
+          bin(st2["flags"]))
+    check("unannotated seqid -> None",
+          feature_stats(feats, "chrX", 0, 500) is None)
+
+    # interval subtraction: mrna (0,900) - exons -> intron (400,699)
+    check("subtract_intervals intron",
+          subtract_intervals([(0, 900)], [(0, 400), (699, 900)])
+          == [(400, 699)])
+
+    # --- annot label encoding -----------------------------------------
+    rows = {
+        "f1": {"coding_frac": "0.5", "intron_frac": "0.25",
+               "rna_frac": "0.0", "active_frame": "1",
+               "struct_flags": "5", "domain_ids": "IPR000001"},
+        "f2": {"coding_frac": "1.0", "intron_frac": "0",
+               "rna_frac": "0", "active_frame": "0",
+               "struct_flags": "0", "domain_ids": ""},
+        "f3": {"coding_frac": "", "intron_frac": "NA",
+               "rna_frac": "NA", "active_frame": "NA",
+               "struct_flags": "NA", "domain_ids": "NA"},
+    }
+    enc = encode_annot_labels(rows, {"IPR000001": 0, "PF9": 1})
+    check("annot tuple width", len(enc["f1"]) == 9 + 2 + 1,
+          len(enc["f1"]))
+    check("region fracs + intergenic residual",
+          enc["f1"][:4] == (0.5, 0.25, 0.0, 0.25), enc["f1"][:4])
+    check("frame + flag bits decoded",
+          enc["f1"][4] == 1.0 and enc["f1"][5:9] == (1.0, 0, 1.0, 0),
+          enc["f1"][4:9])
+    check("domain multi-hot + mask",
+          enc["f1"][9:] == (1.0, 0.0, 1.0), enc["f1"][9:])
+    check("empty domain_ids = annotated all-negative",
+          enc["f2"][9:] == (0.0, 0.0, 1.0), enc["f2"][9:])
+    check("NA labels masked",
+          enc["f3"][:9] == (-1.0,) * 9 and enc["f3"][-1] == -1.0,
+          enc["f3"])
+
+    # --- aa_frame_encode -----------------------------------------------
+    v = aa_frame_encode("ATG" * 167)
+    check("aa_frame dim", v.shape == (AA_FRAME_DIM,), v.shape)
+    check("aa_frame bounded",
+          float(v.min()) >= 0 and float(v.max()) <= 1.0,
+          (float(v.min()), float(v.max())))
+    # pure-ATG forward frame 0 is ORF-clean (no stops); frame 1+ hit
+    # stops. TGA-free seq -> stop_density 0 on F0.
+    check("orf-clean forward frame", v[21] == 0.0 and v[22] == 1.0,
+          (v[21], v[22]))
+
+    # --- model heads ---------------------------------------------------
+    n_classes = {r: 3 for r in RANKS}
+    m = OmniPhyl(n_classes, width=8, cin=1, backbone="resnet", side=8,
+                 targets=RANKS, region_head=True, struct_head=True,
+                 domain_k=4)
+    m.eval()
+    with torch.no_grad():
+        _, lg = m({"x": torch.randn(2, 1, 8, 8),
+                   "aa_frame": torch.rand(2, AA_FRAME_DIM)})
+    check("annot head shapes",
+          lg["region_fracs"].shape == (2, 4) and
+          lg["active_frame"].shape == (2, 8) and
+          lg["struct_flags"].shape == (2, 4) and
+          lg["domains"].shape == (2, 4),
+          {k: tuple(v.shape) for k, v in lg.items()
+           if k in ("region_fracs", "active_frame", "struct_flags",
+                    "domains")})
+    # heads absent by default for back-compat
+    m0 = OmniPhyl(n_classes, width=8, cin=1, backbone="resnet", side=8,
+                  targets=RANKS)
+    _, lg0 = m0(torch.randn(2, 1, 8, 8))
+    check("annot heads off by default",
+          "region_fracs" not in lg0 and "active_frame" not in lg0)
+
+    # --- frame scanner --------------------------------------------------
+    seq = "GGT" * 33 + "ATG" + "GGT" * 32 + "TAG" + "GGT" * 32
+    edge = scan_transition(seq, 0, "start", 90)
+    check("scan start edge", edge == 99, edge)
+    edge = scan_transition(seq, 0, "stop", 200)
+    # TAG starts at 99+3+96=198 -> edge at 198+3=201
+    check("scan stop edge", edge == 201, edge)
+    # minus strand: CAT at fwd 90..93 -> ATG at rc offset L-93; edge=93
+    seq_rc = "GGT" * 30 + "CAT" + "AAA" * 30
+    edge = scan_transition(seq_rc, 3, "start", 90)
+    check("scan minus-strand start edge", edge == 93, edge)
+    check("scan misses canonical triplet -> None",
+          scan_transition("AAA" * 100, 0, "start", 50) is None)
+    check("auroc/auprc sanity",
+          auroc([0, 0, 1, 1], [0.1, 0.4, 0.35, 0.9]) == 0.75 and
+          auroc([0, 0, 0], [0.1, 0.2, 0.3]) is None and
+          auprc([0, 1, 0, 1], [0.1, 0.9, 0.2, 0.8]) is not None)
 
 
 def test_end_to_end():
@@ -535,6 +696,55 @@ def test_end_to_end():
               "reconciled" in res and
               "selective_val" in res["reconciled"],
               list(res.get("reconciled", {})))
+
+    # annot arm: region+struct+domain heads -> ckpt -> eval annot_heads
+    out_a = tmp / "ckpt_annot"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPTS / "train_omniphyl.py"),
+         "--fragments", str(fna), "--labels", str(lab),
+         "--out", str(out_a), "--k", "3", "--width", "16",
+         "--epochs", "2", "--batch-size", "16", "--val-frac", "0.5",
+         "--region-head", "--struct-head", "--domain-head-k", "8",
+         "--num-workers", "0", "--pos-channels", "--cpu"],
+        capture_output=True, text=True, timeout=600)
+    check("annot train exits 0", r.returncode == 0,
+          r.stderr.strip().splitlines()[-1] if r.returncode else "")
+    ckpts_a = list(out_a.glob("*.pt"))
+    if ckpts_a and r.returncode == 0:
+        import torch
+        cka = torch.load(ckpts_a[0], map_location="cpu",
+                         weights_only=False)
+        check("annot ckpt has the three head groups",
+              "heads.region_fracs.weight" in cka["model"] and
+              "head_frame.weight" in cka["model"] and
+              "heads.domains.weight" in cka["model"],
+              sorted(k for k in cka["model"] if "region" in k
+                     or "frame" in k or "domains" in k))
+        check("domain vocab respects >=20 floor",
+              cka.get("domain_vocab") == {"IPR000001": 0},
+              cka.get("domain_vocab"))
+        ev_a = tmp / "eval_annot"
+        r = subprocess.run(
+            [sys.executable, str(SCRIPTS / "eval_pilot.py"),
+             "--model", str(ckpts_a[0]), "--labels", str(lab),
+             "--fragments", str(fna), "--outdir", str(ev_a),
+             "--num-workers", "0", "--cpu"],
+            capture_output=True, text=True, timeout=600)
+        check("annot eval exits 0", r.returncode == 0,
+              r.stderr.strip().splitlines()[-1] if r.returncode else "")
+        res_a = list(ev_a.glob("*.json"))
+        if res_a:
+            res = json.loads(res_a[0].read_text())
+            ah = res.get("annot_heads", {})
+            check("annot_heads sections present",
+                  "region_fracs" in ah and "active_frame" in ah
+                  and "struct_flags" in ah and "domains" in ah,
+                  list(ah))
+            check("annot frame-scan gate ran",
+                  "frame_scan" in res.get("split_metrics", {})
+                  .get("val", {}).get("annot_heads", {}),
+                  list(res.get("split_metrics", {}).get("val", {})
+                       .get("annot_heads", {})))
 
     # gated aa arm: exercises aa_extra encoding -> gated ckpt ->
     # eval_pilot reconstruction (aa_mode/aa_extra round-trip)
@@ -634,7 +844,7 @@ def test_contaminant_screen():
 def main():
     for t in (test_label_math, test_veupath_helpers,
               test_slicing_and_encoding, test_tree_head, test_msfcgr,
-              test_aux_branches, test_p0_eval_tools,
+              test_aux_branches, test_p0_eval_tools, test_p3_annot,
               test_contaminant_screen, test_end_to_end):
         t()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")

@@ -178,6 +178,41 @@ Per-fragment errors at family/genus are near-independent across frags of the sam
 
 ---
 
+## 3b. A5 corpus: full-coverage species-depth build (2026-10-18)
+
+**Design decision.** The corpus is RefSeq+GenBank across all 5 groups, species-level depth n≤2 — **including singleton species** (only 1 assembly available). Merged species-depth counts (computed 2026-10-18 from cached NCBI assembly summaries, same eligibility filters as `select_assemblies`):
+
+| group | species n≥2 | species n=1 | genomes @ ≤2/sp |
+|---|---|---|---|
+| archaea | 140 | 668 | 948 |
+| bacteria | 6,438 | 38,208 | 51,084 |
+| fungi | 1,997 | 4,706 | 8,700 |
+| protozoa | 326 | 705 | 1,357 |
+| viral | 2,254 | 31,667 | 36,175 |
+| **total** | **11,755** | **75,954** | **98,264** |
+
+Singleton species get val coverage via **within-genome fragment holdout** (`--frag-val`, contiguous span on the largest seqid — not random windows, which leak through near-identical neighbours). Genome-level val still applies to multi-genome species; `build_split` returns `val_frags` alongside `val_accs`/`holdout_genera` and eval reports a `val_frag` bucket.
+
+**The memorization instrument (why this is safe).** Within-genome frag val alone can't distinguish "learned the species signature" from "learned this genome's exact content" — both predict held-out windows. The instrumented answer: `--jitter-rate` applies Poisson SNPs to eval fragments (deterministic per frag_id). One SNP destroys ~k overlapping k-mers but leaves GC/codon/dinucleotide spectrum nearly unchanged, so the accuracy-vs-jitter curve traces instance-vs-spectrum reliance. `--zero-aux`/`--shuffle-aux` give direct branch attribution (empty EmbeddingBag → zeros; batch shuffle → permutation control).
+
+**Fetch plan.** ~98k genomes ≈ 110–160h of per-genome download+slice at the observed ~4–6 s/genome (mini corpus did 2,874 in ~5h). Split into ~10–12 Kaggle shards; each shard writes `fragments.fna`+`labels.tsv` into a per-shard dataset, merged before training.
+
+**Config (decided):** `msfcgr + flat + aux` (A3f) on the new corpus — A3f's deep-rank gains were verified against holdout genera (unseen-genus shallow acc .67/.52/.51 vs .90/.78/.76 seen — real generalization, not memorization).
+
+---
+
+## 3c. Eval-bug postmortem (2026-10-18 late): "deep-rank val" was memorization
+
+**The bug.** `eval_pilot --val-only` built its slim pass-1 meta from `SPLIT_COLS = {accession, rank_unresolved, genus}` — **missing `seq_source`**. `build_split` forces `seq_source=="genbank"` accessions train-only; with the column absent, `forced_train` came out empty. The GenBank accessions entered the val pool, changed the accs ordering, and produced a *different val set* than training used: **256 genomes instead of the true 224**, ~88% of which were train-side genomes — their labels were trivially in-vocab because the model trained on them.
+
+**The damage.** Every `--val-only` arm eval (a0/a1/a25/a2/a3/a3f/a4seq `_map_eval`) reported deep-rank "val" accuracy measured on mostly-train genomes: A3f fam .826 / gen .707 / sp .712 — nearly identical to the true train bucket (.816/.709/.710, n≈33–52k), which is exactly what memorization-as-val looks like. The kernel-side eval (non-val-only, full meta) was correct all along: **true val = dom .66 / phy .53 / cls .50 / ord .142, and fam/gen/sp val n=0** — the family×1 mini corpus has ~1 genome per family, so deep-rank val labels are structurally unseen.
+
+**Corrected interpretation.** A3f's real story on the mini corpus: shallow ranks generalize (dom .66/phy .53/cls .50), order barely does (.14), deep ranks were *never measured*. The ablation ordering at deep ranks is uninformative — the species-depth A5 corpus (n≥2 per species) is required for any real deep-rank metric. Jitter on true val is flat at the floor; the memorization dose-response is measured on the **train bucket** (`--jitter-rate` without `--val-only`).
+
+**Fixed in code:** `SPLIT_COLS` now includes `seq_source` (+`seqid`,`start` for frag-val span selection); `--val-only` now reproduces the true training split and additionally keeps `val_frags` (within-genome holdout windows).
+
+---
+
 ## 4. Week schedule
 
 | Day | Local (CPU) | Kaggle (GPU) |

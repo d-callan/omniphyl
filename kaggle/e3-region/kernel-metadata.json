@@ -1,0 +1,13 @@
+{
+  "id": "daniellecallan/omniphyl-e3-region",
+  "title": "omniphyl-e3-region",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["daniellecallan/omniphyl-annot-mini-corpus"],
+  "competition_sources": [],
+  "kernel_sources": []
+}

@@ -303,6 +303,49 @@ def aa_encode(seq: str, extra: bool = False) -> np.ndarray:
     return spec
 
 
+AA_FRAME_DIM = 144    # 6 frames x (21 AA/stop freqs + 3 summaries)
+
+
+def aa_frame_encode(seq: str) -> np.ndarray:
+    """sequence -> per-frame AA summary [6, 24] -> [144] float32 (E4).
+
+    Frame order matches aa_encode (F0,F1,F2,R0,R1,R2). Each frame row is
+    21 single-AA + stop frequencies, then stop_density, longest_orf_frac,
+    and codon third-position GC — the minimal per-frame signature a
+    linear head needs for active-frame classification.
+    """
+    codes = BASE2DIGIT[np.frombuffer(seq.encode("ascii", "replace"),
+                                     dtype=np.uint8)]
+    out = np.zeros((6, 24), dtype=np.float32)
+    fi = 0
+    for c in (codes, 3 - codes[::-1]):
+        for off in range(3):
+            n = (len(c) - off) // 3 * 3
+            if n > 0:
+                trip = c[off:off + n].reshape(-1, 3)
+                ok = (trip >= 0).all(axis=1)
+                cidx = np.clip(trip[:, 0] * 16 + trip[:, 1] * 4
+                               + trip[:, 2], 0, 63)
+                aa = np.where(ok, _AA_LUT[cidx], -1)
+                aa = aa[aa >= 0]
+                n_cod = len(aa)
+                if n_cod:
+                    out[fi, :AA_ALPHA] = np.bincount(
+                        aa, minlength=AA_ALPHA)[:AA_ALPHA] / n_cod
+                    is_stop = aa == (AA_ALPHA - 1)
+                    n_st = int(is_stop.sum())
+                    sp = np.where(is_stop)[0]
+                    runs = np.diff(
+                        np.concatenate(([-1], sp, [n_cod]))) - 1
+                    out[fi, 21] = n_st / n_cod
+                    out[fi, 22] = (float(runs.max()) / n_cod
+                                   if len(runs) else 0.0)
+                    p3 = trip[ok, 2]             # 3rd codon position
+                    out[fi, 23] = float((p3 >= 1).mean())  # C|G share
+            fi += 1
+    return out.reshape(-1)
+
+
 def seq_encode(seq: str, seq_len: int,
                perm: np.ndarray | None = None) -> np.ndarray:
     """sequence -> one-hot tensor [4, seq_len] float32; N -> all-zero col.
@@ -397,7 +440,9 @@ class FragmentDataset(Dataset):
                  var_len_prob: float = 0.0,
                  min_train_len: int = 500,
                  eval_crop: int = 0,
-                 eval_paired: int = 0):
+                 eval_paired: int = 0,
+                 aa_frame: bool = False,
+                 annot: dict | None = None):
         self.fasta = Path(fasta)
         self.k = k
         self.lut = lut
@@ -415,6 +460,12 @@ class FragmentDataset(Dataset):
         self.min_train_len = min_train_len
         self.eval_crop = eval_crop         # E2: deterministic read crop
         self.eval_paired = eval_paired     # E2: paired-end mate length
+        self.aa_frame = aa_frame   # E4: emit per-frame aa summary vec
+        self.annot = annot         # frag_id -> annot label tuple or None
+        self._annot_default = (
+            (-1.0,) * (ANNOT_BASE + annot["_k"]
+                       + (1 if annot["_k"] else 0))
+            if annot is not None else ())
         self.labels = labels  # frag_id -> {target: int}
         self.cont = cont or {}  # frag_id -> (coding_frac, boundary_offset)
         self.ids = list(labels.keys())
@@ -481,6 +532,12 @@ class FragmentDataset(Dataset):
                 x["hash"] = torch.from_numpy(hash_encode(s, self.hash_canon))
             if "aa" in self.aux:
                 x["aa"] = torch.from_numpy(aa_encode(s, self.aa_extra))
+        if self.aa_frame:
+            if not isinstance(x, dict):
+                x = {"x": x}
+            x["aa_frame"] = torch.from_numpy(aa_frame_encode(s))
+        if self.annot is not None:
+            c = c + self.annot.get(fid, self._annot_default)
         return (x, torch.from_numpy(lab),
                 torch.tensor(c, dtype=torch.float32))
 
@@ -728,7 +785,9 @@ class OmniPhyl(nn.Module):
                  targets: list[str] | None = None, dropout: float = 0.0,
                  stem_stride: int = 2, head: str = "flat", tree=None,
                  aux: set | None = None,
-                 aa_mode: str = "plain", aa_drop: float = 0.0):
+                 aa_mode: str = "plain", aa_drop: float = 0.0,
+                 region_head: bool = False, struct_head: bool = False,
+                 domain_k: int = 0):
         super().__init__()
         if backbone == "vit":
             self.encoder = ViTEncoder(cin, side, dim=width * 4)
@@ -781,6 +840,19 @@ class OmniPhyl(nn.Module):
                               tree["parent_of"][t], tree["log_prior"][t])
                  if t in tree_po else nn.Linear(self.latent, n_classes[t]))
              for t in keys})
+        # P3 annotation heads (E3 region composition / E5 domain multi-
+        # label) are plain linears on z; they ride the heads dict since
+        # their input is the fused latent. The struct pair (E4) needs
+        # cat([z, aa_frame]) so it lives outside heads and is applied
+        # explicitly in forward.
+        if region_head:
+            self.heads["region_fracs"] = nn.Linear(self.latent, 4)
+        if domain_k:
+            self.heads["domains"] = nn.Linear(self.latent, domain_k)
+        self.struct_head = struct_head
+        if struct_head:
+            self.head_frame = nn.Linear(self.latent + AA_FRAME_DIM, 8)
+            self.head_flags = nn.Linear(self.latent + AA_FRAME_DIM, 4)
 
     def cond_logps(self, z, tau: float = 0.0):
         """Per-rank sibling-conditional log-probs (tree heads only)."""
@@ -829,6 +901,14 @@ class OmniPhyl(nn.Module):
                 logits[t] = h(z)
         if lcf is not None:
             logits["coding_frac"] = lcf
+        if self.struct_head:
+            xf = (x["aa_frame"] if isinstance(x, dict)
+                  and "aa_frame" in x
+                  else torch.zeros(z.size(0), AA_FRAME_DIM,
+                                   device=z.device))
+            zs = torch.cat([z, xf], 1)
+            logits["active_frame"] = self.head_frame(zs)
+            logits["struct_flags"] = self.head_flags(zs)
         return z, logits
 
 
@@ -858,6 +938,55 @@ def encode_cont_labels(rows: dict[str, dict]) -> dict[str, tuple]:
                 v = -1.0
             vals.append(v if 0 <= v <= 1 else -1.0)
         out[fid] = tuple(vals)
+    return out
+
+
+ANNOT_BASE = 9   # region_fracs(4) + active_frame(1) + struct_flags(4)
+
+
+def encode_annot_labels(rows: dict[str, dict],
+                        domain_vocab: dict | None = None
+                        ) -> dict[str, tuple]:
+    """frag_id -> (r_coding, r_intron, r_rna, r_intergenic,
+                   active_frame, f_start, f_stop, f_donor, f_acceptor,
+                   dom_0..K-1, dom_mask)  for the P3 annotation heads.
+
+    -1.0 marks unlabeled dims (masked out of each loss).  domain_ids
+    uses a trailing mask column because the column distinguishes three
+    states: 'NA'/absent = no annotation (mask off), '' = annotated, no
+    domains (all-negative label), 'IPR..,PF..' = multi-hot positive.
+    out["_k"] carries K so callers can build a matching default row.
+    """
+    domain_vocab = domain_vocab or {}
+    K = len(domain_vocab)
+    out: dict[str, tuple] = {}
+    for fid, m in rows.items():
+        vals, ok = [], True
+        for col in ("coding_frac", "intron_frac", "rna_frac"):
+            v = m.get(col, "")
+            if v in ("", "NA", None):
+                ok = False
+                break
+            vals.append(float(v))
+        region = ([vals[0], vals[1], vals[2],
+                   max(0.0, 1.0 - sum(vals))] if ok else [-1.0] * 4)
+        fv = m.get("active_frame", "")
+        frame = float(int(fv)) if fv not in ("", "NA", None) else -1.0
+        sv = m.get("struct_flags", "")
+        flags = ([float((int(sv) >> b) & 1) for b in range(4)]
+                 if sv not in ("", "NA", None) else [-1.0] * 4)
+        doms: list[float] = []
+        dm: list[float] = []
+        if K:
+            dv = m.get("domain_ids")
+            if dv is None or dv == "NA":
+                doms, dm = [0.0] * K, [-1.0]
+            else:
+                dm = [1.0]
+                pos = {t for t in dv.split(",") if t}
+                doms = [1.0 if i in pos else 0.0 for i in domain_vocab]
+        out[fid] = tuple(region + [frame] + flags + doms + dm)
+    out["_k"] = K
     return out
 
 
@@ -1003,6 +1132,17 @@ def main():
                     help="E2: per-fragment prob of applying a variable "
                          "length crop (70% contiguous sub-window, 30% "
                          "unmerged paired-end) during training")
+    ap.add_argument("--region-head", action="store_true",
+                    help="E3: add region_fracs 4-way soft head "
+                         "[coding, intron, rna, intergenic] with "
+                         "inverse-prior weight on non-coding windows")
+    ap.add_argument("--struct-head", action="store_true",
+                    help="E4: add active_frame (8-way) + struct_flags "
+                         "(4-bit) heads on cat([z, 144-d per-frame aa "
+                         "summary]); emits x['aa_frame']")
+    ap.add_argument("--domain-head-k", type=int, default=0,
+                    help="E5: add a K-way multi-label domains head over "
+                         "the top-K IPR/PF ids seen on >=20 train windows")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cpu", action="store_true")
     args = ap.parse_args()
@@ -1059,6 +1199,30 @@ def main():
     cont_train = encode_cont_labels(train_meta)
     cont_val = encode_cont_labels(val_meta)
 
+    # P3 annotation labels. domain_vocab comes from TRAIN rows only and
+    # requires >=20 windows per domain so the multi-label head is not
+    # fitted to singleton noise. The annot tuple is appended to yc when
+    # any of the three heads is enabled.
+    annot_any = (args.region_head or args.struct_head
+                 or args.domain_head_k > 0)
+    domain_vocab: dict[str, int] = {}
+    annot_train = annot_val = None
+    if annot_any:
+        if args.domain_head_k:
+            from collections import Counter
+            cnt: Counter = Counter()
+            for m in train_meta.values():
+                dv = m.get("domain_ids")
+                if dv and dv != "NA":
+                    cnt.update(t for t in dv.split(",") if t)
+            domain_vocab = {
+                d: i for i, (d, c) in enumerate(cnt.most_common())
+                if c >= 20 and i < args.domain_head_k}
+            print(f"domain head: {len(domain_vocab)} of "
+                  f"{args.domain_head_k} slots filled")
+        annot_train = encode_annot_labels(train_meta, domain_vocab)
+        annot_val = encode_annot_labels(val_meta, domain_vocab)
+
     use_seq = args.backbone == "seq"
     ms_maps = ({k: build_cell_lut(k) for k in MS_KS},
                {k: rc_index_map(k) for k in MS_KS}) \
@@ -1076,14 +1240,18 @@ def main():
                                aux=aux, hash_canon=hash_canon,
                                aa_extra=aa_extra,
                                var_len_prob=args.var_len_prob,
-                               min_train_len=args.min_train_len)
+                               min_train_len=args.min_train_len,
+                               aa_frame=args.struct_head,
+                               annot=annot_train)
     val_ds = FragmentDataset(args.fragments, encode_labels(val_meta),
                              args.k, lut, pos=args.pos_channels,
                              targets=cls_targets, cont=cont_val,
                              seq=use_seq, seq_len=args.seq_len,
                              ms_luts=ms_maps[0], ms_canons=ms_maps[1],
                              aux=aux, hash_canon=hash_canon,
-                             aa_extra=aa_extra)
+                             aa_extra=aa_extra,
+                             aa_frame=args.struct_head,
+                             annot=annot_val)
     train_ld = DataLoader(train_ds, args.batch_size, shuffle=True,
                           num_workers=args.num_workers, drop_last=True,
                           persistent_workers=args.num_workers > 0)
@@ -1098,7 +1266,10 @@ def main():
                      stem_stride=args.stem_stride,
                      head=args.head, tree=tree if args.head == "tree" else None,
                      aux=aux, aa_mode=args.aa_mode,
-                     aa_drop=args.aa_drop).to(device)
+                     aa_drop=args.aa_drop,
+                     region_head=args.region_head,
+                     struct_head=args.struct_head,
+                     domain_k=len(domain_vocab)).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.wd)
     steps = len(train_ld) * args.epochs
@@ -1165,6 +1336,45 @@ def main():
                 if om.any():
                     terms.append(F.mse_loss(torch.sigmoid(
                         logits["offset"][:, 0][om]), yc[om, 1]))
+                if yc.size(1) > 2:          # P3 annotation columns
+                    ya = yc[:, 2:]
+                    if "region_fracs" in logits:
+                        rm = ya[:, 0] >= 0
+                        if rm.any():
+                            # soft-CE on the composition simplex; pure
+                            # non-coding windows are inverse-prior
+                            # upweighted (91% coding imbalance)
+                            pr = F.log_softmax(
+                                logits["region_fracs"][rm], 1)
+                            w = torch.where(
+                                ya[rm, 0] < 0.1, 3.0, 1.0)
+                            terms.append(-(w[:, None] * ya[rm, :4]
+                                           * pr).sum(1).mean())
+                    if "active_frame" in logits:
+                        fm2 = ya[:, 4] >= 0
+                        if fm2.any():
+                            terms.append(F.cross_entropy(
+                                logits["active_frame"][fm2],
+                                ya[fm2, 4].long()))
+                    if "struct_flags" in logits:
+                        sm = ya[:, 5] >= 0
+                        if sm.any():
+                            terms.append(
+                                F.binary_cross_entropy_with_logits(
+                                    logits["struct_flags"][sm],
+                                    ya[sm, 5:9],
+                                    pos_weight=torch.tensor(
+                                        [5., 5., 8., 8.],
+                                        device=device)))
+                    if "domains" in logits:
+                        dm = ya[:, -1] >= 0
+                        if dm.any():
+                            K = logits["domains"].size(1)
+                            terms.append(
+                                F.binary_cross_entropy_with_logits(
+                                    logits["domains"][dm],
+                                    ya[dm, ANNOT_BASE:
+                                       ANNOT_BASE + K]))
                 if not terms:
                     continue
                 loss = torch.stack(terms).mean()
@@ -1225,6 +1435,8 @@ def main():
                               for r in cls_targets}}
             ckpt["flat_log_prior"] = {
                 r: flat_priors[r].tolist() for r in cls_targets}
+            if domain_vocab:
+                ckpt["domain_vocab"] = domain_vocab
             torch.save(ckpt, args.out / "best.pt")
     (args.out / "vocab.json").write_text(json.dumps(vocab, indent=1))
     print(f"done. best mean val acc {best:.3f} -> {args.out}/best.pt")

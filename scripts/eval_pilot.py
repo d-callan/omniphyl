@@ -71,7 +71,8 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).parent))
 from train_omniphyl import (OmniPhyl, FragmentDataset, build_cell_lut,
                              build_split, RANKS, CONT_TARGETS,
-                             encode_cont_labels, MS_KS, HASH_K, HASH_PAD,
+                             encode_cont_labels, encode_annot_labels,
+                             MS_KS, HASH_K, HASH_PAD,
                              rc_index_map)
 
 RANK_ORDER = RANKS  # domain -> ... -> species
@@ -106,6 +107,62 @@ def encode_labels_from_vocab(meta: dict[str, dict], vocab: dict,
             rec[t] = (v + 1 if v >= 0 else 0)
         out[fid] = rec
     return out
+
+
+def auroc(y: np.ndarray, s: np.ndarray):
+    """Tie-aware Mann-Whitney AUROC; None when the truth is single-class."""
+    y, s = np.asarray(y, float), np.asarray(s, float)
+    if y.min() == y.max() or len(y) == 0:
+        return None
+    order = np.argsort(s, kind="stable")
+    ranks = np.empty(len(s))
+    ranks[order] = np.arange(1, len(s) + 1)
+    _, inv, cnt = np.unique(s, return_inverse=True, return_counts=True)
+    ranks = (np.bincount(inv, weights=ranks) / cnt)[inv]
+    npos = y.sum()
+    nneg = len(y) - npos
+    return float((ranks[y == 1].sum() - npos * (npos + 1) / 2)
+                 / (npos * nneg))
+
+
+def auprc(y: np.ndarray, s: np.ndarray):
+    """Average-precision AUPRC; None when no positives exist."""
+    y, s = np.asarray(y, float), np.asarray(s, float)
+    if y.sum() == 0:
+        return None
+    o = np.argsort(-s, kind="stable")
+    tp = np.cumsum(y[o])
+    return float((tp / np.arange(1, len(y) + 1) * y[o]).sum() / y.sum())
+
+
+STOPS = {"TAA", "TAG", "TGA"}
+
+
+def scan_transition(seq: str, frame: int, kind: str,
+                    pred_pos: float):
+    """Canonical triplet edge coordinate nearest pred_pos in `frame`.
+
+    Stage-2 of the frame-scan pathway: given the predicted frame and a
+    predicted transition coordinate (window-relative bp), return the
+    genomic edge position of the closest ATG (start) or stop codon in
+    that frame, or None when no canonical triplet exists. Edge coords
+    match the fetcher's convention: CDS-interval start/end boundary,
+    transcript-oriented on the minus strand.
+    """
+    rev = frame >= 3
+    s2 = seq[::-1].translate(str.maketrans("ACGT", "TGCA")) if rev else seq
+    L = len(s2)
+    off = (frame - 3) if rev else frame
+    cands = {"ATG"} if kind == "start" else STOPS
+    best, bd = None, 1e18
+    for i in range(off, L - 2, 3):
+        if s2[i:i + 3] not in cands:
+            continue
+        edge = (L - i if kind == "start" else L - i - 3) if rev \
+            else (i if kind == "start" else i + 3)
+        if abs(edge - pred_pos) < bd:
+            bd, best = abs(edge - pred_pos), edge
+    return best
 
 
 def macro_f1(pred: list[int], true: list[int],
@@ -356,7 +413,10 @@ def main():
                      aux={a for a in train_args.get("aux", "").split(",")
                           if a},
                      aa_mode=train_args.get("aa_mode", "plain"),
-                     aa_drop=float(train_args.get("aa_drop", 0.0) or 0.0))
+                     aa_drop=float(train_args.get("aa_drop", 0.0) or 0.0),
+                     region_head=bool(train_args.get("region_head")),
+                     struct_head=bool(train_args.get("struct_head")),
+                     domain_k=len(ckpt.get("domain_vocab", {})))
     model.load_state_dict(ckpt["model"])
     # The tree head is trained so softmax(logits + tau*log nu) = P(y);
     # evaluating at that same tau restores the posterior the model was
@@ -408,6 +468,14 @@ def main():
         fid_acc = {fid: m.get("accession", "") for fid, m in meta.items()}
     encoded = encode_labels_from_vocab(meta, vocab, cls_targets)
     cont = encode_cont_labels(meta)
+    # P3 annot labels are needed only when the checkpoint carries the
+    # matching heads; domain_vocab pins the multi-hot layout.
+    domain_vocab = ckpt.get("domain_vocab", {})
+    annot_on = (bool(train_args.get("region_head"))
+                or bool(train_args.get("struct_head"))
+                or bool(domain_vocab))
+    annot = (encode_annot_labels(meta, domain_vocab)
+             if annot_on else None)
 
     lut = build_cell_lut(k)
     ms_maps = ({kk: build_cell_lut(kk) for kk in MS_KS},
@@ -426,7 +494,9 @@ def main():
                          jitter=args.jitter_rate,
                          aa_extra=train_args.get("aa_mode") == "gated",
                          eval_crop=args.eval_crop_len,
-                         eval_paired=args.eval_paired_len)
+                         eval_paired=args.eval_paired_len,
+                         aa_frame=bool(train_args.get("struct_head")),
+                         annot=annot)
     loader = torch.utils.data.DataLoader(
         ds, args.batch_size, shuffle=False,
         num_workers=args.num_workers)
@@ -437,6 +507,10 @@ def main():
     all_confs: dict[str, list[float]] = {t: [] for t in cls_targets}
     cont_out: dict[str, list[float]] = {t: [] for t in CONT_TARGETS}
     cont_true: list[tuple] = []
+    # P3 annotation-head outputs, collected only when the model has them
+    ann_out: dict[str, list] = {
+        k: [] for k in ("region_fracs", "active_frame",
+                        "struct_flags", "domains")}
     frag_ids = ds.ids
     # Frag positions (held-out genomes) whose full log-probs get stored for
     # calibration/consensus metrics; float16 rows keep RAM bounded.
@@ -546,6 +620,18 @@ def main():
                 if t in logits:
                     cont_out[t].extend(
                         torch.sigmoid(logits[t][:, 0]).cpu().tolist())
+            if "region_fracs" in logits:
+                ann_out["region_fracs"].extend(
+                    logits["region_fracs"].softmax(1).cpu().tolist())
+            if "active_frame" in logits:
+                ann_out["active_frame"].extend(
+                    logits["active_frame"].argmax(1).cpu().tolist())
+            if "struct_flags" in logits:
+                ann_out["struct_flags"].extend(
+                    logits["struct_flags"].sigmoid().cpu().tolist())
+            if "domains" in logits:
+                ann_out["domains"].extend(
+                    logits["domains"].sigmoid().cpu().tolist())
             cont_true.extend(yc.tolist())
             for j in range(bs):
                 if pos + j in consensus_pos:
@@ -618,6 +704,148 @@ def main():
                 "n": int(omk.sum())}
         return out
 
+    # P3 annot truth block: yc cols 2.. are [region(4) | frame(1) |
+    # flags(4) | domains(K) | dom_mask(1)] — only present when the
+    # checkpoint carries annotation heads.
+    ann_true = (np.asarray(cont_true)[:, 2:]
+                if cont_true and len(cont_true[0]) > 2 else None)
+    dom_id2name = {v: k for k, v in domain_vocab.items()}
+
+    def annot_metrics(idxs: list[int], scan: bool = False) -> dict:
+        """E3-E5 annotation-head metrics restricted to idxs.
+
+        The frame-scan gate (E4 stage-2) resolves each predicted
+        start/stop flag to the nearest canonical triplet in the
+        predicted frame and scores |pred - true edge| <= 3bp — the
+        operationally meaningful end-to-end rate, not just head acc.
+        """
+        if ann_true is None:
+            return {}
+        sel = np.asarray(idxs, dtype=np.int64)
+        ya = ann_true[sel]
+        out: dict = {}
+        if ann_out["region_fracs"]:
+            rm = ya[:, 0] >= 0
+            if rm.any():
+                p = np.asarray(ann_out["region_fracs"])[sel][rm]
+                t_ = ya[rm, :4]
+                coding_bin = (t_[:, 0] >= 0.5).astype(float)
+                nonc = t_[:, 0] < 0.5
+                pred_nc = p.argmax(1) != 0
+                tp = float((pred_nc & nonc).sum())
+                fp = float((pred_nc & ~nonc).sum())
+                fn = float((~pred_nc & nonc).sum())
+                f1 = 2 * tp / max(2 * tp + fp + fn, 1)
+                m = {"mae": round(float(np.abs(p - t_).mean()), 4),
+                     "coding_auroc": auroc(coding_bin, p[:, 0]),
+                     "noncoding_f1": round(f1, 4),
+                     "n": int(rm.sum())}
+                # eukaryote subset: introns make the composition task
+                # strictly harder than the bacterial majority
+                euk = np.array([meta[frag_ids[i]].get("group") in
+                                ("fungi", "protozoa")
+                                for i in sel[rm]])
+                if euk.any():
+                    m["euk_coding_auroc"] = auroc(
+                        coding_bin[euk], p[euk, 0])
+                    m["euk_n"] = int(euk.sum())
+                out["region_fracs"] = m
+        if ann_out["active_frame"]:
+            fm = ya[:, 4] >= 0
+            if fm.any():
+                p = np.asarray(ann_out["active_frame"])[sel][fm]
+                t_ = ya[fm, 4]
+                acc = float((p == t_).mean())
+                single = t_ < 6
+                m = {"accuracy": round(acc, 4), "n": int(fm.sum())}
+                if single.any():
+                    m["single_frame_acc"] = round(
+                        float((p[single] == t_[single]).mean()), 4)
+                    m["n_single_frame"] = int(single.sum())
+                out["active_frame"] = m
+        if ann_out["struct_flags"]:
+            sm = ya[:, 5] >= 0
+            if sm.any():
+                p = np.asarray(ann_out["struct_flags"])[sel][sm]
+                t_ = ya[sm, 5:9]
+                bits = {}
+                names = ("start", "stop", "splice_donor",
+                         "splice_acceptor")
+                for b in range(4):
+                    a = auroc(t_[:, b], p[:, b])
+                    bits[names[b]] = {"auroc": a,
+                                      "n_pos": int(t_[:, b].sum())}
+                vals = [v["auroc"] for v in bits.values()
+                        if v["auroc"] is not None]
+                out["struct_flags"] = {
+                    "per_bit": bits,
+                    "macro_auroc": round(float(np.mean(vals)), 4)
+                    if vals else None,
+                    "n": int(sm.sum())}
+        if ann_out["domains"]:
+            dm = ya[:, -1] >= 0
+            if dm.any():
+                p = np.asarray(ann_out["domains"])[sel][dm]
+                K = p.shape[1]
+                t_ = ya[dm, 9:9 + K]
+                per = [(auroc(t_[:, j], p[:, j]),
+                        auprc(t_[:, j], p[:, j]))
+                       for j in range(K)]
+                aus = [a for a, _ in per if a is not None]
+                aps = [b for _, b in per if b is not None]
+                top5 = np.argsort(-p, 1)[:, :min(5, K)]
+                pos_rows = t_.sum(1) > 0
+                r5 = (float(np.mean(
+                    [t_[i, top5[i]].any() for i in range(len(t_))
+                     if pos_rows[i]])) if pos_rows.any() else None)
+                out["domains"] = {
+                    "macro_auroc": round(float(np.mean(aus)), 4)
+                    if aus else None,
+                    "macro_auprc": round(float(np.mean(aps)), 4)
+                    if aps else None,
+                    "recall_at5": round(r5, 4) if r5 is not None else None,
+                    "K": K, "n": int(dm.sum()),
+                    "n_pos_rows": int(pos_rows.sum())}
+        # ---- E4 stage-2 frame-scan gate ------------------------------
+        # has_start/has_stop windows with exactly one CDS boundary:
+        # head predicts bit + frame + coordinate; scanner resolves the
+        # coordinate to a canonical triplet in that frame; hit within 3bp.
+        if scan and ann_out["struct_flags"] \
+                and ann_out["active_frame"]:
+            rows = {"start": [0, 0], "stop": [0, 0]}
+            n_single_bnd = 0
+            for pos_i, i in enumerate(sel):
+                fid = frag_ids[i]
+                if meta[fid].get("n_boundaries", "") != "1" \
+                        or off_true[i] < 0:
+                    continue
+                n_single_bnd += 1
+                flg = ann_out["struct_flags"][i]
+                fr = ann_out["active_frame"][i]
+                if fr >= 6:
+                    continue
+                seq = ds._read_seq(fid)
+                flen = len(seq)
+                for bit, kind in ((0, "start"), (1, "stop")):
+                    if ya[pos_i, 5 + bit] < 0.5 or flg[bit] <= 0.5:
+                        continue
+                    pred_off = (cont_out["offset"][i] * flen
+                                if cont_out["offset"] else flen / 2)
+                    edge = scan_transition(seq, int(fr), kind, pred_off)
+                    if edge is None:
+                        continue
+                    rows[kind][1] += 1
+                    if abs(edge - off_true[i] * flen) <= 3:
+                        rows[kind][0] += 1
+            if n_single_bnd:
+                out["frame_scan"] = {
+                    "n_single_boundary_windows": n_single_bnd,
+                    **{k: {"hit_rate_3bp": round(v[0] / v[1], 4)
+                           if v[1] else None,
+                           "n": v[1]}
+                       for k, v in rows.items()}}
+        return out
+
     results: dict = {}
     results["per_target"] = cls_metrics(all_idxs)
     for t, m in results["per_target"].items():
@@ -626,6 +854,10 @@ def main():
     results["annotation_heads"] = cont_metrics(all_idxs)
     for t, m in results["annotation_heads"].items():
         print(f"  {t:12s}  {m}")
+    if ann_true is not None:
+        results["annot_heads"] = annot_metrics(all_idxs)
+        for t, m in results["annot_heads"].items():
+            print(f"  {t:12s}  {m}")
 
     # -----------------------------------------------------------------------
     # 1c. Honest split: reproduce the training genome split (deterministic
@@ -658,7 +890,8 @@ def main():
         "train": {"per_target": cls_metrics(train_idxs),
                   "annotation_heads": cont_metrics(train_idxs)},
         "val": {"per_target": cls_metrics(val_idxs),
-                "annotation_heads": cont_metrics(val_idxs)},
+                "annotation_heads": cont_metrics(val_idxs),
+                "annot_heads": annot_metrics(val_idxs, scan=True)},
         "val_frag": {"per_target": cls_metrics(fragval_idxs),
                      "annotation_heads": cont_metrics(fragval_idxs)},
         "val_genus": {"per_target": cls_metrics(val_genus_idxs),
