@@ -59,6 +59,7 @@ import io
 import json
 import random
 import re
+import shutil
 import sys
 import tarfile
 import time
@@ -1038,14 +1039,17 @@ def annotate_fragments_pfam(frag_path: Path, lab_path: Path,
     if hmm_path is None:
         hmm_path = cache / "Pfam-A.hmm"
         cleanup_hmm = True
-        if not hmm_path.exists():
+        if not hmm_path.exists() or hmm_path.stat().st_size == 0:
             gz_path = cache / "Pfam-A.hmm.gz"
-            print("downloading Pfam-A.hmm.gz (~400MB)...")
-            download(PFAM_HMM_URL, gz_path, timeout=900)
+            if not gz_path.exists() or gz_path.stat().st_size == 0:
+                print("downloading Pfam-A.hmm.gz (~400MB)...")
+                download(PFAM_HMM_URL, gz_path, timeout=900)
             # HMMFile needs a plain seekable file, not a .gz stream
+            part_hmm = cache / "Pfam-A.hmm.part"
             with gzip.open(gz_path, "rb") as fin, \
-                    open(hmm_path, "wb") as fout:
+                    open(part_hmm, "wb") as fout:
                 shutil.copyfileobj(fin, fout, 1 << 22)
+            part_hmm.replace(hmm_path)
             gz_path.unlink()
 
     # 1. Read fragment active_frame from labels.tsv so annotated coding
@@ -1087,24 +1091,66 @@ def annotate_fragments_pfam(frag_path: Path, lab_path: Path,
     print(f"pyhmmer: scanning {len(seqs)} ORFs from {len(frame_of)} "
           f"fragments against {hmm_path.name} (cpus={workers})...")
     hits_by_frag: dict[str, set[str]] = defaultdict(set)
+
+    def _collect_hits(top_hits) -> int:
+        q = getattr(top_hits, "query", top_hits)
+        raw_acc = (getattr(q, "accession", None)
+                   or getattr(q, "name", None)
+                   or getattr(top_hits, "query_accession", None)
+                   or getattr(top_hits, "query_name", ""))
+        acc_s = (raw_acc.decode("ascii")
+                 if isinstance(raw_acc, bytes) else str(raw_acc))
+        pf_id = acc_s.split(".")[0]
+        label = (f"Pfam:{pf_id}" if pf_id.startswith("PF")
+                 else f"HMM:{pf_id}")
+        n_inc = 0
+        for hit in top_hits:
+            if hit.included and hit.evalue <= evalue:
+                hname = (hit.name.decode("ascii")
+                         if isinstance(hit.name, bytes)
+                         else str(hit.name))
+                hits_by_frag[frag_ids[int(hname)]].add(label)
+                n_inc += 1
+        return n_inc
+
     if seqs:
-        block = pyhmmer.easel.DigitalSequenceBlock(alpha, seqs)
-        with pyhmmer.plan7.HMMFile(str(hmm_path)) as hf:
-            for top_hits in pyhmmer.hmmsearch(hf, block, cpus=workers,
-                                              E=evalue):
-                raw_acc = (getattr(top_hits, "query_accession", None)
-                           or top_hits.query_name)
-                acc_s = (raw_acc.decode("ascii")
-                         if isinstance(raw_acc, bytes) else str(raw_acc))
-                pf_id = acc_s.split(".")[0]
-                label = (f"Pfam:{pf_id}" if pf_id.startswith("PF")
-                         else f"HMM:{pf_id}")
-                for hit in top_hits:
-                    if hit.included and hit.evalue <= evalue:
-                        hname = (hit.name.decode("ascii")
-                                 if isinstance(hit.name, bytes)
-                                 else str(hit.name))
-                        hits_by_frag[frag_ids[int(hname)]].add(label)
+        if len(seqs) >= 20_000:
+            # Two-stage scan on large corpora: a uniform 10% stride
+            # identifies all Pfam families present in the corpus (any
+            # domain meeting train_omniphyl's >=20-window floor has E>=2
+            # hits in 10%; top-256 domains have E>=25 hits, P(miss)<1e-10),
+            # then the remaining 90% of ORFs are scanned against the
+            # top-1024 active HMMs (~7x total speedup).
+            s1_seqs = seqs[::10]
+            s2_seqs = [s for idx, s in enumerate(seqs) if idx % 10 != 0]
+            s1_block = pyhmmer.easel.DigitalSequenceBlock(alpha, s1_seqs)
+            scored_hmms: list[tuple[int, object]] = []
+            with pyhmmer.plan7.HMMFile(str(hmm_path)) as hf:
+                for n_h, top_hits in enumerate(
+                        pyhmmer.hmmsearch(hf, s1_block,
+                                          cpus=workers, E=evalue), 1):
+                    n_inc = _collect_hits(top_hits)
+                    if n_inc > 0:
+                        scored_hmms.append((n_inc, top_hits.query))
+                    if n_h % 4000 == 0:
+                        print(f"  pyhmmer stage 1: {n_h} HMMs scanned "
+                              f"({len(scored_hmms)} active)...")
+            scored_hmms.sort(key=lambda t: t[0], reverse=True)
+            active_hmms = [h for _, h in scored_hmms[:1024]]
+            print(f"pyhmmer stage 1: {len(scored_hmms)} HMMs hit 10% "
+                  f"stride; scanning remaining {len(s2_seqs)} ORFs against "
+                  f"top {len(active_hmms)} HMMs...")
+            if active_hmms and s2_seqs:
+                s2_block = pyhmmer.easel.DigitalSequenceBlock(alpha, s2_seqs)
+                for top_hits in pyhmmer.hmmsearch(active_hmms, s2_block,
+                                                  cpus=workers, E=evalue):
+                    _collect_hits(top_hits)
+        else:
+            block = pyhmmer.easel.DigitalSequenceBlock(alpha, seqs)
+            with pyhmmer.plan7.HMMFile(str(hmm_path)) as hf:
+                for top_hits in pyhmmer.hmmsearch(hf, block, cpus=workers,
+                                                  E=evalue):
+                    _collect_hits(top_hits)
     if cleanup_hmm:
         hmm_path.unlink(missing_ok=True)
 

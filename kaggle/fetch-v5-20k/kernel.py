@@ -20,6 +20,7 @@ Pipeline:
      KAGGLE_USERNAME/KAGGLE_KEY or KAGGLE_API_TOKEN are set).
 """
 
+import glob
 import os
 import shutil
 import socket
@@ -37,6 +38,22 @@ WORK = "/kaggle/working"
 WORKDIR = f"{WORK}/omniphyl-work"
 os.environ.setdefault("WORKDIR", WORKDIR)
 os.environ.setdefault("OUTDIR", WORK)
+
+# If a pre-sliced raw corpus is mounted in /kaggle/input, copy it into
+# WORKDIR/corpus and set SKIP_FETCH=1 so run_pilot.sh runs only the
+# pyhmmer Pfam-A scan and contaminant screen.
+raw_hits = glob.glob("/kaggle/input/**/fragments.fna", recursive=True)
+if raw_hits:
+    raw_dir = Path(raw_hits[0]).parent
+    dst_corpus = Path(WORKDIR) / "corpus"
+    dst_corpus.mkdir(parents=True, exist_ok=True)
+    for fname in ("fragments.fna", "labels.tsv", "manifest.json", "skipped.tsv"):
+        src_f = raw_dir / fname
+        if src_f.exists():
+            shutil.copy2(src_f, dst_corpus / fname)
+    os.environ["SKIP_FETCH"] = "1"
+    os.environ["CORPUS_DIR"] = str(dst_corpus)
+    print(f"==> Resuming from mounted pre-sliced corpus at {raw_dir}")
 
 # Option B (~20k genomes, ~900k fragments at 25kb/genome):
 os.environ.setdefault("GROUPS", "protozoa fungi archaea bacteria viral")

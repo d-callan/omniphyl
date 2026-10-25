@@ -27,7 +27,8 @@ from fetch_refseq_corpus import (  # noqa: E402
     veupath_intervals, _collect_bed_items,
     load_gff_features, feature_stats, cds_frame, subtract_intervals,
     DOMAIN_RE, parse_gtdb_lineage, attach_gtdb_lineage,
-    select_assemblies, translate_frame, extract_orfs_for_fragment)
+    select_assemblies, translate_frame, extract_orfs_for_fragment,
+    annotate_fragments_pfam)
 from train_omniphyl import (  # noqa: E402
     encode_cont_labels, encode_annot_labels, CONT_TARGETS, RANKS,
     FragmentDataset, build_cell_lut, load_labels, build_tree,
@@ -650,6 +651,39 @@ def test_p3_annot():
           len(orfs_f0) == 1 and len(orfs_f0[0][1]) == 36
           and orfs_nc == [] and len(orfs_na) == 2,
           (len(orfs_f0), len(orfs_nc), len(orfs_na)))
+    try:
+        import gzip
+        import pyhmmer
+        alpha = pyhmmer.easel.Alphabet.amino()
+        hc_dna = ("ATG" + "GCTGACGAATTCGGCCACATCAAACTGTTCCCG" * 4 + "TAA")
+        pep = extract_orfs_for_fragment(hc_dna, "0", min_aa=30)[0][1]
+        msa_seqs = [pyhmmer.easel.TextSequence(
+            name=f"s{i}".encode(), sequence=pep).digitize(alpha)
+            for i in range(4)]
+        msa = pyhmmer.easel.DigitalMSA(
+            alpha, name=b"test", accession=b"PF99999.1", sequences=msa_seqs)
+        hmm, _, _ = pyhmmer.plan7.Builder(alpha).build_msa(
+            msa, pyhmmer.plan7.Background(alpha))
+        pf_dir = tmp / "pfam_test"
+        pf_dir.mkdir(exist_ok=True)
+        with gzip.open(pf_dir / "Pfam-A.hmm.gz", "wb") as gz_out:
+            hmm.write(gz_out)
+        pf_fna = pf_dir / "fragments.fna"
+        pf_fna.write_text(f">f1\n{hc_dna}\n>f2\n{hc_dna}\n")
+        pf_lab = pf_dir / "labels.tsv"
+        pf_lab.write_text(
+            "frag_id\tactive_frame\tdomain_ids\n"
+            "f1\t0\tNA\n"
+            "f2\t7\tNA\n")
+        n_added = annotate_fragments_pfam(
+            pf_fna, pf_lab, pf_dir, workers=1, evalue=1e-3, hmm_path=None)
+        rows_after = list(csv.DictReader(open(pf_lab), delimiter="\t"))
+        check("annotate_fragments_pfam decompresses gz and merges Pfam hit",
+              n_added == 1 and rows_after[0]["domain_ids"] == "Pfam:PF99999"
+              and rows_after[1]["domain_ids"] == "",
+              rows_after)
+    except ImportError:
+        pass
 
     # mRNA+CDS but NO exon rows: intron = mRNA minus CDS coverage — the
     # CDS portion of the transcript must NOT be labelled intronic.

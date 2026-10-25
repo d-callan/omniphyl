@@ -127,6 +127,25 @@ if [ "$SKIP_FETCH" = 1 ]; then
         [ -f "$DATA/$f" ] || { echo "SKIP_FETCH=1 but $DATA/$f missing"; exit 1; }
     done
     echo "==> SKIP_FETCH: using corpus at $DATA"
+    if [ "$PFAM_HMMS" = 1 ]; then
+        if [ ! -w "$DATA" ]; then
+            mkdir -p "$WORKDIR/corpus"
+            cp -f "$DATA/fragments.fna" "$WORKDIR/corpus/fragments.fna"
+            cp -f "$DATA/labels.tsv" "$WORKDIR/corpus/labels.tsv"
+            DATA="$WORKDIR/corpus"
+        fi
+        python3 - "$DATA" "$PFAM_EVALUE" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, "scripts")
+from fetch_refseq_corpus import annotate_fragments_pfam
+d = Path(sys.argv[1])
+c = d / "_ncbi_cache"
+c.mkdir(parents=True, exist_ok=True)
+annotate_fragments_pfam(d / "fragments.fna", d / "labels.tsv", c,
+                        workers=8, evalue=float(sys.argv[2]))
+PY
+    fi
 else
     mkdir -p "$DATA"
     VEUPATH_FLAG=""
