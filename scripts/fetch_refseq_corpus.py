@@ -72,6 +72,12 @@ NCBI_BASE = {
     "genbank": "https://ftp.ncbi.nlm.nih.gov/genomes/genbank",
 }
 TAXDUMP_URL = "https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/new_taxdump/new_taxdump.tar.gz"
+GTDB_BASE = "https://data.gtdb.ecogenomic.org/releases/latest"
+GTDB_FILES = {
+    "archaea": "ar53_taxonomy.tsv.gz",
+    "bacteria": "bac120_taxonomy.tsv.gz",
+}
+PFAM_HMM_URL = "https://ftp.ebi.ac.uk/pub/databases/Pfam/current_release/Pfam-A.hmm.gz"
 UCSC_API = "https://api.genome.ucsc.edu"
 UCSC_HUBS = "https://hgdownload.soe.ucsc.edu/hubs"
 VEUPATH_TRACK = "VEuPathDBGeneModels"  # UCSC GenArk contrib track (~440 assemblies, release 68)
@@ -230,8 +236,8 @@ def select_assemblies(rows: list[dict], levels: set[str],
                             key=lambda rk: abs(rk_order.index(rk) - i_req))
         groups: dict[str, list] = defaultdict(list)
         for r in keep:
-            tid = r.get("species_taxid", "")
-            lin = tax_map.get(tid, {})
+            lin = (r.get("_gtdb_lin")
+                   or tax_map.get(r.get("species_taxid", ""), {}))
             rank_val = lin.get(one_per_rank)
             if not rank_val:
                 resolved = sum(1 for rk in lin_ranks if lin.get(rk))
@@ -245,11 +251,38 @@ def select_assemblies(rows: list[dict], levels: set[str],
             groups[rank_val].append(r)
         # prefer better assemblies within each rank value: the pre-group
         # shuffle already randomised order, so a stable sort by level
-        # keeps randomness inside a level while preferring completeness
+        # keeps randomness inside a level while preferring completeness.
+        # Within a rank group (e.g. genus), interleave distinct lower-rank
+        # values (species -> strain taxid) first so per_rank_n>1 spreads
+        # picks across distinct species before taking a second strain of
+        # the same species.
         candidates = []
         for key, grp in groups.items():
             grp.sort(key=lambda r: LEVEL_PREF.get(
                 r.get("assembly_level", ""), 9))
+            if per_rank_n > 1 and one_per_rank != "species":
+                by_sub: dict[str, list] = defaultdict(list)
+                for r in grp:
+                    lin = (r.get("_gtdb_lin")
+                           or tax_map.get(r.get("species_taxid", ""), {}))
+                    sub = (lin.get("species")
+                           or r.get("species_taxid")
+                           or r.get("taxid")
+                           or r["assembly_accession"])
+                    by_sub[sub].append(r)
+                interleaved: list[dict] = []
+                idx = 0
+                subs = list(by_sub.values())
+                while True:
+                    progressed = False
+                    for bucket in subs:
+                        if idx < len(bucket):
+                            interleaved.append(bucket[idx])
+                            progressed = True
+                    if not progressed:
+                        break
+                    idx += 1
+                grp = interleaved
             candidates.append((key, grp))
     else:
         candidates = [(None, [r]) for r in keep]
@@ -347,7 +380,9 @@ def load_gff_cds(gff_path: Path) -> dict[str, list[tuple[int, int]]]:
 FEAT_TYPES = {"CDS": "cds", "exon": "exon",
               "mRNA": "mrna", "transcript": "mrna",
               "rRNA": "rna", "tRNA": "rna"}
-DOMAIN_RE = re.compile(r"(?:InterPro:IPR\d+|(?:PFAM|Pfam):PF\d+)")
+DOMAIN_RE = re.compile(
+    r"(?:InterPro:IPR\d+|(?:PFAM|Pfam):PF\d+|CDD:\d+"
+    r"|COG:COG\d+|TIGRFAM:TIGR\d+|PROSITE:PS\d+)")
 
 
 def load_gff_features(gff_path: Path) -> dict[str, dict]:
@@ -857,6 +892,235 @@ def resolve_taxonomy(taxids: set[str], cache: Path) -> dict:
     return out
 
 
+GTDB_PREFIX_MAP = {
+    "d": "domain", "p": "phylum", "c": "class", "o": "order",
+    "f": "family", "g": "genus", "s": "species",
+}
+
+
+def parse_gtdb_lineage(lineage: str) -> dict[str, str]:
+    """Parse GTDB 'd__Bacteria;p__...' string into {rank: name} dict."""
+    rec: dict[str, str] = {}
+    for tok in lineage.split(";"):
+        tok = tok.strip()
+        if "__" not in tok:
+            continue
+        k, v = tok.split("__", 1)
+        rank = GTDB_PREFIX_MAP.get(k)
+        if rank and v:
+            rec[rank] = v
+    return rec
+
+
+def load_gtdb_taxonomy(cache: Path,
+                       groups: set[str] | None = None) -> dict[str, dict]:
+    """accession (with and without version) -> GTDB {rank: name} dict."""
+    want = [g for g in ("archaea", "bacteria")
+            if groups is None or g in groups]
+    out: dict[str, dict] = {}
+    for g in want:
+        fname = GTDB_FILES[g]
+        p = cache / fname
+        if not p.exists():
+            print(f"downloading GTDB {fname} ...")
+            download(f"{GTDB_BASE}/{fname}", p)
+        with gzip.open(p, "rt", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 2:
+                    continue
+                acc, lin = parts[0].strip(), parts[1]
+                if acc.startswith(("RS_", "GB_")):
+                    acc = acc[3:]
+                rec = parse_gtdb_lineage(lin)
+                if rec:
+                    out[acc] = rec
+                    out[acc.split(".")[0]] = rec
+    return out
+
+
+def attach_gtdb_lineage(rows: list[dict],
+                        gtdb_map: dict[str, dict]) -> int:
+    """Attach _gtdb_lin to matching rows in place; return match count."""
+    n = 0
+    for r in rows:
+        acc = r.get("assembly_accession", "")
+        lin = gtdb_map.get(acc) or gtdb_map.get(acc.split(".")[0])
+        if lin:
+            r["_gtdb_lin"] = lin
+            n += 1
+    return n
+
+
+# --- Pfam-A / pyhmmer fragment domain annotation (E5) --------------------
+
+_CODON_TABLE = {
+    "TTT": "F", "TTC": "F", "TTA": "L", "TTG": "L",
+    "CTT": "L", "CTC": "L", "CTA": "L", "CTG": "L",
+    "ATT": "I", "ATC": "I", "ATA": "I", "ATG": "M",
+    "GTT": "V", "GTC": "V", "GTA": "V", "GTG": "V",
+    "TCT": "S", "TCC": "S", "TCA": "S", "TCG": "S",
+    "CCT": "P", "CCC": "P", "CCA": "P", "CCG": "P",
+    "ACT": "T", "ACC": "T", "ACA": "T", "ACG": "T",
+    "GCT": "A", "GCC": "A", "GCA": "A", "GCG": "A",
+    "TAT": "Y", "TAC": "Y", "TAA": "*", "TAG": "*",
+    "CAT": "H", "CAC": "H", "CAA": "Q", "CAG": "Q",
+    "AAT": "N", "AAC": "N", "AAA": "K", "AAG": "K",
+    "GAT": "D", "GAC": "D", "GAA": "E", "GAG": "E",
+    "TGT": "C", "TGC": "C", "TGA": "*", "TGG": "W",
+    "CGT": "R", "CGC": "R", "CGA": "R", "CGG": "R",
+    "AGT": "S", "AGC": "S", "AGA": "R", "AGG": "R",
+    "GGT": "G", "GGC": "G", "GGA": "G", "GGG": "G",
+}
+_RC_TRANS = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+
+
+def translate_frame(seq: str, frame: int) -> str:
+    """Translate DNA string in frame 0..5 (0-2 fwd, 3-5 rev-comp)."""
+    s = seq.translate(_RC_TRANS)[::-1] if frame >= 3 else seq
+    off = frame % 3
+    s = s.upper()
+    n = (len(s) - off) // 3 * 3
+    return "".join(_CODON_TABLE.get(s[i:i + 3], "X")
+                   for i in range(off, off + n, 3))
+
+
+def extract_orfs_for_fragment(seq: str, active_frame: str,
+                              min_aa: int = 30) -> list[tuple[int, str]]:
+    """Return [(frame_idx, peptide)] ORFs >= min_aa for a fragment.
+
+    Uses active_frame (0..5) when known from GFF; falls back to all 6
+    frames when active_frame is 6 (multi-frame) or NA (unannotated
+    GenBank/VEuPathDB assembly), and skips pure non-coding windows (7).
+    """
+    if active_frame == "7":
+        return []
+    if active_frame in ("0", "1", "2", "3", "4", "5"):
+        frames = [int(active_frame)]
+    else:
+        frames = list(range(6))
+    out: list[tuple[int, str]] = []
+    for f in frames:
+        aa = translate_frame(seq, f)
+        for seg in aa.split("*"):
+            seg = seg.strip("X")
+            if len(seg) >= min_aa:
+                out.append((f, seg))
+    return out
+
+
+def annotate_fragments_pfam(frag_path: Path, lab_path: Path,
+                            cache: Path, workers: int = 4,
+                            evalue: float = 1e-5,
+                            min_aa: int = 30,
+                            hmm_path: Path | None = None) -> int:
+    """Scan emitted fragments against Pfam-A via pyhmmer.hmmsearch.
+
+    Updates lab_path in place: merges Pfam:PFxxxxx hits into domain_ids
+    and upgrades unannotated rows ('NA' domain_ids on GenBank/GFF-less
+    windows) to '' or their matched Pfam IDs so the E5 domain head
+    receives uniform supervision across RefSeq and GenBank assemblies.
+    Returns total number of (fragment, Pfam) hit pairs added.
+    """
+    import pyhmmer
+
+    if hmm_path is None:
+        hmm_path = cache / "Pfam-A.hmm"
+        if not hmm_path.exists():
+            gz_path = cache / "Pfam-A.hmm.gz"
+            print("downloading Pfam-A.hmm.gz (~400MB)...")
+            download(PFAM_HMM_URL, gz_path, timeout=900)
+            # HMMFile needs a plain seekable file, not a .gz stream
+            with gzip.open(gz_path, "rb") as fin, \
+                    open(hmm_path, "wb") as fout:
+                shutil.copyfileobj(fin, fout, 1 << 22)
+            gz_path.unlink()
+
+    # 1. Read fragment active_frame from labels.tsv so annotated coding
+    #    windows only translate their true reading frame.
+    frame_of: dict[str, str] = {}
+    with open(lab_path, encoding="utf-8", errors="replace") as f:
+        r = csv.DictReader(f, delimiter="\t")
+        for row in r:
+            frame_of[row["frag_id"]] = row.get("active_frame", "NA")
+
+    # 2. Build in-memory digitized peptide dataset over all fragments.
+    alpha = pyhmmer.easel.Alphabet.amino()
+    seqs: list = []
+    frag_ids: list[str] = []
+    with open(frag_path, encoding="utf-8", errors="replace") as f:
+        fid, buf = None, []
+        for line in f:
+            line = line.strip()
+            if line.startswith(">"):
+                if fid is not None:
+                    for j, (fr, pep) in enumerate(extract_orfs_for_fragment(
+                            "".join(buf), frame_of.get(fid, "NA"), min_aa)):
+                        tag = f"{len(frag_ids)}".encode("ascii")
+                        frag_ids.append(fid)
+                        seqs.append(pyhmmer.easel.TextSequence(
+                            name=tag, sequence=pep).digitize(alpha))
+                fid = line[1:].split()[0]
+                buf = []
+            else:
+                buf.append(line)
+        if fid is not None:
+            for j, (fr, pep) in enumerate(extract_orfs_for_fragment(
+                    "".join(buf), frame_of.get(fid, "NA"), min_aa)):
+                tag = f"{len(frag_ids)}".encode("ascii")
+                frag_ids.append(fid)
+                seqs.append(pyhmmer.easel.TextSequence(
+                    name=tag, sequence=pep).digitize(alpha))
+
+    print(f"pyhmmer: scanning {len(seqs)} ORFs from {len(frame_of)} "
+          f"fragments against {hmm_path.name} (cpus={workers})...")
+    hits_by_frag: dict[str, set[str]] = defaultdict(set)
+    if seqs:
+        block = pyhmmer.easel.DigitalSequenceBlock(alpha, seqs)
+        with pyhmmer.plan7.HMMFile(str(hmm_path)) as hf:
+            for top_hits in pyhmmer.hmmsearch(hf, block, cpus=workers,
+                                              E=evalue):
+                raw_acc = (getattr(top_hits, "query_accession", None)
+                           or top_hits.query_name)
+                acc_s = (raw_acc.decode("ascii")
+                         if isinstance(raw_acc, bytes) else str(raw_acc))
+                pf_id = acc_s.split(".")[0]
+                label = (f"Pfam:{pf_id}" if pf_id.startswith("PF")
+                         else f"HMM:{pf_id}")
+                for hit in top_hits:
+                    if hit.included and hit.evalue <= evalue:
+                        hname = (hit.name.decode("ascii")
+                                 if isinstance(hit.name, bytes)
+                                 else str(hit.name))
+                        hits_by_frag[frag_ids[int(hname)]].add(label)
+
+    # 3. Rewrite labels.tsv in place with merged domain_ids.
+    tmp_path = lab_path.with_suffix(".tsv.tmp")
+    n_pairs = 0
+    with open(lab_path, encoding="utf-8", errors="replace") as fin, \
+            open(tmp_path, "w", newline="", encoding="utf-8") as fout:
+        reader = csv.DictReader(fin, delimiter="\t")
+        writer = csv.DictWriter(fout, fieldnames=reader.fieldnames,
+                                delimiter="\t")
+        writer.writeheader()
+        for row in reader:
+            fid = row["frag_id"]
+            cur = row.get("domain_ids", "NA")
+            existing = (set() if not cur or cur == "NA"
+                        else {t for t in cur.split(",") if t})
+            added = hits_by_frag.get(fid, set())
+            n_pairs += len(added - existing)
+            merged = sorted(existing | added)
+            # Every scanned fragment now has known domain status ("" when
+            # no Pfam/GFF domain hit, rather than "NA" unannotated).
+            row["domain_ids"] = ",".join(merged)
+            writer.writerow(row)
+    tmp_path.replace(lab_path)
+    print(f"pyhmmer: annotated {len(hits_by_frag)} fragments "
+          f"(+{n_pairs} new domain hits)")
+    return n_pairs
+
+
 def slice_assembly(row: dict, gdir: Path, args, cache: Path):
     """Fetch one assembly, slice its nt-budgeted fragments, delete sources.
 
@@ -982,6 +1246,19 @@ def main():
                     help="assembly levels eligible for genbank picks; "
                          "broader than --levels since genbank is mostly "
                          "draft assemblies")
+    ap.add_argument("--gtdb", action="store_true",
+                    help="use GTDB r220 taxonomy (bac120/ar53) over NCBI "
+                         "rankedlineage for bacterial and archaeal "
+                         "selection and rank labels")
+    ap.add_argument("--pfam-hmms", action="store_true",
+                    help="run pyhmmer Pfam-A hmmsearch over emitted "
+                         "fragments and merge Pfam:PFxxxxx hits into "
+                         "domain_ids")
+    ap.add_argument("--pfam-hmm-path", type=Path, default=None,
+                    help="optional local HMM file for --pfam-hmms "
+                         "(default downloads Pfam-A.hmm.gz into cache)")
+    ap.add_argument("--pfam-evalue", type=float, default=1e-5,
+                    help="E-value threshold for --pfam-hmms (default 1e-5)")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -993,12 +1270,18 @@ def main():
     levels = set(args.levels.split(","))
     skipped: list[dict] = []
 
+    gtdb_map = (load_gtdb_taxonomy(cache, set(args.groups)
+                                   | set(args.genbank_groups))
+                if args.gtdb else {})
+
     # 1-2. summaries + selection (with GFF HEAD-check pre-filter)
     gb_groups = set(args.genbank_groups)
     gb_levels = set(args.genbank_levels.split(","))
     selected = []
     for g in args.groups:
         rows = load_summary(g, cache)
+        if gtdb_map and g in ("archaea", "bacteria"):
+            attach_gtdb_lineage(rows, gtdb_map)
         sel = select_assemblies(rows, levels, args.one_per_rank,
                                 rng, skipped, args.workers,
                                 tax_resolver=resolve_taxonomy,
@@ -1020,6 +1303,8 @@ def main():
             gb_rows = [r for r in load_summary(g, cache, source="genbank")
                        if (r.get("gbrs_paired_asm") or "na").strip()
                        in ("", "na")]
+            if gtdb_map and g in ("archaea", "bacteria"):
+                attach_gtdb_lineage(gb_rows, gtdb_map)
             gb_sel = select_assemblies(
                 gb_rows, gb_levels, args.one_per_rank, rng, skipped,
                 args.workers, tax_resolver=resolve_taxonomy, cache=cache,
@@ -1080,7 +1365,8 @@ def main():
                     "struct_flags", "domain_ids"])
         for i in sorted(results):
             row, label_source, frags, n_veu_unmatched = results[i]
-            tax = tax_map.get(row.get("species_taxid", ""), {})
+            tax = (row.get("_gtdb_lin")
+                   or tax_map.get(row.get("species_taxid", ""), {}))
             for seqid, s, e, frag, stats in frags:
                 fid = f"{row['assembly_accession']}|{seqid}|{s}-{e}"
                 ff.write(f">{fid}\n")
@@ -1127,6 +1413,12 @@ def main():
                       f"chrom names (NA labels)", file=sys.stderr)
     print(f"wrote {n_frags} fragments -> {frag_path}")
 
+    if args.pfam_hmms:
+        annotate_fragments_pfam(
+            frag_path, lab_path, cache,
+            workers=args.workers, evalue=args.pfam_evalue,
+            hmm_path=args.pfam_hmm_path)
+
     with open(skip_path, "w", newline="") as sf:
         sw = csv.DictWriter(sf, fieldnames=["accession", "group", "reason"],
                             delimiter="\t")
@@ -1135,7 +1427,8 @@ def main():
     print(f"skipped {len(skipped)} assemblies -> {skip_path}")
 
     manifest = {
-        "args": vars(args) | {"outdir": str(args.outdir)},
+        "args": {k: (str(v) if isinstance(v, Path) else v)
+                 for k, v in vars(args).items()},
         "groups": args.groups,
         "genomes_downloaded": len(ok),
         "genomes_skipped": len(skipped),
@@ -1144,6 +1437,9 @@ def main():
         "sources": {
             "summaries": f"{NCBI_BASE}/<group>/assembly_summary.txt",
             "taxonomy": TAXDUMP_URL + " (rankedlineage.dmp)",
+            "gtdb": (f"{GTDB_BASE}/{{bac120,ar53}}_taxonomy.tsv.gz"
+                     if args.gtdb else None),
+            "pfam": (PFAM_HMM_URL if args.pfam_hmms else None),
         },
     }
     (args.outdir / "manifest.json").write_text(json.dumps(manifest, indent=2))

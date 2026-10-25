@@ -55,6 +55,11 @@ ONE_PER_RANK="${ONE_PER_RANK:-}"
 PER_RANK_N="${PER_RANK_N:-1}"  # assemblies kept per rank value
 GENBANK_GROUPS="${GENBANK_GROUPS:-}"  # e.g. "archaea protozoa fungi"
 GENBANK_EXTRA="${GENBANK_EXTRA:-0}"   # genbank picks on covered rank values
+GTDB="${GTDB:-0}"                     # 1 = use GTDB r220 taxonomy for bacteria/archaea
+PFAM_HMMS="${PFAM_HMMS:-0}"           # 1 = run pyhmmer Pfam-A scan over emitted fragments
+PFAM_EVALUE="${PFAM_EVALUE:-1e-5}"
+PUBLISH_DATASET_ID="${PUBLISH_DATASET_ID:-}"      # e.g. "daniellecallan/omniphyl-v5-20k"
+PUBLISH_DATASET_TITLE="${PUBLISH_DATASET_TITLE:-}"
 VEUPATH="${VEUPATH:-1}"
 REQUIRE_GFF="${REQUIRE_GFF:-0}"  # 1 = drop assemblies lacking RefSeq GFF
 K="${K:-7}"
@@ -90,6 +95,9 @@ EVAL_PAIRED_LEN="${EVAL_PAIRED_LEN:-0}" # E2 eval: paired-end mate length
 REGION_HEAD="${REGION_HEAD:-0}"       # E3: 4-way region-composition head
 STRUCT_HEAD="${STRUCT_HEAD:-0}"       # E4: active_frame + struct_flags heads
 DOMAIN_HEAD_K="${DOMAIN_HEAD_K:-0}"   # E5: top-K IPR/PF multi-label head
+ANNOT_WEIGHT="${ANNOT_WEIGHT:-0.25}"   # loss weight on the annotation-head group
+ANNOT_CTX="${ANNOT_CTX:-0}"            # 1 = detached tax->annot posterior conditioning
+CACHE_SEQS="${CACHE_SEQS:-0}"          # 1 = --cache-seqs (in-RAM FASTA; faster epochs on low-core VMs)
 
 mkdir -p "$WORKDIR" "$OUTDIR"
 cd "$WORKDIR"
@@ -104,6 +112,9 @@ fi
 cd omniphyl
 
 python3 -c "import torch" 2>/dev/null || pip install torch numpy --quiet
+if [ "$PFAM_HMMS" = 1 ]; then
+    python3 -c "import pyhmmer" 2>/dev/null || pip install pyhmmer --quiet
+fi
 
 if [ "$SMOKE" = 1 ]; then
     python3 tests/test_smoke.py
@@ -129,12 +140,17 @@ else
     GENBANK_FLAG=""
     [ -n "$GENBANK_GROUPS" ] && GENBANK_FLAG="--genbank-groups $GENBANK_GROUPS"
     [ -n "$GENBANK_EXTRA" ] && GENBANK_FLAG+=" --genbank-extra $GENBANK_EXTRA"
+    GTDB_FLAG=""
+    [ "$GTDB" = 1 ] && GTDB_FLAG="--gtdb"
+    PFAM_FLAG=""
+    [ "$PFAM_HMMS" = 1 ] && PFAM_FLAG="--pfam-hmms --pfam-evalue $PFAM_EVALUE"
     # shellcheck disable=SC2086
     python3 scripts/fetch_refseq_corpus.py --outdir "$DATA" \
         --groups $GROUPS --levels "$LEVELS" \
         --nt-budget "$NT_BUDGET" --frag-len-min "$FRAG_LEN" \
         --frag-len-max "$FRAG_LEN" --boundary-frac "$BOUNDARY_FRAC" \
-        $VEUPATH_FLAG $RANK_FLAG $GFF_FLAG $GBUDGET_FLAG $GENBANK_FLAG --workers 8
+        $VEUPATH_FLAG $RANK_FLAG $GFF_FLAG $GBUDGET_FLAG $GENBANK_FLAG \
+        $GTDB_FLAG $PFAM_FLAG --workers 8
 fi
 
 # --- contaminant screen (all fragments) --------------------------------------
@@ -172,6 +188,30 @@ if [ "$FETCH_ONLY" = 1 ]; then
     tar -czf "$OUTDIR/omniphyl-corpus-$STAMP.tar.gz" -C "$DATA" \
         fragments.fna labels.tsv manifest.json
     echo "==> corpus bundle: $OUTDIR/omniphyl-corpus-$STAMP.tar.gz"
+    if [ -n "$PUBLISH_DATASET_ID" ]; then
+        DS_DIR="$WORKDIR/dataset_publish"
+        mkdir -p "$DS_DIR"
+        cp -f "$FRAG_FILE" "$DS_DIR/fragments.fna"
+        cp -f "$LAB_FILE" "$DS_DIR/labels.tsv"
+        [ -f "$DATA/manifest.json" ] && cp -f "$DATA/manifest.json" "$DS_DIR/"
+        [ -f "$DATA/screen_manifest.json" ] && cp -f "$DATA/screen_manifest.json" "$DS_DIR/"
+        [ -f "$DATA/skipped.tsv" ] && cp -f "$DATA/skipped.tsv" "$DS_DIR/"
+        DS_TITLE="${PUBLISH_DATASET_TITLE:-${PUBLISH_DATASET_ID#*/}}"
+        cat > "$DS_DIR/dataset-metadata.json" <<EOF
+{
+  "title": "$DS_TITLE",
+  "id": "$PUBLISH_DATASET_ID",
+  "licenses": [{"name": "CC0-1.0"}]
+}
+EOF
+        python3 -c "import kaggle" 2>/dev/null || pip install kaggle --quiet
+        if kaggle datasets status "$PUBLISH_DATASET_ID" >/dev/null 2>&1; then
+            kaggle datasets version -p "$DS_DIR" -m "Automated corpus build $STAMP" --dir-mode zip
+        else
+            kaggle datasets create -p "$DS_DIR" --dir-mode zip
+        fi
+        echo "==> published private Kaggle Dataset: $PUBLISH_DATASET_ID"
+    fi
     exit 0
 fi
 
@@ -183,6 +223,9 @@ ANNOT_FLAGS=""
 [ "$REGION_HEAD" = 1 ] && ANNOT_FLAGS="$ANNOT_FLAGS --region-head"
 [ "$STRUCT_HEAD" = 1 ] && ANNOT_FLAGS="$ANNOT_FLAGS --struct-head"
 [ "$DOMAIN_HEAD_K" != 0 ] && ANNOT_FLAGS="$ANNOT_FLAGS --domain-head-k $DOMAIN_HEAD_K"
+[ "$ANNOT_CTX" = 1 ] && ANNOT_FLAGS="$ANNOT_FLAGS --annot-ctx"
+ANNOT_FLAGS="$ANNOT_FLAGS --annot-weight $ANNOT_WEIGHT"
+[ "$CACHE_SEQS" = 1 ] && ANNOT_FLAGS="$ANNOT_FLAGS --cache-seqs"
 python3 scripts/train_omniphyl.py \
     --fragments "$FRAG_FILE" --labels "$LAB_FILE" \
     --out "$RUN" --k "$K" --width "$WIDTH" --epochs "$EPOCHS" \
@@ -201,7 +244,7 @@ python3 scripts/train_omniphyl.py \
 # --- eval + bundle ----------------------------------------------------------
 python3 scripts/eval_pilot.py --model "$RUN/best.pt" \
     --fragments "$FRAG_FILE" --labels "$LAB_FILE" \
-    --outdir "$RUN/eval" --num-workers 4 \
+    --outdir "$RUN/eval" --num-workers 4 --val-only \
     --eval-crop-len "$EVAL_CROP_LEN" --eval-paired-len "$EVAL_PAIRED_LEN"
 
 STAMP=$(date +%Y%m%d-%H%M%S)

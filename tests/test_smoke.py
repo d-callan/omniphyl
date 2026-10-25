@@ -25,7 +25,9 @@ sys.path.insert(0, str(SCRIPTS))
 from fetch_refseq_corpus import (  # noqa: E402
     coding_stats, coding_stats_iv, slice_fragments, hub_url,
     veupath_intervals, _collect_bed_items,
-    load_gff_features, feature_stats, cds_frame, subtract_intervals)
+    load_gff_features, feature_stats, cds_frame, subtract_intervals,
+    DOMAIN_RE, parse_gtdb_lineage, attach_gtdb_lineage,
+    select_assemblies, translate_frame, extract_orfs_for_fragment)
 from train_omniphyl import (  # noqa: E402
     encode_cont_labels, encode_annot_labels, CONT_TARGETS, RANKS,
     FragmentDataset, build_cell_lut, load_labels, build_tree,
@@ -587,6 +589,55 @@ def test_p3_annot():
     check("domain id found outside Dbxref attr",
           len(cds_with_note) == 1,
           [r[5] for r in feats2["chrA"]["cds_recs"]])
+    check("widened DOMAIN_RE matches CDD/COG/TIGRFAM/PROSITE",
+          DOMAIN_RE.findall(
+              "Dbxref=CDD:23456,COG:COG0001;inference=protein motif:"
+              "TIGRFAM:TIGR00123,PROSITE:PS01008") == [
+              "CDD:23456", "COG:COG0001",
+              "TIGRFAM:TIGR00123", "PROSITE:PS01008"])
+    # GTDB lineage parser + species-interleaved genus selection
+    glin = parse_gtdb_lineage(
+        "d__Bacteria;p__Pseudomonadota;c__Gammaproteobacteria;"
+        "o__Enterobacterales;f__Enterobacteriaceae;g__Escherichia;"
+        "s__Escherichia coli")
+    check("parse_gtdb_lineage 7 ranks",
+          glin.get("domain") == "Bacteria" and
+          glin.get("genus") == "Escherichia" and
+          glin.get("species") == "Escherichia coli", glin)
+    mock_rows = [
+        {"assembly_accession": "GCF_1.1", "assembly_level": "Complete Genome",
+         "version_status": "latest", "genome_rep": "Full",
+         "excluded_from_refseq": "na", "ftp_path": "https://x/GCF_1",
+         "species_taxid": "10", "group": "bacteria"},
+        {"assembly_accession": "GCF_2.1", "assembly_level": "Complete Genome",
+         "version_status": "latest", "genome_rep": "Full",
+         "excluded_from_refseq": "na", "ftp_path": "https://x/GCF_2",
+         "species_taxid": "10", "group": "bacteria"},
+        {"assembly_accession": "GCF_3.1", "assembly_level": "Complete Genome",
+         "version_status": "latest", "genome_rep": "Full",
+         "excluded_from_refseq": "na", "ftp_path": "https://x/GCF_3",
+         "species_taxid": "20", "group": "bacteria"},
+    ]
+    gmap = {
+        "GCF_1": {**glin, "species": "Escherichia coli"},
+        "GCF_2": {**glin, "species": "Escherichia coli"},
+        "GCF_3": {**glin, "species": "Escherichia albertii"},
+    }
+    attach_gtdb_lineage(mock_rows, gmap)
+    sel = select_assemblies(
+        mock_rows, {"Complete Genome"}, "genus", random.Random(0),
+        [], workers=1, per_rank_n=2, require_gff=False)
+    sel_sp = {r["_gtdb_lin"]["species"] for r in sel}
+    check("select_assemblies interleaves distinct species within genus",
+          sel_sp == {"Escherichia coli", "Escherichia albertii"},
+          sel_sp)
+    # ORF extraction for pyhmmer Pfam scanner
+    coding_dna = "ATG" + "GCT" * 35 + "TAA"
+    orfs_f0 = extract_orfs_for_fragment(coding_dna, "0", min_aa=30)
+    orfs_nc = extract_orfs_for_fragment(coding_dna, "7", min_aa=30)
+    check("extract_orfs_for_fragment honours active_frame",
+          len(orfs_f0) == 1 and len(orfs_f0[0][1]) == 36 and orfs_nc == [],
+          (len(orfs_f0), len(orfs_nc)))
 
     # mRNA+CDS but NO exon rows: intron = mRNA minus CDS coverage — the
     # CDS portion of the transcript must NOT be labelled intronic.
@@ -730,6 +781,18 @@ def test_end_to_end():
           np.allclose(xp["aa"].numpy(), aa_encode(s0.translate(tbl))),
           xp["aa"].shape)
 
+    # in-RAM sequence cache: every frag_id resolves through the blob and
+    # yields the exact same sequence as the seek-based path
+    ds_c = FragmentDataset(fna, {fid: {} for fid in meta}, 3, lut,
+                           pos=True, targets=[],
+                           cont=encode_cont_labels(meta),
+                           cache_seqs=True)
+    check("cache_seqs: blob covers all ids",
+          set(ds_c._seq_pos) == set(meta), len(ds_c._seq_pos))
+    check("cache_seqs: sequences identical to seek path",
+          all(ds_c._read_seq(f) == ds._read_seq(f) for f in
+              list(meta)[:20]))
+
     out = tmp / "ckpt"
     r = subprocess.run(
         [sys.executable, str(SCRIPTS / "train_omniphyl.py"),
@@ -793,6 +856,15 @@ def test_end_to_end():
               "reconciled" in res and
               "selective_val" in res["reconciled"],
               list(res.get("reconciled", {})))
+        # regression: s.max(1) returns (values, indices) — swapped
+        # unpacking stored float log-probs as predicted class ids, so
+        # reconciled accuracy was ~0. Every synthetic row is Eukaryota,
+        # so domain reconciliation must be perfect post-fix.
+        check("reconciled argmax returns class ids",
+              res.get("reconciled", {}).get("per_target_val", {})
+                 .get("domain", {}).get("accuracy", 0.0) > 0.99,
+              res.get("reconciled", {}).get("per_target_val", {})
+                 .get("domain"))
 
     # annot arm: region+struct+domain heads -> ckpt -> eval annot_heads
     out_a = tmp / "ckpt_annot"
@@ -890,6 +962,51 @@ def test_end_to_end():
             capture_output=True, text=True, timeout=600)
         check("gated eval exits 0", r.returncode == 0,
               r.stderr.strip().splitlines()[-1] if r.returncode else "")
+
+    # annot_ctx arm: detached tax->annot posterior conditioning moves
+    # the optional heads out of heads{} under new names with wider
+    # inputs; eval_pilot must rebuild the same layout from ckpt args.
+    out_c = tmp / "ckpt_annot_ctx"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPTS / "train_omniphyl.py"),
+         "--fragments", str(fna), "--labels", str(lab),
+         "--out", str(out_c), "--k", "3", "--width", "16",
+         "--epochs", "2", "--batch-size", "16", "--val-frac", "0.5",
+         "--region-head", "--struct-head", "--domain-head-k", "8",
+         "--annot-ctx", "--annot-weight", "0.5",
+         "--num-workers", "0", "--pos-channels", "--cpu"],
+        capture_output=True, text=True, timeout=600)
+    check("annot-ctx train exits 0", r.returncode == 0,
+          r.stderr.strip().splitlines()[-1] if r.returncode else "")
+    ckpts_c = list(out_c.glob("*.pt"))
+    if ckpts_c and r.returncode == 0:
+        import torch
+        ckc = torch.load(ckpts_c[0], map_location="cpu",
+                         weights_only=False)
+        check("annot-ctx ckpt uses detached-ctx head modules",
+              "head_region.weight" in ckc["model"] and
+              "head_domains.weight" in ckc["model"] and
+              "heads.region_fracs.weight" not in ckc["model"],
+              sorted(k for k in ckc["model"]
+                     if "region" in k or "domains" in k))
+        check("annot_ctx flag round-trips in ckpt args",
+              ckc.get("args", {}).get("annot_ctx") is True)
+        ev_c = tmp / "eval_annot_ctx"
+        r = subprocess.run(
+            [sys.executable, str(SCRIPTS / "eval_pilot.py"),
+             "--model", str(ckpts_c[0]), "--labels", str(lab),
+             "--fragments", str(fna), "--outdir", str(ev_c),
+             "--num-workers", "0", "--cpu"],
+            capture_output=True, text=True, timeout=600)
+        check("annot-ctx eval exits 0", r.returncode == 0,
+              r.stderr.strip().splitlines()[-1] if r.returncode else "")
+        res_c = list(ev_c.glob("*.json"))
+        if res_c:
+            res = json.loads(res_c[0].read_text())
+            check("annot-ctx eval emits annot_heads sections",
+                  "region_fracs" in res.get("annot_heads", {}) and
+                  "domains" in res.get("annot_heads", {}),
+                  list(res.get("annot_heads", {})))
 
 
 def test_contaminant_screen():

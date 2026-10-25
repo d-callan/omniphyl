@@ -422,7 +422,8 @@ def main():
                      aa_drop=float(train_args.get("aa_drop", 0.0) or 0.0),
                      region_head=bool(train_args.get("region_head")),
                      struct_head=bool(train_args.get("struct_head")),
-                     domain_k=len(ckpt.get("domain_vocab", {})))
+                     domain_k=len(ckpt.get("domain_vocab", {})),
+                     annot_ctx=bool(train_args.get("annot_ctx")))
     model.load_state_dict(ckpt["model"])
     # The tree head is trained so softmax(logits + tau*log nu) = P(y);
     # evaluating at that same tau restores the posterior the model was
@@ -625,7 +626,9 @@ def main():
                     # NCBI ancestor path; col 0 (unknown) masked out
                     s = path_scores(logp, ch, cls_targets)
                     s[:, 0] = -1e9
-                    rp, rs = s.max(1)
+                    # s.max(1) returns (values, indices): the argmax
+                    # class id is .indices, its path score is .values
+                    rs, rp = s.max(1)
                     recon_pred[t].extend(rp.tolist())
                     recon_conf[t].extend(torch.exp(rs).tolist())
                     # veto evidence: weakest ancestor prob of the raw

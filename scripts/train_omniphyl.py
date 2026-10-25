@@ -444,7 +444,8 @@ class FragmentDataset(Dataset):
                  eval_crop: int = 0,
                  eval_paired: int = 0,
                  aa_frame: bool = False,
-                 annot: dict | None = None):
+                 annot: dict | None = None,
+                 cache_seqs: bool = False):
         self.fasta = Path(fasta)
         self.k = k
         self.lut = lut
@@ -477,6 +478,16 @@ class FragmentDataset(Dataset):
             self.offsets = json.loads(idx_path.read_text())
         else:
             self.offsets = self._build_index(idx_path)
+        # Optional in-RAM sequence store: one concatenated bytes blob plus
+        # per-fid (start, len) offsets. Replaces per-sample open()+seek()
+        # reads -- on 2-core VMs the syscall+decode overhead dominates the
+        # dataloader (~6ms/frag) and starves the GPU. A single sequential
+        # pass loads 900k x ~500bp fragments in <1GB; worker processes
+        # share the blob copy-on-write.
+        self._seq_blob: bytes | None = None
+        self._seq_pos: dict[str, tuple[int, int]] = {}
+        if cache_seqs:
+            self._load_seqs()
 
     def _build_index(self, idx_path: Path):
         offsets = {}
@@ -499,7 +510,46 @@ class FragmentDataset(Dataset):
                   f"{idx_path} not writable)")
         return offsets
 
+    # Optional in-RAM sequence store: one concatenated bytes blob plus
+    # per-fid (start, len) offsets. Replaces per-sample open()+seek()
+    # reads -- on 2-core VMs the syscall+decode overhead dominates the
+    # dataloader (~6ms/frag) and starves the GPU. A single sequential
+    # pass loads 900k x ~500bp fragments in <1GB; worker processes
+    # share the blob copy-on-write.
+
+    def _load_seqs(self):
+        """One sequential pass storing every needed record in memory."""
+        wanted = set(self.ids)
+        parts: list[bytes] = []
+        pos: dict[str, tuple[int, int]] = {}
+        cursor = 0
+        fid = None
+        with open(self.fasta, "rb") as f:
+            for line in f:
+                if line.startswith(b">"):
+                    fid = line[1:].strip().decode()
+                elif fid in wanted:
+                    chunk = line.strip()
+                    if fid not in pos:
+                        pos[fid] = (cursor, 0)
+                    parts.append(chunk)
+                    cursor += len(chunk)
+                    st, ln = pos[fid]
+                    pos[fid] = (st, ln + len(chunk))
+        missing = wanted - set(pos)
+        if missing:
+            raise KeyError(f"{len(missing)} frag_ids absent from "
+                           f"{self.fasta} (first: {sorted(missing)[0]})")
+        self._seq_blob = b"".join(parts)
+        self._seq_pos = pos
+        self.offsets = {}  # release the line-offset index
+        print(f"cached {len(pos)} sequences "
+              f"({len(self._seq_blob) / 2**20:.0f} MiB)")
+
     def _read_seq(self, fid: str) -> str:
+        if self._seq_blob is not None:
+            st, ln = self._seq_pos[fid]
+            return self._seq_blob[st:st + ln].decode("ascii")
         off = self.offsets[fid]
         with open(self.fasta, "rb") as f:
             f.seek(off)
@@ -700,8 +750,8 @@ def build_tree(meta: dict[str, dict], vocab: dict[str, dict],
     parent_votes = {r: defaultdict(Counter) for r in ranks[1:]}
     for m in meta.values():
         for ri, r in enumerate(ranks):
-            c = vocab[r].get(m.get(r, ""))
-            if c is None:
+            c = vocab[r].get(m.get(r, ""), -1)
+            if c == -1:
                 continue
             counts[r][c + 1] += 1
             if ri:
@@ -743,9 +793,10 @@ def build_flat_priors(meta: dict[str, dict], vocab: dict[str, dict],
     counts = {r: np.zeros(len(vocab[r]) + 1) for r in ranks}
     for m in meta.values():
         for r in ranks:
-            c = vocab[r].get(m.get(r, ""))
-            if c is not None:
-                counts[r][c + 1] += 1
+            c = vocab[r].get(m.get(r, ""), -1)
+            if c == -1:
+                continue
+            counts[r][c + 1] += 1
     out: dict[str, torch.Tensor] = {}
     for r in ranks:
         n = len(vocab[r]) + 1
@@ -817,8 +868,9 @@ class OmniPhyl(nn.Module):
                  aux: set | None = None,
                  aa_mode: str = "plain", aa_drop: float = 0.0,
                  region_head: bool = False, struct_head: bool = False,
-                 domain_k: int = 0):
+                 domain_k: int = 0, annot_ctx: bool = False):
         super().__init__()
+        self.annot_ctx = annot_ctx
         if backbone == "vit":
             self.encoder = ViTEncoder(cin, side, dim=width * 4)
         elif backbone == "seq":
@@ -875,14 +927,35 @@ class OmniPhyl(nn.Module):
         # their input is the fused latent. The struct pair (E4) needs
         # cat([z, aa_frame]) so it lives outside heads and is applied
         # explicitly in forward.
-        if region_head:
-            self.heads["region_fracs"] = nn.Linear(self.latent, 4)
-        if domain_k:
-            self.heads["domains"] = nn.Linear(self.latent, domain_k)
+        # annot_ctx=True instead conditions each annotation head on
+        # DETACHED posteriors from the other tasks: every annot head
+        # sees the domain-rank class probs, and the domains/struct pair
+        # also sees the region-composition probs. Taxonomy can thus
+        # inform annotation explicitly (splice sites are euk-only; TGA
+        # is a stop except in code-4 clades) without a gradient path
+        # that would let annot losses distort the taxonomy posterior.
+        # Because their input dims differ, ctx heads sit outside the
+        # heads dict under new names (head_region/head_domains), so
+        # checkpoints trained without the flag stay loadable.
+        n_dom = (n_classes.get("domain", 1) - 1) if annot_ctx else 0
+        if annot_ctx:
+            self.head_region = (nn.Linear(self.latent + n_dom, 4)
+                                if region_head else None)
+            self.head_domains = (nn.Linear(self.latent + n_dom + 4,
+                                           domain_k)
+                                 if domain_k else None)
+        else:
+            self.head_region = self.head_domains = None
+            if region_head:
+                self.heads["region_fracs"] = nn.Linear(self.latent, 4)
+            if domain_k:
+                self.heads["domains"] = nn.Linear(self.latent, domain_k)
         self.struct_head = struct_head
         if struct_head:
-            self.head_frame = nn.Linear(self.latent + AA_FRAME_DIM, 8)
-            self.head_flags = nn.Linear(self.latent + AA_FRAME_DIM, 4)
+            struct_in = (self.latent + AA_FRAME_DIM
+                         + (n_dom + 4 if annot_ctx else 0))
+            self.head_frame = nn.Linear(struct_in, 8)
+            self.head_flags = nn.Linear(struct_in, 4)
 
     def cond_logps(self, z, tau: float = 0.0):
         """Per-rank sibling-conditional log-probs (tree heads only)."""
@@ -931,12 +1004,30 @@ class OmniPhyl(nn.Module):
                 logits[t] = h(z)
         if lcf is not None:
             logits["coding_frac"] = lcf
+        if self.annot_ctx:
+            # detached taxonomy->annotation context. Softmax over cols
+            # 1.. only: col 0 (unknown mask) is an untrained free logit.
+            # reg_p stays zero when no region head exists, keeping the
+            # downstream input width constant.
+            dl = logits.get("domain")
+            dom_p = (dl.softmax(1)[:, 1:].detach() if dl is not None
+                     else z.new_zeros(z.size(0), 0))
+            if self.head_region is not None:
+                logits["region_fracs"] = self.head_region(
+                    torch.cat([z, dom_p], 1))
+                reg_p = logits["region_fracs"].softmax(1).detach()
+            else:
+                reg_p = z.new_zeros(z.size(0), 4)
+            if self.head_domains is not None:
+                logits["domains"] = self.head_domains(
+                    torch.cat([z, dom_p, reg_p], 1))
         if self.struct_head:
             xf = (x["aa_frame"] if isinstance(x, dict)
                   and "aa_frame" in x
                   else torch.zeros(z.size(0), AA_FRAME_DIM,
                                    device=z.device))
-            zs = torch.cat([z, xf], 1)
+            zs = (torch.cat([z, xf, dom_p, reg_p], 1)
+                  if self.annot_ctx else torch.cat([z, xf], 1))
             logits["active_frame"] = self.head_frame(zs)
             logits["struct_flags"] = self.head_flags(zs)
         return z, logits
@@ -1173,6 +1264,23 @@ def main():
     ap.add_argument("--domain-head-k", type=int, default=0,
                     help="E5: add a K-way multi-label domains head over "
                          "the top-K IPR/PF ids seen on >=20 train windows")
+    ap.add_argument("--annot-weight", type=float, default=0.25,
+                    help="gradient weight on the optional annotation-head "
+                         "loss group (region_fracs, active_frame, "
+                         "struct_flags, domains) relative to the "
+                         "unit-weight taxonomy+continuous group")
+    ap.add_argument("--annot-ctx", action="store_true",
+                    help="condition annotation heads on detached "
+                         "posteriors: domain-class probs feed "
+                         "region/domains/struct heads and region probs "
+                         "feed domains/struct (cross-task context with "
+                         "no gradient path)")
+    ap.add_argument("--cache-seqs", action="store_true",
+                    help="load all fragment sequences into RAM once "
+                         "(one sequential FASTA pass) instead of "
+                         "open()+seek() per sample per epoch; ~1GB per "
+                         "900k x 500bp fragments, removes the dataloader "
+                         "bottleneck on low-core remote VMs")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cpu", action="store_true")
     args = ap.parse_args()
@@ -1272,7 +1380,8 @@ def main():
                                var_len_prob=args.var_len_prob,
                                min_train_len=args.min_train_len,
                                aa_frame=args.struct_head,
-                               annot=annot_train)
+                               annot=annot_train,
+                               cache_seqs=args.cache_seqs)
     val_ds = FragmentDataset(args.fragments, encode_labels(val_meta),
                              args.k, lut, pos=args.pos_channels,
                              targets=cls_targets, cont=cont_val,
@@ -1281,12 +1390,16 @@ def main():
                              aux=aux, hash_canon=hash_canon,
                              aa_extra=aa_extra,
                              aa_frame=args.struct_head,
-                             annot=annot_val)
+                             annot=annot_val,
+                             cache_seqs=args.cache_seqs)
+    pin = device == "cuda"
     train_ld = DataLoader(train_ds, args.batch_size, shuffle=True,
                           num_workers=args.num_workers, drop_last=True,
+                          pin_memory=pin,
                           persistent_workers=args.num_workers > 0)
     val_ld = DataLoader(val_ds, args.batch_size, shuffle=False,
-                        num_workers=args.num_workers)
+                        num_workers=args.num_workers, pin_memory=pin,
+                        persistent_workers=args.num_workers > 0)
 
     base_ch = len(MS_KS) if args.backbone == "msfcgr" else 1
     model = OmniPhyl(n_classes, args.width,
@@ -1299,7 +1412,8 @@ def main():
                      aa_drop=args.aa_drop,
                      region_head=args.region_head,
                      struct_head=args.struct_head,
-                     domain_k=len(domain_vocab)).to(device)
+                     domain_k=len(domain_vocab),
+                     annot_ctx=args.annot_ctx).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.wd)
     steps = len(train_ld) * args.epochs
@@ -1323,6 +1437,10 @@ def main():
             with torch.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=amp):
                 z, logits = model(x)
+                # optional P3 annotation-head losses are collected
+                # separately so they can be scaled by --annot-weight
+                # without diluting the taxonomy/cont group
+                annot_terms: list = []
                 if args.head == "tree":
                     # sibling-conditional NLL with prior offset; the
                     # conditional softmax is the training target while
@@ -1383,18 +1501,19 @@ def main():
                                 logits["region_fracs"][rm], 1)
                             w = torch.where(
                                 ya[rm, 0] < 0.1, 3.0, 1.0)
-                            terms.append(-(w[:, None] * ya[rm, :4]
-                                           * pr).sum(1).mean())
+                            annot_terms.append(
+                                -(w[:, None] * ya[rm, :4]
+                                  * pr).sum(1).mean())
                     if "active_frame" in logits:
                         fm2 = ya[:, 4] >= 0
                         if fm2.any():
-                            terms.append(F.cross_entropy(
+                            annot_terms.append(F.cross_entropy(
                                 logits["active_frame"][fm2],
                                 ya[fm2, 4].long()))
                     if "struct_flags" in logits:
                         sm = ya[:, 5] >= 0
                         if sm.any():
-                            terms.append(
+                            annot_terms.append(
                                 F.binary_cross_entropy_with_logits(
                                     logits["struct_flags"][sm],
                                     ya[sm, 5:9],
@@ -1405,14 +1524,22 @@ def main():
                         dm = ya[:, -1] >= 0
                         if dm.any():
                             K = logits["domains"].size(1)
-                            terms.append(
+                            annot_terms.append(
                                 F.binary_cross_entropy_with_logits(
                                     logits["domains"][dm],
                                     ya[dm, ANNOT_BASE:
                                        ANNOT_BASE + K]))
-                if not terms:
+                if not terms and not annot_terms:
                     continue
-                loss = torch.stack(terms).mean()
+                # taxonomy + the always-on continuous heads keep unit
+                # weight, so enabling annotation heads can never dilute
+                # their gradient share; the optional annotation group is
+                # scaled by --annot-weight as a single block
+                loss = (torch.stack(terms).mean() if terms
+                        else z.new_zeros(()))
+                if annot_terms:
+                    loss = loss + args.annot_weight * torch.stack(
+                        annot_terms).mean()
             if train:
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
