@@ -112,8 +112,9 @@ def download(url: str, dest: Path, retries: int = 3, timeout: int = 300) -> Path
             part.replace(dest)  # atomic: never leave a truncated cache
             return dest
         except Exception as e:
-            # a full disk can't be fixed by retrying; fail fast
-            if getattr(e, "errno", None) == errno.ENOSPC:
+            # a full disk or HTTP 404 can't be fixed by retrying; fail fast
+            if (getattr(e, "errno", None) == errno.ENOSPC
+                    or getattr(e, "code", None) == 404):
                 raise
             if attempt == retries - 1:
                 raise
@@ -161,7 +162,9 @@ def has_gff(row: dict, timeout: int = 10) -> bool:
             req = urllib.request.Request(url, method="HEAD")
             with urllib.request.urlopen(req, timeout=timeout):
                 return True
-        except Exception:
+        except Exception as e:
+            if getattr(e, "code", None) == 404:
+                return False
             # NCBI throttles concurrent HEAD bursts; back off and retry
             time.sleep(2 * (a + 1))
     return False
@@ -213,7 +216,8 @@ def select_assemblies(rows: list[dict], levels: set[str],
             if r.get("assembly_level") in levels
             and r.get("version_status") == "latest"
             and r.get("genome_rep") == "Full"
-            and r.get("excluded_from_refseq", "na") in ("", "na")
+            and (r.get("excluded_from_refseq", "na") in ("", "na")
+                 or r.get("_gtdb_lin"))
             and r.get("ftp_path", "").startswith(("ftp://", "https://"))]
     rng.shuffle(keep)
 
@@ -1006,6 +1010,12 @@ def extract_orfs_for_fragment(seq: str, active_frame: str,
             seg = seg.strip("X")
             if len(seg) >= min_aa:
                 out.append((f, seg))
+    if len(frames) > 1 and len(out) > 2:
+        # Unannotated / multi-frame windows: out-of-frame translations emit
+        # many short random stop-bounded runs (~9/frag); the true coding
+        # frame(s) on a 500bp window are the longest ORFs.
+        out.sort(key=lambda t: len(t[1]), reverse=True)
+        out = out[:2]
     return out
 
 
@@ -1024,8 +1034,10 @@ def annotate_fragments_pfam(frag_path: Path, lab_path: Path,
     """
     import pyhmmer
 
+    cleanup_hmm = False
     if hmm_path is None:
         hmm_path = cache / "Pfam-A.hmm"
+        cleanup_hmm = True
         if not hmm_path.exists():
             gz_path = cache / "Pfam-A.hmm.gz"
             print("downloading Pfam-A.hmm.gz (~400MB)...")
@@ -1093,6 +1105,8 @@ def annotate_fragments_pfam(frag_path: Path, lab_path: Path,
                                  if isinstance(hit.name, bytes)
                                  else str(hit.name))
                         hits_by_frag[frag_ids[int(hname)]].add(label)
+    if cleanup_hmm:
+        hmm_path.unlink(missing_ok=True)
 
     # 3. Rewrite labels.tsv in place with merged domain_ids.
     tmp_path = lab_path.with_suffix(".tsv.tmp")
@@ -1133,7 +1147,8 @@ def slice_assembly(row: dict, gdir: Path, args, cache: Path):
     """
     acc = row["assembly_accession"]
     try:
-        fna, gff = fetch_fasta_and_gff(row, gdir, args.require_gff)
+        req_gff = args.require_gff and row.get("_seq_source") != "genbank"
+        fna, gff = fetch_fasta_and_gff(row, gdir, req_gff)
         veu = (fetch_veupathdb_cds(acc, cache) if args.veupath else None)
         alias_groups = load_chrom_alias(acc, cache) if veu else {}
         label_source = ("veupathdb" if veu else

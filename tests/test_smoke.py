@@ -631,13 +631,25 @@ def test_p3_annot():
     check("select_assemblies interleaves distinct species within genus",
           sel_sp == {"Escherichia coli", "Escherichia albertii"},
           sel_sp)
+    mag_row = [{"assembly_accession": "GCA_9.1", "assembly_level": "Scaffold",
+                "version_status": "latest", "genome_rep": "Full",
+                "excluded_from_refseq": "derived from metagenome",
+                "ftp_path": "https://x/GCA_9", "species_taxid": "99",
+                "group": "archaea", "_gtdb_lin": glin}]
+    sel_mag = select_assemblies(
+        mag_row, {"Scaffold"}, "genus", random.Random(0),
+        [], workers=1, per_rank_n=1, require_gff=False)
+    check("GTDB-curated GenBank MAG passes excluded_from_refseq filter",
+          len(sel_mag) == 1, len(sel_mag))
     # ORF extraction for pyhmmer Pfam scanner
     coding_dna = "ATG" + "GCT" * 35 + "TAA"
     orfs_f0 = extract_orfs_for_fragment(coding_dna, "0", min_aa=30)
     orfs_nc = extract_orfs_for_fragment(coding_dna, "7", min_aa=30)
+    orfs_na = extract_orfs_for_fragment("GCT" * 160, "NA", min_aa=30)
     check("extract_orfs_for_fragment honours active_frame",
-          len(orfs_f0) == 1 and len(orfs_f0[0][1]) == 36 and orfs_nc == [],
-          (len(orfs_f0), len(orfs_nc)))
+          len(orfs_f0) == 1 and len(orfs_f0[0][1]) == 36
+          and orfs_nc == [] and len(orfs_na) == 2,
+          (len(orfs_f0), len(orfs_nc), len(orfs_na)))
 
     # mRNA+CDS but NO exon rows: intron = mRNA minus CDS coverage — the
     # CDS portion of the transcript must NOT be labelled intronic.
