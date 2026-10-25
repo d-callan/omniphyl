@@ -45,27 +45,40 @@ os.environ.setdefault("OUTDIR", WORK)
 raw_hits = glob.glob("/kaggle/input/**/fragments.fna", recursive=True)
 if raw_hits:
     raw_dir = Path(raw_hits[0]).parent
-    dst_corpus = Path(WORKDIR) / "corpus"
-    dst_corpus.mkdir(parents=True, exist_ok=True)
-    for fname in ("fragments.fna", "labels.tsv", "manifest.json", "skipped.tsv"):
-        src_f = raw_dir / fname
-        if src_f.exists():
-            shutil.copy2(src_f, dst_corpus / fname)
-    os.environ["SKIP_FETCH"] = "1"
-    os.environ["CORPUS_DIR"] = str(dst_corpus)
-    print(f"==> Resuming from mounted pre-sliced corpus at {raw_dir}")
+    if os.environ.get("EXTEND_MOUNTED", "1") == "1":
+        os.environ.setdefault("BASE_CORPUS", str(raw_dir))
+        print(f"==> Extending mounted base corpus at {raw_dir}")
+    else:
+        dst_corpus = Path(WORKDIR) / "corpus"
+        dst_corpus.mkdir(parents=True, exist_ok=True)
+        for fname in ("fragments.fna", "labels.tsv", "manifest.json", "skipped.tsv"):
+            src_f = raw_dir / fname
+            if src_f.exists():
+                shutil.copy2(src_f, dst_corpus / fname)
+        os.environ["SKIP_FETCH"] = "1"
+        os.environ["CORPUS_DIR"] = str(dst_corpus)
+        print(f"==> Resuming from mounted pre-sliced corpus at {raw_dir}")
 
-# Option B (~20k genomes, ~900k fragments at 25kb/genome):
+# Expanded v6 corpus config (species-level depth for protozoa & fungi +
+# VEuPathDB gene models + GenBank MAGs/SAGs + bacterial GTDB GenBank fill):
 os.environ.setdefault("GROUPS", "protozoa fungi archaea bacteria viral")
 os.environ.setdefault("LEVELS", "Complete Genome,Chromosome,Scaffold")
 os.environ.setdefault("ONE_PER_RANK", "genus")
 os.environ.setdefault("PER_RANK_N", "2")
 os.environ.setdefault("NT_BUDGET", "25000")
-os.environ.setdefault("VEUPATH", "0")
+os.environ.setdefault("GROUP_ONE_PER_RANK", "protozoa=species,fungi=species")
+os.environ.setdefault("GROUP_PER_RANK_N", "protozoa=3,fungi=2")
+os.environ.setdefault("GROUP_NT_BUDGET", "protozoa=50000,fungi=35000")
+os.environ.setdefault(
+    "GROUP_LEVELS",
+    "protozoa=Complete Genome|Chromosome|Scaffold|Contig,"
+    "fungi=Complete Genome|Chromosome|Scaffold|Contig")
+os.environ.setdefault("VEUPATH", "1")
 os.environ.setdefault("REQUIRE_GFF", "1")
 os.environ.setdefault("BOUNDARY_FRAC", "0.3")
-os.environ.setdefault("GENBANK_GROUPS", "archaea protozoa fungi")
+os.environ.setdefault("GENBANK_GROUPS", "archaea protozoa fungi bacteria")
 os.environ.setdefault("GENBANK_EXTRA", "0")
+os.environ.setdefault("INCLUDE_MAGS", "1")
 os.environ.setdefault("GTDB", "1")
 os.environ.setdefault("PFAM_HMMS", "1")
 os.environ.setdefault("FETCH_ONLY", "1")

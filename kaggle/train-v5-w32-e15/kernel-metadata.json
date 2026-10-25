@@ -1,0 +1,13 @@
+{
+  "id": "daniellecallan/omniphyl-train-v5-w32-e15",
+  "title": "omniphyl-train-v5-w32-e15",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["daniellecallan/omniphyl-v5-20k"],
+  "competition_sources": [],
+  "kernel_sources": []
+}

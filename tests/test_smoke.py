@@ -28,7 +28,7 @@ from fetch_refseq_corpus import (  # noqa: E402
     load_gff_features, feature_stats, cds_frame, subtract_intervals,
     DOMAIN_RE, parse_gtdb_lineage, attach_gtdb_lineage,
     select_assemblies, translate_frame, extract_orfs_for_fragment,
-    annotate_fragments_pfam)
+    annotate_fragments_pfam, _excl_ok, parse_group_map)
 from train_omniphyl import (  # noqa: E402
     encode_cont_labels, encode_annot_labels, CONT_TARGETS, RANKS,
     FragmentDataset, build_cell_lut, load_labels, build_tree,
@@ -642,6 +642,36 @@ def test_p3_annot():
         [], workers=1, per_rank_n=1, require_gff=False)
     check("GTDB-curated GenBank MAG passes excluded_from_refseq filter",
           len(sel_mag) == 1, len(sel_mag))
+    euk_mag_rows = [
+        {"assembly_accession": "GCA_10.1", "assembly_level": "Scaffold",
+         "version_status": "latest", "genome_rep": "Full",
+         "excluded_from_refseq": "derived from metagenome; genus undefined",
+         "ftp_path": "https://x/GCA_10", "species_taxid": "10",
+         "group": "protozoa"},
+        {"assembly_accession": "GCA_11.1", "assembly_level": "Scaffold",
+         "version_status": "latest", "genome_rep": "Full",
+         "excluded_from_refseq": "derived from metagenome; contaminated",
+         "ftp_path": "https://x/GCA_11", "species_taxid": "10",
+         "group": "protozoa"},
+    ]
+    sel_euk_mag = select_assemblies(
+        euk_mag_rows, {"Scaffold"}, None, random.Random(0),
+        [], workers=1, per_rank_n=2, require_gff=False, include_mags=True)
+    check("include_mags keeps eukaryotic MAG but blocks contaminated",
+          [r["assembly_accession"] for r in sel_euk_mag] == ["GCA_10.1"],
+          sel_euk_mag)
+    # Deficit-aware covered dict + exclude_accs (incremental base_corpus)
+    sel_def = select_assemblies(
+        mock_rows, {"Complete Genome"}, "genus", random.Random(0),
+        [], workers=1, per_rank_n=3, require_gff=False,
+        covered={"Escherichia": 2}, covered_n=0,
+        exclude_accs={"GCF_1.1", "GCF_3.1"})
+    check("deficit-aware covered dict fills remaining slot & skips base accs",
+          [r["assembly_accession"] for r in sel_def] == ["GCF_2.1"],
+          [r["assembly_accession"] for r in sel_def])
+    check("parse_group_map parses typed overrides",
+          parse_group_map("protozoa=50000,fungi=35000", int)
+          == {"protozoa": 50000, "fungi": 35000})
     # ORF extraction for pyhmmer Pfam scanner
     coding_dna = "ATG" + "GCT" * 35 + "TAA"
     orfs_f0 = extract_orfs_for_fragment(coding_dna, "0", min_aa=30)

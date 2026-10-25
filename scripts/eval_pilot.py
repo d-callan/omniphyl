@@ -463,12 +463,12 @@ def main():
     # Two-pass read under --val-only: pass 1 keeps only the columns
     # build_split needs (461k full rows = ~2 GB; slim rows ~50 MB); pass 2
     # loads full rows for eval fragments only.
-    SPLIT_COLS = {"accession", "rank_unresolved", "genus", "seq_source",
-                  "seqid", "start"}
-    split_args = (float(train_args.get("val_frac", 0.1)),
-                  float(train_args.get("holdout_genus_frac", 0.0)),
+    SPLIT_COLS = {"accession", "rank_unresolved", "genus", "species",
+                  "seq_source", "seqid", "start"}
+    split_args = (float(train_args.get("val_frac", 0.05)),
+                  float(train_args.get("holdout_genus_frac", 0.02)),
                   int(train_args.get("seed", 0)),
-                  float(train_args.get("frag_val", 0.0)))
+                  float(train_args.get("frag_val", 0.05)))
     if args.val_only:
         meta_split = load_labels(args.labels, cols=SPLIT_COLS)
         val_accs, holdout_genera, val_frags = build_split(

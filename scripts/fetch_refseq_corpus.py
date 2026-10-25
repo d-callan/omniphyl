@@ -171,6 +171,42 @@ def has_gff(row: dict, timeout: int = 10) -> bool:
     return False
 
 
+# Benign RefSeq exclusion reasons (MAGs, SAGs, environmental/uncultured
+# isolates) allowed when include_mags=True, while keeping hard quality/
+# contamination rejections ('contaminated', 'chimeric', 'low quality', etc.)
+# blocked.
+MAG_EXCLUSION_OK = (
+    "derived from metagenome",
+    "derived from single cell",
+    "derived from environmental source",
+    "uncultured",
+    "genus undefined",
+)
+
+
+def _excl_ok(row: dict, include_mags: bool = False) -> bool:
+    ex = (row.get("excluded_from_refseq") or "na").strip()
+    if ex in ("", "na") or row.get("_gtdb_lin"):
+        return True
+    if not include_mags:
+        return False
+    parts = [p.strip().lower() for p in ex.split(";") if p.strip()]
+    return bool(parts) and all(
+        any(tag in p for tag in MAG_EXCLUSION_OK) for p in parts)
+
+
+def parse_group_map(spec: str, cast=str) -> dict[str, object]:
+    """Parse 'protozoa=species,fungi=species' -> {'protozoa': 'species', ...}."""
+    out: dict[str, object] = {}
+    for item in (spec or "").split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        out[k.strip()] = cast(v.strip())
+    return out
+
+
 def select_assemblies(rows: list[dict], levels: set[str],
                       one_per_rank: str | None,
                       rng: random.Random,
@@ -180,9 +216,11 @@ def select_assemblies(rows: list[dict], levels: set[str],
                       cache: Path | None = None,
                       per_rank_n: int = 1,
                       require_gff: bool = True,
-                      covered: set | None = None,
+                      covered: set | dict | None = None,
                       covered_n: int = 0,
-                      mark_unresolved: bool = True) -> list[dict]:
+                      mark_unresolved: bool = True,
+                      include_mags: bool = False,
+                      exclude_accs: set[str] | None = None) -> list[dict]:
     """Filter to eligible assemblies, then sample.
 
     covered/covered_n implement gap-filling from a second source: rank
@@ -213,12 +251,13 @@ def select_assemblies(rows: list[dict], levels: set[str],
     group is ordered by assembly level so Scaffold members fill slots
     only after Complete/Chromosome members are exhausted.
     """
+    exclude_accs = exclude_accs or set()
     keep = [r for r in rows
-            if r.get("assembly_level") in levels
+            if r.get("assembly_accession") not in exclude_accs
+            and r.get("assembly_level") in levels
             and r.get("version_status") == "latest"
             and r.get("genome_rep") == "Full"
-            and (r.get("excluded_from_refseq", "na") in ("", "na")
-                 or r.get("_gtdb_lin"))
+            and _excl_ok(r, include_mags=include_mags)
             and r.get("ftp_path", "").startswith(("ftp://", "https://"))]
     rng.shuffle(keep)
 
@@ -292,9 +331,13 @@ def select_assemblies(rows: list[dict], levels: set[str],
     else:
         candidates = [(None, [r]) for r in keep]
 
-    covered = covered or set()
+    covered = covered or {}
 
     def quota(key):
+        if isinstance(covered, dict):
+            c = covered.get(key, 0)
+            return (max(0, per_rank_n - c) + covered_n
+                    if c > 0 else per_rank_n)
         return covered_n if key in covered else per_rank_n
 
     def members_with_gff(grp, q):
@@ -1024,7 +1067,8 @@ def annotate_fragments_pfam(frag_path: Path, lab_path: Path,
                             cache: Path, workers: int = 4,
                             evalue: float = 1e-5,
                             min_aa: int = 30,
-                            hmm_path: Path | None = None) -> int:
+                            hmm_path: Path | None = None,
+                            only_fids: set[str] | None = None) -> int:
     """Scan emitted fragments against Pfam-A via pyhmmer.hmmsearch.
 
     Updates lab_path in place: merges Pfam:PFxxxxx hits into domain_ids
@@ -1058,7 +1102,10 @@ def annotate_fragments_pfam(frag_path: Path, lab_path: Path,
     with open(lab_path, encoding="utf-8", errors="replace") as f:
         r = csv.DictReader(f, delimiter="\t")
         for row in r:
-            frame_of[row["frag_id"]] = row.get("active_frame", "NA")
+            fid = row["frag_id"]
+            if only_fids is not None and fid not in only_fids:
+                continue
+            frame_of[fid] = row.get("active_frame", "NA")
 
     # 2. Build in-memory digitized peptide dataset over all fragments.
     alpha = pyhmmer.easel.Alphabet.amino()
@@ -1069,7 +1116,7 @@ def annotate_fragments_pfam(frag_path: Path, lab_path: Path,
         for line in f:
             line = line.strip()
             if line.startswith(">"):
-                if fid is not None:
+                if fid is not None and (only_fids is None or fid in only_fids):
                     for j, (fr, pep) in enumerate(extract_orfs_for_fragment(
                             "".join(buf), frame_of.get(fid, "NA"), min_aa)):
                         tag = f"{len(frag_ids)}".encode("ascii")
@@ -1078,9 +1125,9 @@ def annotate_fragments_pfam(frag_path: Path, lab_path: Path,
                             name=tag, sequence=pep).digitize(alpha))
                 fid = line[1:].split()[0]
                 buf = []
-            else:
+            elif only_fids is None or fid in only_fids:
                 buf.append(line)
-        if fid is not None:
+        if fid is not None and (only_fids is None or fid in only_fids):
             for j, (fr, pep) in enumerate(extract_orfs_for_fragment(
                     "".join(buf), frame_of.get(fid, "NA"), min_aa)):
                 tag = f"{len(frag_ids)}".encode("ascii")
@@ -1165,6 +1212,9 @@ def annotate_fragments_pfam(frag_path: Path, lab_path: Path,
         writer.writeheader()
         for row in reader:
             fid = row["frag_id"]
+            if only_fids is not None and fid not in only_fids:
+                writer.writerow(row)
+                continue
             cur = row.get("domain_ids", "NA")
             existing = (set() if not cur or cur == "NA"
                         else {t for t in cur.split(",") if t})
@@ -1320,6 +1370,36 @@ def main():
                          "(default downloads Pfam-A.hmm.gz into cache)")
     ap.add_argument("--pfam-evalue", type=float, default=1e-5,
                     help="E-value threshold for --pfam-hmms (default 1e-5)")
+    ap.add_argument("--group-one-per-rank", default="",
+                    help="comma map of per-group sampling rank overrides, "
+                         "e.g. 'protozoa=species,fungi=species'")
+    ap.add_argument("--group-per-rank-n", default="",
+                    help="comma map of per-group quota overrides, "
+                         "e.g. 'protozoa=5,fungi=3'")
+    ap.add_argument("--group-genbank-rank", default="",
+                    help="comma map of per-group rank overrides for the "
+                         "GenBank pass (e.g. 'bacteria=family' to sample "
+                         "uncultured bacterial MAGs at family level while "
+                         "RefSeq stays at genus level)")
+    ap.add_argument("--group-genbank-n", default="",
+                    help="comma map of per-group quota overrides for the "
+                         "GenBank pass (e.g. 'bacteria=1,fungi=3')")
+    ap.add_argument("--group-nt-budget", default="",
+                    help="comma map of per-group nucleotide budgets per "
+                         "assembly, e.g. 'protozoa=75000,fungi=50000'")
+    ap.add_argument("--group-levels", default="",
+                    help="semicolon/colon or comma map of per-group RefSeq "
+                         "assembly levels (use '|' inside level lists), e.g. "
+                         "'protozoa=Complete Genome|Chromosome|Scaffold|Contig'")
+    ap.add_argument("--include-mags", action="store_true",
+                    help="allow GenBank MAGs/SAGs/environmental/uncultured "
+                         "assemblies (excluded_from_refseq metagenome/single-"
+                         "cell/environmental/genus-undefined) while still "
+                         "blocking contaminated/chimeric/low-quality rows")
+    ap.add_argument("--base-corpus", type=Path, default=None,
+                    help="existing corpus dir (fragments.fna + labels.tsv) to "
+                         "extend incrementally: pre-populates covered rank "
+                         "counts and skips already-sliced accessions")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -1331,6 +1411,44 @@ def main():
     levels = set(args.levels.split(","))
     skipped: list[dict] = []
 
+    grp_rank = parse_group_map(args.group_one_per_rank, str)
+    grp_n = parse_group_map(args.group_per_rank_n, int)
+    grp_gb_rank = parse_group_map(args.group_genbank_rank, str)
+    grp_gb_n = parse_group_map(args.group_genbank_n, int)
+    grp_budget = parse_group_map(args.group_nt_budget, int)
+    grp_levels = {
+        k: set(v.replace("|", ",").split(","))
+        for k, v in parse_group_map(args.group_levels, str).items()
+    }
+
+    base_accs: set[str] = set()
+    base_rank_counts: dict[str, dict[str, int]] = defaultdict(
+        lambda: defaultdict(int))
+    base_n_frags = 0
+    if args.base_corpus:
+        b_fna = args.base_corpus / "fragments.fna"
+        b_lab = args.base_corpus / "labels.tsv"
+        if not (b_fna.exists() and b_lab.exists()):
+            raise SystemExit(
+                f"--base-corpus {args.base_corpus} missing fragments.fna "
+                "or labels.tsv")
+        seen_acc_rank: set[tuple[str, str, str]] = set()
+        with open(b_lab, encoding="utf-8", errors="replace") as bf:
+            for row in csv.DictReader(bf, delimiter="\t"):
+                base_n_frags += 1
+                acc = row["accession"]
+                grp = row.get("group", "")
+                base_accs.add(acc)
+                for rk in {grp_rank.get(grp, args.one_per_rank),
+                           grp_gb_rank.get(grp, grp_rank.get(grp, args.one_per_rank))}:
+                    if rk and row.get(rk):
+                        key = (grp, rk, acc, row[rk])
+                        if key not in seen_acc_rank:
+                            seen_acc_rank.add(key)
+                            base_rank_counts[(grp, rk)][row[rk]] += 1
+        print(f"base corpus: {len(base_accs)} accessions, "
+              f"{base_n_frags} fragments loaded from {args.base_corpus}")
+
     gtdb_map = (load_gtdb_taxonomy(cache, set(args.groups)
                                    | set(args.genbank_groups))
                 if args.gtdb else {})
@@ -1340,44 +1458,74 @@ def main():
     gb_levels = set(args.genbank_levels.split(","))
     selected = []
     for g in args.groups:
+        g_rank = grp_rank.get(g, args.one_per_rank)
+        g_per_n = grp_n.get(g, args.per_rank_n)
+        g_gb_rank = grp_gb_rank.get(g, g_rank)
+        g_gb_n = grp_gb_n.get(g, g_per_n)
+        g_lvls = grp_levels.get(g, levels)
+        g_nt = grp_budget.get(g, args.nt_budget)
+        init_cov = dict(base_rank_counts.get((g, g_rank), {}))
+
         rows = load_summary(g, cache)
         if gtdb_map and g in ("archaea", "bacteria"):
             attach_gtdb_lineage(rows, gtdb_map)
-        sel = select_assemblies(rows, levels, args.one_per_rank,
+        sel = select_assemblies(rows, g_lvls, g_rank,
                                 rng, skipped, args.workers,
                                 tax_resolver=resolve_taxonomy,
-                                cache=cache, per_rank_n=args.per_rank_n,
-                                require_gff=args.require_gff)
-        if args.group_nt_total and sel:
-            for r in sel:
-                r["_nt_budget"] = args.group_nt_total // len(sel)
+                                cache=cache, per_rank_n=g_per_n,
+                                require_gff=args.require_gff,
+                                covered=init_cov if init_cov else None,
+                                covered_n=0,
+                                include_mags=args.include_mags,
+                                exclude_accs=base_accs)
         n_refseq = len(sel)
         n_gb = 0
         if g in gb_groups:
             # GenBank pass: keep only assemblies with no RefSeq twin,
-            # then gap-fill rank values the RefSeq pass missed
-            # (--genbank-extra relaxes this to a bounded supplement).
+            # then top up rank values using deficit-aware covered counts
+            # (max(0, g_gb_n - covered[key]) + genbank_extra).
             # GFF stays optional (genbank annotation is sparse) and picks
             # are never flagged test-only — genbank rows are train-only
             # via seq_source.
-            covered = {r["_rank_key"] for r in sel if "_rank_key" in r}
+            gb_init_cov = dict(base_rank_counts.get((g, g_gb_rank), {}))
+            cov_counts: dict[str, int] = defaultdict(int, gb_init_cov)
+            if g_gb_rank == g_rank:
+                for r in sel:
+                    if "_rank_key" in r:
+                        cov_counts[r["_rank_key"]] += 1
+            else:
+                sel_tids = {r.get("species_taxid") for r in sel
+                            if r.get("species_taxid")}
+                sel_tmap = (resolve_taxonomy(sel_tids, cache)
+                            if sel_tids else {})
+                for r in sel:
+                    lin = (r.get("_gtdb_lin")
+                           or sel_tmap.get(r.get("species_taxid", ""), {}))
+                    if g_gb_rank and lin.get(g_gb_rank):
+                        cov_counts[lin[g_gb_rank]] += 1
             gb_rows = [r for r in load_summary(g, cache, source="genbank")
                        if (r.get("gbrs_paired_asm") or "na").strip()
                        in ("", "na")]
             if gtdb_map and g in ("archaea", "bacteria"):
                 attach_gtdb_lineage(gb_rows, gtdb_map)
             gb_sel = select_assemblies(
-                gb_rows, gb_levels, args.one_per_rank, rng, skipped,
+                gb_rows, gb_levels, g_gb_rank, rng, skipped,
                 args.workers, tax_resolver=resolve_taxonomy, cache=cache,
-                per_rank_n=args.per_rank_n, require_gff=False,
-                covered=covered, covered_n=args.genbank_extra,
-                mark_unresolved=False)
+                per_rank_n=g_gb_n, require_gff=False,
+                covered=dict(cov_counts), covered_n=args.genbank_extra,
+                mark_unresolved=False,
+                include_mags=args.include_mags,
+                exclude_accs=base_accs)
             for r in gb_sel:
                 r["_seq_source"] = "genbank"
             n_gb = len(gb_sel)
             sel.extend(gb_sel)
+        for r in sel:
+            r["_nt_budget"] = (args.group_nt_total // len(sel)
+                               if args.group_nt_total and sel else g_nt)
         tag = "GFF required" if args.require_gff else "GFF optional"
-        print(f"{g}: {len(rows)} assemblies -> {n_refseq} selected"
+        print(f"{g} (rank={g_rank}, n={g_per_n}, nt={g_nt}): "
+              f"{len(rows)} assemblies -> {n_refseq} selected"
               + (f" (+{n_gb} genbank)" if g in gb_groups else "")
               + f" ({tag})")
         selected.extend(sel)
@@ -1410,26 +1558,35 @@ def main():
     ok = [selected[i] for i in sorted(results)]
     print(f"downloaded+sliced {len(ok)}/{len(selected)} genomes")
 
-    # 5. emit
+    # 5. emit (copy base corpus first when --base-corpus is supplied)
     frag_path = args.outdir / "fragments.fna"
     lab_path = args.outdir / "labels.tsv"
     skip_path = args.outdir / "skipped.tsv"
-    n_frags = 0
-    with open(frag_path, "w") as ff, open(lab_path, "w", newline="") as lf:
+    n_frags = base_n_frags
+    new_fids: set[str] = set()
+    f_mode = "w"
+    if args.base_corpus:
+        if (args.base_corpus / "fragments.fna").resolve() != frag_path.resolve():
+            shutil.copy2(args.base_corpus / "fragments.fna", frag_path)
+            shutil.copy2(args.base_corpus / "labels.tsv", lab_path)
+        f_mode = "a"
+    with open(frag_path, f_mode) as ff, open(lab_path, f_mode, newline="") as lf:
         w = csv.writer(lf, delimiter="\t")
-        w.writerow(["frag_id", "accession", "seqid", "start", "end",
-                    "length", "taxid", "group", "rank_unresolved",
-                    "seq_source", "coding", "label_source", "coding_frac",
-                    "boundary", "n_boundaries", "boundary_offset"] +
-                   RANKS +
-                   ["intron_frac", "rna_frac", "active_frame",
-                    "struct_flags", "domain_ids"])
+        if f_mode == "w":
+            w.writerow(["frag_id", "accession", "seqid", "start", "end",
+                        "length", "taxid", "group", "rank_unresolved",
+                        "seq_source", "coding", "label_source", "coding_frac",
+                        "boundary", "n_boundaries", "boundary_offset"] +
+                       RANKS +
+                       ["intron_frac", "rna_frac", "active_frame",
+                        "struct_flags", "domain_ids"])
         for i in sorted(results):
             row, label_source, frags, n_veu_unmatched = results[i]
             tax = (row.get("_gtdb_lin")
                    or tax_map.get(row.get("species_taxid", ""), {}))
             for seqid, s, e, frag, stats in frags:
                 fid = f"{row['assembly_accession']}|{seqid}|{s}-{e}"
+                new_fids.add(fid)
                 ff.write(f">{fid}\n")
                 for i2 in range(0, len(frag), 70):
                     ff.write(frag[i2:i2 + 70] + "\n")
@@ -1478,7 +1635,8 @@ def main():
         annotate_fragments_pfam(
             frag_path, lab_path, cache,
             workers=args.workers, evalue=args.pfam_evalue,
-            hmm_path=args.pfam_hmm_path)
+            hmm_path=args.pfam_hmm_path,
+            only_fids=new_fids if args.base_corpus else None)
 
     with open(skip_path, "w", newline="") as sf:
         sw = csv.DictWriter(sf, fieldnames=["accession", "group", "reason"],

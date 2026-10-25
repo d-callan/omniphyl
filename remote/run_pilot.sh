@@ -53,8 +53,16 @@ FRAG_LEN="${FRAG_LEN:-500}"
 BOUNDARY_FRAC="${BOUNDARY_FRAC:-0.3}"
 ONE_PER_RANK="${ONE_PER_RANK:-}"
 PER_RANK_N="${PER_RANK_N:-1}"  # assemblies kept per rank value
-GENBANK_GROUPS="${GENBANK_GROUPS:-}"  # e.g. "archaea protozoa fungi"
+GENBANK_GROUPS="${GENBANK_GROUPS:-}"  # e.g. "archaea protozoa fungi bacteria"
 GENBANK_EXTRA="${GENBANK_EXTRA:-0}"   # genbank picks on covered rank values
+GROUP_ONE_PER_RANK="${GROUP_ONE_PER_RANK:-}" # e.g. "protozoa=species,fungi=species"
+GROUP_PER_RANK_N="${GROUP_PER_RANK_N:-}"     # e.g. "protozoa=4,fungi=3"
+GROUP_GENBANK_RANK="${GROUP_GENBANK_RANK:-}" # e.g. "bacteria=family"
+GROUP_GENBANK_N="${GROUP_GENBANK_N:-}"       # e.g. "bacteria=1"
+GROUP_NT_BUDGET="${GROUP_NT_BUDGET:-}"       # e.g. "protozoa=50000,fungi=35000"
+GROUP_LEVELS="${GROUP_LEVELS:-}"             # e.g. "protozoa=Complete Genome|Chromosome|Scaffold|Contig"
+INCLUDE_MAGS="${INCLUDE_MAGS:-0}"            # 1 = allow GenBank MAG/SAG/environmental/uncultured assemblies
+BASE_CORPUS="${BASE_CORPUS:-}"               # existing corpus dir to extend incrementally
 GTDB="${GTDB:-0}"                     # 1 = use GTDB r220 taxonomy for bacteria/archaea
 PFAM_HMMS="${PFAM_HMMS:-0}"           # 1 = run pyhmmer Pfam-A scan over emitted fragments
 PFAM_EVALUE="${PFAM_EVALUE:-1e-5}"
@@ -67,14 +75,14 @@ WIDTH="${WIDTH:-64}"
 EPOCHS="${EPOCHS:-30}"
 BATCH="${BATCH:-256}"
 POS_CHANNELS="${POS_CHANNELS:-1}"
-VAL_FRAC="${VAL_FRAC:-0.1}"
+VAL_FRAC="${VAL_FRAC:-0.05}"
 DROPOUT="${DROPOUT:-0}"
 LABEL_SMOOTHING="${LABEL_SMOOTHING:-0}"
 WD="${WD:-1e-4}"
 BACKBONE="${BACKBONE:-resnet}"      # resnet | vit | seq
 STEM_STRIDE="${STEM_STRIDE:-2}"     # 1 = full-res FCGR stem
-HOLDOUT_GENUS_FRAC="${HOLDOUT_GENUS_FRAC:-0}"
-FRAG_VAL="${FRAG_VAL:-0}"             # within-genome frag holdout fraction (contiguous span)
+HOLDOUT_GENUS_FRAC="${HOLDOUT_GENUS_FRAC:-0.02}"
+FRAG_VAL="${FRAG_VAL:-0.05}"          # within-genome frag holdout fraction (contiguous span)
 FETCH_ONLY="${FETCH_ONLY:-0}"       # 1 = corpus capture run, no training
 SKIP_FETCH="${SKIP_FETCH:-0}"       # 1 = use prebuilt corpus in CORPUS_DIR
 CORPUS_DIR="${CORPUS_DIR:-}"        # empty = $WORKDIR/corpus
@@ -161,15 +169,25 @@ else
     [ -n "$GENBANK_EXTRA" ] && GENBANK_FLAG+=" --genbank-extra $GENBANK_EXTRA"
     GTDB_FLAG=""
     [ "$GTDB" = 1 ] && GTDB_FLAG="--gtdb"
+    MAG_FLAG=""
+    [ "$INCLUDE_MAGS" = 1 ] && MAG_FLAG="--include-mags"
     PFAM_FLAG=""
     [ "$PFAM_HMMS" = 1 ] && PFAM_FLAG="--pfam-hmms --pfam-evalue $PFAM_EVALUE"
+    EXTRA_FETCH_ARGS=()
+    [ -n "$GROUP_ONE_PER_RANK" ] && EXTRA_FETCH_ARGS+=(--group-one-per-rank "$GROUP_ONE_PER_RANK")
+    [ -n "$GROUP_PER_RANK_N" ] && EXTRA_FETCH_ARGS+=(--group-per-rank-n "$GROUP_PER_RANK_N")
+    [ -n "$GROUP_GENBANK_RANK" ] && EXTRA_FETCH_ARGS+=(--group-genbank-rank "$GROUP_GENBANK_RANK")
+    [ -n "$GROUP_GENBANK_N" ] && EXTRA_FETCH_ARGS+=(--group-genbank-n "$GROUP_GENBANK_N")
+    [ -n "$GROUP_NT_BUDGET" ] && EXTRA_FETCH_ARGS+=(--group-nt-budget "$GROUP_NT_BUDGET")
+    [ -n "$GROUP_LEVELS" ] && EXTRA_FETCH_ARGS+=(--group-levels "$GROUP_LEVELS")
+    [ -n "$BASE_CORPUS" ] && EXTRA_FETCH_ARGS+=(--base-corpus "$BASE_CORPUS")
     # shellcheck disable=SC2086
     python3 scripts/fetch_refseq_corpus.py --outdir "$DATA" \
         --groups $GROUPS --levels "$LEVELS" \
         --nt-budget "$NT_BUDGET" --frag-len-min "$FRAG_LEN" \
         --frag-len-max "$FRAG_LEN" --boundary-frac "$BOUNDARY_FRAC" \
         $VEUPATH_FLAG $RANK_FLAG $GFF_FLAG $GBUDGET_FLAG $GENBANK_FLAG \
-        $GTDB_FLAG $PFAM_FLAG --workers 8
+        $GTDB_FLAG $MAG_FLAG $PFAM_FLAG "${EXTRA_FETCH_ARGS[@]}" --workers 8
 fi
 
 # --- contaminant screen (all fragments) --------------------------------------
