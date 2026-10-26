@@ -127,7 +127,9 @@ def fcgr_encode(seq: str, k: int, lut: np.ndarray,
     if canon is not None:
         kidx = canon[kidx]
     cells = lut[kidx]
-    np.add.at(freq, cells, 1.0)
+    # bincount over repeated cell ids is ~5x faster than np.add.at
+    # scatter-add on 500-elem windows (runs in every dataloader worker).
+    freq += np.bincount(cells, minlength=side * side).astype(np.float32)
     if pos:
         # CGR point at each position: p_i = (p_{i-1} + v_i)/2 solved as a
         # weighted sliding sum truncated at J terms (error <= 2^-J), with
@@ -141,8 +143,10 @@ def fcgr_encode(seq: str, k: int, lut: np.ndarray,
         ends = np.flatnonzero(valid) + (k - 1)  # position of each k-mer's last base
         sx = np.zeros(side * side, dtype=np.float32)
         sy = np.zeros(side * side, dtype=np.float32)
-        np.add.at(sx, cells, px[ends])
-        np.add.at(sy, cells, py[ends])
+        sx += np.bincount(cells, weights=px[ends],
+                          minlength=side * side).astype(np.float32)
+        sy += np.bincount(cells, weights=py[ends],
+                          minlength=side * side).astype(np.float32)
         ys, xs = np.divmod(np.arange(side * side), side)
         mx = np.where(freq > 0, sx / (freq + 1e-9), (xs + 0.5) / side)
         my = np.where(freq > 0, sy / (freq + 1e-9), (ys + 0.5) / side)
@@ -295,7 +299,7 @@ def aa_encode(seq: str, extra: bool = False) -> np.ndarray:
                 continue
             w = np.lib.stride_tricks.sliding_window_view(aa, 3)
             idx = (w * np.array([AA_ALPHA ** 2, AA_ALPHA, 1])).sum(axis=1)
-            np.add.at(vec, idx, 1.0)
+            vec += np.bincount(idx, minlength=AA_DIM).astype(np.float32)
     spec = np.log1p(vec / max(vec.sum(), 1.0) * AA_DIM)
     if extra:
         spec = np.concatenate(
@@ -1474,13 +1478,30 @@ def main():
         opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / steps)))
     amp = device == "cuda"
 
+    # Device-resident tensors reused across all batches — hoisting them
+    # out of the loop avoids a host->device transfer (and implicit sync)
+    # per batch per rank.
+    flat_priors_dev = ({t: flat_priors[t].to(device)
+                        for t in cls_targets}
+                       if args.flat_prior_tau > 0 else {})
+    struct_pos_w = torch.tensor([5., 5., 8., 8.], device=device)
+
     def run(loader, train=True):
         model.train(train)
-        tot_loss, tot_n = 0.0, 0
-        correct = defaultdict(int)
-        total = defaultdict(int)
-        frac_err = frac_n = bnd_ok = bnd_n = off_n = 0
-        off_err = 0.0
+        # All epoch statistics accumulate on-device; host conversion
+        # happens once at the end, so the batch loop issues zero
+        # cudaStreamSynchronize calls beyond the ones autocast already
+        # needs for grad updates.
+        tot_loss_t = torch.zeros((), device=device)
+        tot_n = 0
+        correct = defaultdict(lambda: torch.zeros((), device=device))
+        total = defaultdict(lambda: torch.zeros((), device=device))
+        frac_err = torch.zeros((), device=device)
+        frac_n = torch.zeros((), device=device)
+        bnd_ok = torch.zeros((), device=device)
+        bnd_n = torch.zeros((), device=device)
+        off_err = torch.zeros((), device=device)
+        off_n = torch.zeros((), device=device)
         for x, y, yc in loader:
             if isinstance(x, dict):
                 x = {kk: v.to(device) for kk, v in x.items()}
@@ -1520,7 +1541,7 @@ def main():
                     if args.flat_prior_tau > 0:
                         for t in cls_targets:
                             logits[t] = logits[t] + args.flat_prior_tau \
-                                * flat_priors[t].to(device)
+                                * flat_priors_dev[t]
                     # skip heads whose batch labels are all masked —
                     # cross_entropy(ignore_index=0) returns NaN there (val
                     # batches whose rank labels are entirely out-of-vocab)
@@ -1570,9 +1591,7 @@ def main():
                                 F.binary_cross_entropy_with_logits(
                                     logits["struct_flags"][sm],
                                     ya[sm, 5:9],
-                                    pos_weight=torch.tensor(
-                                        [5., 5., 8., 8.],
-                                        device=device)))
+                                    pos_weight=struct_pos_w))
                     if "domains" in logits:
                         dm = ya[:, -1] >= 0
                         if dm.any():
@@ -1598,31 +1617,43 @@ def main():
                 loss.backward()
                 opt.step()
                 sched.step()
-            tot_loss += loss.item() * len(x)
-            tot_n += len(x)
-            for i, t in enumerate(cls_targets):
-                m = y[:, i] != 0  # unknown/NA labels excluded from accuracy
-                total[t] += int(m.sum())
-                correct[t] += int((logits[t].argmax(1)[m]
-                                   == y[:, i][m]).sum())
-            if fm.any():
-                p_frac = torch.sigmoid(logits["coding_frac"][:, 0][fm])
-                frac_err += float((p_frac - yc[fm, 0]).detach().abs().sum())
-                frac_n += int(fm.sum())
-                p_bnd = torch.sigmoid(logits["boundary"][:, 0][fm]) > 0.5
-                bnd_ok += int((p_bnd == btgt[fm].bool()).sum())
-                bnd_n += int(fm.sum())
-            if om.any():
-                p_off = torch.sigmoid(logits["offset"][:, 0][om])
-                off_err += float((p_off - yc[om, 1]).detach().abs().sum())
-                off_n += int(om.sum())
-        accs = {t: correct[t] / max(total[t], 1) for t in cls_targets}
+            # Batch size from y: x may be a dict (len() would count
+            # keys, not samples).
+            bsz = y.size(0)
+            tot_loss_t += loss.detach() * bsz
+            tot_n += bsz
+            if not train:
+                # Per-rank accuracies + annotation extras are only
+                # consumed by the caller on the val pass — computing
+                # them in train mode wastes a full argmax over the
+                # 12k-class species head per batch and forces host
+                # syncs the training loop never uses.
+                for i, t in enumerate(cls_targets):
+                    m = y[:, i] != 0  # unknown/NA labels excluded
+                    total[t] += m.sum()
+                    correct[t] += (logits[t].argmax(1)[m]
+                                   == y[:, i][m]).sum()
+                if fm.any():
+                    p_frac = torch.sigmoid(logits["coding_frac"][:, 0][fm])
+                    frac_err += (p_frac - yc[fm, 0]).detach().abs().sum()
+                    frac_n += fm.sum()
+                    p_bnd = torch.sigmoid(logits["boundary"][:, 0][fm]) > 0.5
+                    bnd_ok += (p_bnd == btgt[fm].bool()).sum()
+                    bnd_n += fm.sum()
+                if om.any():
+                    p_off = torch.sigmoid(logits["offset"][:, 0][om])
+                    off_err += (p_off - yc[om, 1]).detach().abs().sum()
+                    off_n += om.sum()
+        if train:
+            return float(tot_loss_t) / max(tot_n, 1), {}, {}
+        accs = {t: (float(correct[t]) / max(float(total[t]), 1))
+                for t in cls_targets}
         extras = {
-            "frac_mae": frac_err / max(frac_n, 1),
-            "boundary_acc": bnd_ok / max(bnd_n, 1),
-            "offset_mae": off_err / max(off_n, 1),
+            "frac_mae": float(frac_err) / max(float(frac_n), 1),
+            "boundary_acc": float(bnd_ok) / max(float(bnd_n), 1),
+            "offset_mae": float(off_err) / max(float(off_n), 1),
         }
-        return tot_loss / max(tot_n, 1), accs, extras
+        return float(tot_loss_t) / max(tot_n, 1), accs, extras
 
     best = 0.0
     for ep in range(1, args.epochs + 1):
@@ -1634,25 +1665,34 @@ def main():
         print(f"ep {ep:03d} train {tr_loss:.4f} val {va_loss:.4f} | "
               f"{msg} | {xmsg} | {time.time()-t0:.0f}s")
         mean_acc = float(np.mean(list(accs.values())))
+        ckpt = {"model": model.state_dict(), "vocab": vocab,
+                "k": args.k, "targets": all_targets, "epoch": ep,
+                "val_mean_acc": mean_acc,
+                "args": {k: str(v) if isinstance(v, Path) else v
+                         for k, v in vars(args).items()}}
+        # parent_of + flat priors are saved for every head so
+        # eval_pilot can do cross-rank tree reconciliation and
+        # prior diagnostics without rebuilding them from labels.tsv
+        ckpt["tree"] = {
+            "parent_of": {r: tree["parent_of"][r].tolist()
+                          for r in cls_targets},
+            "log_prior": {r: tree["log_prior"][r].tolist()
+                          for r in cls_targets}}
+        ckpt["flat_log_prior"] = {
+            r: flat_priors[r].tolist() for r in cls_targets}
+        if domain_vocab:
+            ckpt["domain_vocab"] = domain_vocab
+        # Atomic per-epoch checkpoint: if the kernel is killed mid-save
+        # (Kaggle 12h cap), last.pt still holds the previous complete
+        # epoch rather than a truncated file.
+        tmp_ck = args.out / "last.pt.tmp"
+        torch.save(ckpt, tmp_ck)
+        tmp_ck.replace(args.out / "last.pt")
         if mean_acc > best:
             best = mean_acc
-            ckpt = {"model": model.state_dict(), "vocab": vocab,
-                    "k": args.k, "targets": all_targets,
-                    "args": {k: str(v) if isinstance(v, Path) else v
-                             for k, v in vars(args).items()}}
-            # parent_of + flat priors are saved for every head so
-            # eval_pilot can do cross-rank tree reconciliation and
-            # prior diagnostics without rebuilding them from labels.tsv
-            ckpt["tree"] = {
-                "parent_of": {r: tree["parent_of"][r].tolist()
-                              for r in cls_targets},
-                "log_prior": {r: tree["log_prior"][r].tolist()
-                              for r in cls_targets}}
-            ckpt["flat_log_prior"] = {
-                r: flat_priors[r].tolist() for r in cls_targets}
-            if domain_vocab:
-                ckpt["domain_vocab"] = domain_vocab
-            torch.save(ckpt, args.out / "best.pt")
+            tmp_ck = args.out / "best.pt.tmp"
+            torch.save(ckpt, tmp_ck)
+            tmp_ck.replace(args.out / "best.pt")
     (args.out / "vocab.json").write_text(json.dumps(vocab, indent=1))
     print(f"done. best mean val acc {best:.3f} -> {args.out}/best.pt")
 

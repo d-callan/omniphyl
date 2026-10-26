@@ -289,7 +289,7 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 # the corpus is a mounted dir outside WORKDIR.  screened outputs land under
 # corpus/ (fresh) or screened/ (mounted).  Bundle whatever exists.
 cd "$WORKDIR"
-BUNDLE_FILES="run/best.pt run/eval"
+BUNDLE_FILES="run/best.pt run/last.pt run/eval"
 for d in corpus screened; do
     for f in fragments.fna fragments.fna.idx.json labels.tsv skipped.tsv \
              manifest.json fragments_screened.fna \

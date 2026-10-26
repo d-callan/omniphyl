@@ -64,8 +64,11 @@ os.environ.setdefault("WD", "1e-2")
 os.environ.setdefault("VAL_FRAC", "0.05")
 os.environ.setdefault("HOLDOUT_GENUS_FRAC", "0.02")
 # --- v5 main-run schedule ----------------------------------------------
+# 8 epochs: at ~2.1h/epoch (pre-speedup) 15 epochs cannot finish inside
+# the 12h session cap; last.pt is saved atomically every epoch so a
+# late cancellation still yields a usable checkpoint.
 os.environ.setdefault("WIDTH", "64")
-os.environ.setdefault("EPOCHS", "15")
+os.environ.setdefault("EPOCHS", "8")
 os.environ.setdefault("CACHE_SEQS", "1")
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 

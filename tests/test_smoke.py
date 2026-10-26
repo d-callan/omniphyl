@@ -881,13 +881,20 @@ def test_end_to_end():
     check("train exits 0", r.returncode == 0,
           r.stderr.strip().splitlines()[-1] if r.returncode else "")
     ckpts = list(out.glob("*.pt")) + list(out.glob("*.pth"))
-    check("checkpoint written", len(ckpts) == 1,
+    check("checkpoints written (best.pt + last.pt)",
+          {p.name for p in ckpts} == {"best.pt", "last.pt"},
           [p.name for p in ckpts])
     if not ckpts:
         print(r.stdout[-2000:], r.stderr[-2000:])
         return
     import torch
-    ck = torch.load(ckpts[0], map_location="cpu", weights_only=False)
+    ck_last = torch.load(out / "last.pt", map_location="cpu",
+                         weights_only=False)
+    check("last.pt carries epoch + val_mean_acc",
+          ck_last.get("epoch") == 2 and "val_mean_acc" in ck_last,
+          {k: ck_last.get(k) for k in ("epoch", "val_mean_acc")})
+    ck = torch.load(out / "best.pt", map_location="cpu",
+                    weights_only=False)
     check("checkpoint has all targets",
           set(ck["targets"]) == set(RANKS) | set(CONT_TARGETS),
           ck["targets"])
@@ -901,7 +908,7 @@ def test_end_to_end():
     ev = tmp / "eval"
     r = subprocess.run(
         [sys.executable, str(SCRIPTS / "eval_pilot.py"),
-         "--model", str(ckpts[0]), "--labels", str(lab),
+         "--model", str(out / "best.pt"), "--labels", str(lab),
          "--fragments", str(fna), "--outdir", str(ev),
          "--num-workers", "0", "--cpu"],
         capture_output=True, text=True, timeout=600)
@@ -955,9 +962,10 @@ def test_end_to_end():
     check("annot train exits 0", r.returncode == 0,
           r.stderr.strip().splitlines()[-1] if r.returncode else "")
     ckpts_a = list(out_a.glob("*.pt"))
-    if ckpts_a and r.returncode == 0:
+    ck_a = out_a / "best.pt"
+    if ck_a.exists() and r.returncode == 0:
         import torch
-        cka = torch.load(ckpts_a[0], map_location="cpu",
+        cka = torch.load(ck_a, map_location="cpu",
                          weights_only=False)
         check("annot ckpt has the three head groups",
               "heads.region_fracs.weight" in cka["model"] and
@@ -971,7 +979,7 @@ def test_end_to_end():
         ev_a = tmp / "eval_annot"
         r = subprocess.run(
             [sys.executable, str(SCRIPTS / "eval_pilot.py"),
-             "--model", str(ckpts_a[0]), "--labels", str(lab),
+             "--model", str(ck_a), "--labels", str(lab),
              "--fragments", str(fna), "--outdir", str(ev_a),
              "--num-workers", "0", "--cpu"],
             capture_output=True, text=True, timeout=600)
@@ -1019,9 +1027,10 @@ def test_end_to_end():
     check("gated train exits 0", r.returncode == 0,
           r.stderr.strip().splitlines()[-1] if r.returncode else "")
     ckpts_g = list(out_g.glob("*.pt"))
-    if ckpts_g and r.returncode == 0:
+    ck_g = out_g / "best.pt"
+    if ck_g.exists() and r.returncode == 0:
         import torch
-        ckg = torch.load(ckpts_g[0], map_location="cpu",
+        ckg = torch.load(ck_g, map_location="cpu",
                          weights_only=False)
         check("gated ckpt has gate + dna coding head params",
               "aa_gate.weight" in ckg["model"] and
@@ -1032,7 +1041,7 @@ def test_end_to_end():
         ev_g = tmp / "eval_gated"
         r = subprocess.run(
             [sys.executable, str(SCRIPTS / "eval_pilot.py"),
-             "--model", str(ckpts_g[0]), "--labels", str(lab),
+             "--model", str(ck_g), "--labels", str(lab),
              "--fragments", str(fna), "--outdir", str(ev_g),
              "--num-workers", "0", "--cpu"],
             capture_output=True, text=True, timeout=600)
@@ -1055,9 +1064,10 @@ def test_end_to_end():
     check("annot-ctx train exits 0", r.returncode == 0,
           r.stderr.strip().splitlines()[-1] if r.returncode else "")
     ckpts_c = list(out_c.glob("*.pt"))
-    if ckpts_c and r.returncode == 0:
+    ck_c = out_c / "best.pt"
+    if ck_c.exists() and r.returncode == 0:
         import torch
-        ckc = torch.load(ckpts_c[0], map_location="cpu",
+        ckc = torch.load(ck_c, map_location="cpu",
                          weights_only=False)
         check("annot-ctx ckpt uses detached-ctx head modules",
               "head_region.weight" in ckc["model"] and
@@ -1070,7 +1080,7 @@ def test_end_to_end():
         ev_c = tmp / "eval_annot_ctx"
         r = subprocess.run(
             [sys.executable, str(SCRIPTS / "eval_pilot.py"),
-             "--model", str(ckpts_c[0]), "--labels", str(lab),
+             "--model", str(ck_c), "--labels", str(lab),
              "--fragments", str(fna), "--outdir", str(ev_c),
              "--num-workers", "0", "--cpu"],
             capture_output=True, text=True, timeout=600)
