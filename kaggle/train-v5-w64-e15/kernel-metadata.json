@@ -7,7 +7,7 @@
   "is_private": true,
   "enable_gpu": true,
   "enable_internet": true,
-  "dataset_sources": ["daniellecallan/omniphyl-v5-20k"],
+  "dataset_sources": ["daniellecallan/omniphyl-v6"],
   "competition_sources": [],
   "kernel_sources": []
 }
