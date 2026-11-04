@@ -1,0 +1,13 @@
+{
+  "id": "daniellecallan/omniphyl-e3-base",
+  "title": "omniphyl-e3-base",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["daniellecallan/omniphyl-5group-annot-mini"],
+  "competition_sources": [],
+  "kernel_sources": []
+}

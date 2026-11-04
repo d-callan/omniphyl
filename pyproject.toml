@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omniphyl"
+version = "0.1.0"
+description = "Reference-free taxonomic & functional profiling and clade-agnostic genome annotation with multi-scale FCGR networks"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.23",
+    "torch>=2.0",
+]
+
+[project.scripts]
+omniphyl = "omniphyl.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

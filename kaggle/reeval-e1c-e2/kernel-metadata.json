@@ -1,0 +1,15 @@
+{
+  "id": "daniellecallan/omniphyl-reeval-e1c-e2",
+  "title": "omniphyl-reeval-e1c-e2",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "daniellecallan/omniphyl-pilot-checkpoints"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

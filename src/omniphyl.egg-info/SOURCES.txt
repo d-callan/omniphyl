@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+src/omniphyl/__init__.py
+src/omniphyl/__main__.py
+src/omniphyl/annotate.py
+src/omniphyl/cli.py
+src/omniphyl/encode.py
+src/omniphyl/io.py
+src/omniphyl/model.py
+src/omniphyl/profile.py
+src/omniphyl.egg-info/PKG-INFO
+src/omniphyl.egg-info/SOURCES.txt
+src/omniphyl.egg-info/dependency_links.txt
+src/omniphyl.egg-info/entry_points.txt
+src/omniphyl.egg-info/requires.txt
+src/omniphyl.egg-info/top_level.txt
+tests/test_smoke.py

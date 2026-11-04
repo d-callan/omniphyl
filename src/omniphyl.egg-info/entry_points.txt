@@ -1,0 +1,2 @@
+[console_scripts]
+omniphyl = omniphyl.cli:main
