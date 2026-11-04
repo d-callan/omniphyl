@@ -27,3 +27,4 @@ eval_report.md
 # conventional output dirs
 data/
 runs/
+*.egg-info/
