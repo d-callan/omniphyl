@@ -85,6 +85,11 @@ def _annotate_parser(sub):
     dec.add_argument("--domain-threshold", type=float, default=0.5)
     dec.add_argument("--min-intron", type=int, default=35)
     dec.add_argument("--max-intron", type=int, default=5000)
+    dec.add_argument("--ablate", default="",
+                     help="comma-separated evidence streams to disable "
+                          "post-aggregation (contribution audit): "
+                          "frame,flags,region,coding,boundary,evidence,"
+                          "domains")
     return ap
 
 
@@ -143,6 +148,7 @@ def main(argv=None) -> int:
             evidence_weight=args.evidence_weight,
             kingdom=args.kingdom, genetic_code=args.genetic_code,
             min_cds_len=args.min_cds_len,
+            ablate=args.ablate,
             coding_threshold=args.coding_threshold,
             boundary_threshold=args.boundary_threshold,
             domain_threshold=args.domain_threshold,

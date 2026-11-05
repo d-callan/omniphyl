@@ -27,6 +27,21 @@ FLAG_NAMES = ("start", "stop", "donor", "acceptor")
 
 _CODE4_STOPS = {"TAA", "TAG"}  # TGA->Trp in genetic code 4
 
+# Evidence streams that --ablate can disable to audit each head's
+# contribution to decoded output. Track streams are zeroed on the fused
+# ContigResult post-aggregation (the decoder then falls back to simpler
+# signals, e.g. p_region[:,0] -> p_coding); "evidence" skips LexicMap
+# loading entirely and "domains" skips per-gene domain assignment.
+ABLATE_FIELDS = {
+    "frame": ("p_frame",),
+    "flags": ("b_tracks",),
+    "region": ("p_region",),
+    "coding": ("p_coding",),
+    "boundary": ("p_boundary",),
+    "evidence": (),
+    "domains": (),
+}
+
 
 @dataclass
 class ContigResult:
@@ -82,6 +97,7 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
                  domain_threshold: float = 0.5,
                  conf_tau: float = 0.5, anc_tau: float = 0.2,
                  min_intron: int = 35, max_intron: int = 5000,
+                 ablate: str = "",
                  verbose: bool = True) -> dict:
     """Full annotate pipeline; writes all outputs, returns report dict."""
     out_prefix = Path(out_prefix)
@@ -94,6 +110,12 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
     # resolves boundary impulses and run edges more sharply.
     B = int(bin_width) if bin_width else math.gcd(S, 50)
     w_ev = float(evidence_weight)
+    abl = {s.strip() for s in ablate.split(",") if s.strip()}
+    unknown = abl - ABLATE_FIELDS.keys()
+    if unknown:
+        raise ValueError(
+            f"unknown ablate stream(s) {sorted(unknown)}; "
+            f"choose from {sorted(ABLATE_FIELDS)}")
 
     contigs = [(i, s, c) for i, s, c in iter_sequences(Path(fasta_path))]
     if verbose:
@@ -118,7 +140,8 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
 
     # ---------------- Step 3 (early load): LexicMap evidence ---------------
     evidence: dict[str, ContigEvidence] = {}
-    if lexicmap_bed or lexicmap_bedgraph or lexicmap_tsv:
+    if ((lexicmap_bed or lexicmap_bedgraph or lexicmap_tsv)
+            and "evidence" not in abl):
         evidence = load_lexicmap_evidence(
             bed_path=lexicmap_bed, bedgraph_path=lexicmap_bedgraph,
             tsv_path=lexicmap_tsv, source=lexicmap_source,
@@ -138,88 +161,15 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
         logp_by_contig[ci].append(wi)
 
     for ci, (cid, seq, cov) in enumerate(contigs):
-        L = len(seq)
-        nbins = max(1, math.ceil(L / B))
-        wsum = np.full(nbins, 1e-9, np.float64)
-        p_region = np.zeros((nbins, 4), np.float64)
-        p_frame = np.zeros((nbins, 8), np.float64)
-        p_coding = np.zeros(nbins, np.float64)
-        p_boundary = np.zeros(nbins, np.float64)
-        b_tracks = np.zeros((nbins, 4), np.float64)
-        for wi in logp_by_contig[ci]:
-            _ci, a, wl = win_meta[wi]
-            x = (np.arange(nbins) * B + B / 2 - a) / wl
-            u = 0.1 + 0.9 * np.sin(np.pi * np.clip(x, 0, 1)) ** 2
-            u = np.where((x >= 0) & (x <= 1), u, 0.0)
-            if not u.any():
-                continue
-            wsum += u
-            p_coding += u * bp.coding_frac[wi]
-            p_boundary += u * bp.boundary[wi]
-            if bp.region_fracs is not None:
-                p_region += u[:, None] * bp.region_fracs[wi]
-            else:
-                p_region[:, 0] += u * bp.coding_frac[wi]
-                p_region[:, 3] += u * (1 - bp.coding_frac[wi])
-            if bp.active_frame is not None:
-                # window-local frames -> contig-global frame ids.
-                # fwd f: g = (a + f) % 3
-                # rev f: g = 3 + ((a + wl - (f-3)) % 3)
-                row = bp.active_frame[wi]
-                gmap = [(a + f) % 3 for f in range(3)] + [
-                    3 + ((a + wl - r) % 3) for r in range(3)]
-                for f, g in enumerate(gmap):
-                    p_frame[:, g] += u * row[f]
-                p_frame[:, 6] += u * row[6]
-                p_frame[:, 7] += u * row[7]
-                if bp.struct_flags is not None:
-                    fl = bp.struct_flags[wi]
-                    xhat = a + bp.offset[wi] * wl
-                    # gaussian impulse, sigma=35 bp. Strand-awareness lives
-                    # at decode time: track idx 2 is the splice donor on +
-                    # and the acceptor on - (and vice-versa for idx 3).
-                    dist = np.arange(nbins) * B + B / 2 - xhat
-                    imp = (np.exp(-0.5 * (dist / 35.0) ** 2)
-                           * bp.boundary[wi])
-                    b_tracks += imp[:, None] * fl
-        p_region /= wsum[:, None]
-        p_frame /= wsum[:, None]
-        p_coding /= wsum
-        p_boundary /= wsum
-        # evidence fusion
-        ev = evidence.get(cid)
-        dtilde = np.zeros(nbins, np.float64)
-        e_lex = np.zeros(nbins, np.float64)
-        if ev is not None:
-            d = ev.density[:nbins]
-            if len(d) < nbins:
-                d = np.pad(d, (0, nbins - len(d)))
-            l1p = np.log1p(d)
-            p90 = np.percentile(l1p[l1p > 0], 90) if (l1p > 0).any() else 1
-            dtilde = np.minimum(1.0, l1p / max(p90, 1.0))
-            # repeat damper: high depth + low model evidence -> cap
-            med = np.median(d[d > 0]) if (d > 0).any() else 0
-            if med > 0:
-                p_crna = (p_region[:, 0]
-                          + (p_region[:, 2] if bp.region_fracs is not None
-                             else 0.0))
-                damp = (d > 10 * med) & (p_crna < 0.35)
-                dtilde = np.where(damp, np.minimum(dtilde, 0.15), dtilde)
-            if lexicmap_source == "rnaseq" and ev.endpoints is not None:
-                e_lex = ev.endpoints[:nbins]
-                if len(e_lex) < nbins:
-                    e_lex = np.pad(e_lex, (0, nbins - len(e_lex)))
-                # transcript endpoints are junction candidates on both
-                # splice tracks; motif+phase validation sorts out which
-                # side is donor vs acceptor
-                b_tracks[:, 2] += e_lex
-                b_tracks[:, 3] += e_lex
-        results.append(ContigResult(
-            contig=cid, length=L, n_bins=nbins, bin_width=B,
-            p_region=p_region, p_frame=p_frame,
-            b_tracks=b_tracks, p_boundary=p_boundary,
-            p_coding=p_coding, dtilde=dtilde, e_lex=e_lex,
-            n_windows=len(logp_by_contig[ci])))
+        res = _fuse_contig(cid, len(seq), logp_by_contig[ci], win_meta,
+                           bp, B, evidence.get(cid), lexicmap_source)
+        res.n_windows = len(logp_by_contig[ci])
+        results.append(res)
+
+    # ablation: zero fused tracks so the decoder falls back to simpler
+    # signals (ABLATE_FIELDS). "evidence"/"domains" were handled above
+    # and below, not by zeroing a track.
+    _apply_ablate(results, abl)
 
     # ---------------- Step 4a: taxonomy calls -------------------------------
     def _pooled_call(idxs):
@@ -344,6 +294,112 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
     report = _write_outputs(out_prefix, results, contigs, genome_call,
                             gcode, w_ev, lexicmap_source, verbose)
     return report
+
+
+# ------------------------------------------------------- aggregation ----
+
+
+def _fuse_contig(cid: str, L: int, win_idx: list[int],
+                 win_meta: list[tuple], bp, B: int, ev,
+                 lexicmap_source: str) -> ContigResult:
+    """Fuse per-window head outputs onto fixed-width contig bins.
+
+    Raised-cosine weights u(x) spread each window's votes over the span
+    it covers; window-local active-frame classes are remapped to
+    contig-global frame ids (fwd f -> (a+f)%3; rev r ->
+    3+((a+wl-r)%3), matching the label convention in
+    fetch_refseq_corpus.cds_frame); struct_flags are placed as
+    gaussian impulses at the predicted boundary offset xhat. Optional
+    LexicMap evidence adds a normalized coverage track (dtilde) and
+    endpoint impulses on the splice tracks.
+    """
+    nbins = max(1, math.ceil(L / B))
+    wsum = np.full(nbins, 1e-9, np.float64)
+    p_region = np.zeros((nbins, 4), np.float64)
+    p_frame = np.zeros((nbins, 8), np.float64)
+    p_coding = np.zeros(nbins, np.float64)
+    p_boundary = np.zeros(nbins, np.float64)
+    b_tracks = np.zeros((nbins, 4), np.float64)
+    for wi in win_idx:
+        _ci, a, wl = win_meta[wi]
+        x = (np.arange(nbins) * B + B / 2 - a) / wl
+        u = 0.1 + 0.9 * np.sin(np.pi * np.clip(x, 0, 1)) ** 2
+        u = np.where((x >= 0) & (x <= 1), u, 0.0)
+        if not u.any():
+            continue
+        wsum += u
+        p_coding += u * bp.coding_frac[wi]
+        p_boundary += u * bp.boundary[wi]
+        if bp.region_fracs is not None:
+            p_region += u[:, None] * bp.region_fracs[wi]
+        else:
+            p_region[:, 0] += u * bp.coding_frac[wi]
+            p_region[:, 3] += u * (1 - bp.coding_frac[wi])
+        if bp.active_frame is not None:
+            # window-local frames -> contig-global frame ids.
+            # fwd f: g = (a + f) % 3
+            # rev f: g = 3 + ((a + wl - (f-3)) % 3)
+            row = bp.active_frame[wi]
+            gmap = [(a + f) % 3 for f in range(3)] + [
+                3 + ((a + wl - r) % 3) for r in range(3)]
+            for f, g in enumerate(gmap):
+                p_frame[:, g] += u * row[f]
+            p_frame[:, 6] += u * row[6]
+            p_frame[:, 7] += u * row[7]
+            if bp.struct_flags is not None:
+                fl = bp.struct_flags[wi]
+                xhat = a + bp.offset[wi] * wl
+                # gaussian impulse, sigma=35 bp. Strand-awareness lives
+                # at decode time: track idx 2 is the splice donor on +
+                # and the acceptor on - (and vice-versa for idx 3).
+                dist = np.arange(nbins) * B + B / 2 - xhat
+                imp = (np.exp(-0.5 * (dist / 35.0) ** 2)
+                       * bp.boundary[wi])
+                b_tracks += imp[:, None] * fl
+    p_region /= wsum[:, None]
+    p_frame /= wsum[:, None]
+    p_coding /= wsum
+    p_boundary /= wsum
+    # evidence fusion
+    dtilde = np.zeros(nbins, np.float64)
+    e_lex = np.zeros(nbins, np.float64)
+    if ev is not None:
+        d = ev.density[:nbins]
+        if len(d) < nbins:
+            d = np.pad(d, (0, nbins - len(d)))
+        l1p = np.log1p(d)
+        p90 = np.percentile(l1p[l1p > 0], 90) if (l1p > 0).any() else 1
+        dtilde = np.minimum(1.0, l1p / max(p90, 1.0))
+        # repeat damper: high depth + low model evidence -> cap
+        med = np.median(d[d > 0]) if (d > 0).any() else 0
+        if med > 0:
+            p_crna = (p_region[:, 0]
+                      + (p_region[:, 2] if bp.region_fracs is not None
+                         else 0.0))
+            damp = (d > 10 * med) & (p_crna < 0.35)
+            dtilde = np.where(damp, np.minimum(dtilde, 0.15), dtilde)
+        if lexicmap_source == "rnaseq" and ev.endpoints is not None:
+            e_lex = ev.endpoints[:nbins]
+            if len(e_lex) < nbins:
+                e_lex = np.pad(e_lex, (0, nbins - len(e_lex)))
+            # transcript endpoints are junction candidates on both
+            # splice tracks; motif+phase validation sorts out which
+            # side is donor vs acceptor
+            b_tracks[:, 2] += e_lex
+            b_tracks[:, 3] += e_lex
+    return ContigResult(
+        contig=cid, length=L, n_bins=nbins, bin_width=B,
+        p_region=p_region, p_frame=p_frame,
+        b_tracks=b_tracks, p_boundary=p_boundary,
+        p_coding=p_coding, dtilde=dtilde, e_lex=e_lex)
+
+
+def _apply_ablate(results: list[ContigResult], abl: set):
+    """Zero fused tracks for each ablated stream (ABLATE_FIELDS)."""
+    for res in results:
+        for s in abl:
+            for attr in ABLATE_FIELDS[s]:
+                getattr(res, attr)[:] = 0.0
 
 
 # ---------------------------------------------------------- Stage-2 ------

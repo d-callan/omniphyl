@@ -16,6 +16,7 @@ Runs scripts/eval_pilot.py across:
 import glob
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys

@@ -590,6 +590,119 @@ def test_hint_rescues_weak_partner_exon():
                   for g in plus), genes)
 
 
+def _mk_bp(n, **kw):
+    """Fake predict_sequences namespace for _fuse_contig tests."""
+    from types import SimpleNamespace
+    d = dict(coding_frac=np.zeros(n), boundary=np.zeros(n),
+             offset=np.zeros(n), region_fracs=np.zeros((n, 4)),
+             active_frame=np.zeros((n, 8)),
+             struct_flags=np.zeros((n, 4)), domains=None)
+    d.update(kw)
+    return SimpleNamespace(**d)
+
+
+def test_fuse_cosine_support():
+    """Bins outside every window span get zero; covered bins normalize."""
+    from omniphyl.annotate import _fuse_contig
+    L, B = 1000, 50
+    win_meta = [(0, 100, 500)]           # window covers [100, 600)
+    bp = _mk_bp(1, coding_frac=np.array([0.6]))
+    res = _fuse_contig("c", L, [0], win_meta, bp, B, None, "rnaseq")
+    check("bin before window = 0", res.p_coding[0] == 0)
+    check("bin after window = 0", res.p_coding[12] == 0)
+    check("interior bin normalized", abs(res.p_coding[4] - 0.6) < 1e-6,
+          res.p_coding[4])
+
+
+def test_fuse_fwd_frame_remap():
+    """Different window-local fwd frames referring to the SAME
+    contig-global frame must land in the same p_frame column."""
+    from omniphyl.annotate import _fuse_contig
+    L, B = 1000, 50
+    # win0: a=100, local f=0 -> global g = 100%3 = 1
+    # win1: a=101, local f=2 -> global g = 103%3 = 1
+    win_meta = [(0, 100, 500), (0, 101, 500)]
+    af = np.zeros((2, 8))
+    af[0, 0] = 1.0
+    af[1, 2] = 1.0
+    bp = _mk_bp(2, active_frame=af, struct_flags=None)
+    res = _fuse_contig("c", L, [0, 1], win_meta, bp, B, None, "rnaseq")
+    # bins covered by both windows: all fwd mass in global col 1
+    b = 4
+    check("fwd mass in global col 1", abs(res.p_frame[b, 1] - 1.0) < 1e-6,
+          res.p_frame[b, :6])
+    check("no fwd leakage", res.p_frame[b, [0, 2, 3, 4, 5]].sum() == 0)
+
+
+def test_fuse_rev_frame_remap():
+    """Minus-strand remap matches the corpus label convention: a minus
+    codon occupying genomic [x, x+3) in a window [a, a+wl) is labelled
+    r = (a+wl-(x+3)) % 3 (cds_frame) and must land in global col
+    3 + x%3 (the decode/_scan_codons convention)."""
+    from omniphyl.annotate import _fuse_contig
+    L, B = 1000, 50
+    a, wl = 10, 500                        # a + wl = 510
+    win_meta = [(0, a, wl)]
+    for x in (200, 201):
+        r = (a + wl - (x + 3)) % 3         # per-fragment label frame
+        af = np.zeros((1, 8))
+        af[0, 3 + r] = 1.0
+        bp = _mk_bp(1, active_frame=af, struct_flags=None)
+        res = _fuse_contig("c", L, [0], win_meta, bp, B, None, "rnaseq")
+        g_exp = 3 + x % 3
+        b = x // B                         # interior bin containing x
+        check(f"rev x={x} -> col {g_exp}",
+              abs(res.p_frame[b, g_exp] - 1.0) < 1e-6,
+              res.p_frame[b, :6])
+        check(f"rev x={x} no leakage",
+              res.p_frame[b, [g for g in range(6)
+                              if g != g_exp]].sum() == 0)
+
+
+def test_fuse_impulse_placement():
+    """struct_flags impulse is placed at a + offset*wl, scaled by the
+    window's boundary prob, on the flagged channel only."""
+    from omniphyl.annotate import _fuse_contig
+    L, B = 1000, 50
+    win_meta = [(0, 0, 500)]
+    bp = _mk_bp(1, boundary=np.array([0.8]), offset=np.array([0.5]),
+                region_fracs=None, active_frame=np.ones((1, 8)),
+                struct_flags=np.array([[1.0, 0, 0, 0]]))
+    res = _fuse_contig("c", L, [0], win_meta, bp, B, None, "rnaseq")
+    # xhat = 250; nearest bin centers 225 (b4) / 275 (b5)
+    exp = 0.8 * np.exp(-0.5 * (25 / 35.0) ** 2)
+    check("impulse peak bin", int(np.argmax(res.b_tracks[:, 0])) in (4, 5))
+    check("impulse magnitude",
+          abs(res.b_tracks[4, 0] - exp) < 0.01,
+          res.b_tracks[4, 0])
+    check("only start channel", res.b_tracks[:, 1:].sum() == 0)
+
+
+def test_fuse_region_fallback():
+    """Without a region head, p_region falls back to coding/intergenic."""
+    from omniphyl.annotate import _fuse_contig
+    L, B = 1000, 50
+    win_meta = [(0, 0, 500)]
+    bp = _mk_bp(1, coding_frac=np.array([0.7]), region_fracs=None,
+                active_frame=None)
+    res = _fuse_contig("c", L, [0], win_meta, bp, B, None, "rnaseq")
+    b = 4
+    check("region[0] = coding", abs(res.p_region[b, 0] - 0.7) < 1e-6)
+    check("region[3] = 1-coding", abs(res.p_region[b, 3] - 0.3) < 1e-6)
+    check("intron/rna zero", res.p_region[b, 1:3].sum() == 0)
+
+
+def test_apply_ablate():
+    """_apply_ablate zeroes only the named tracks."""
+    from omniphyl.annotate import _apply_ablate
+    res = _mk_result(1000, 50, coding=[(0, 20, 0.8)],
+                     frame=[(0, 20, 0, 0.9)], btr=[(0, 20, 0, 0.5)])
+    _apply_ablate([res], {"frame", "flags"})
+    check("p_frame zeroed", res.p_frame.sum() == 0)
+    check("b_tracks zeroed", res.b_tracks.sum() == 0)
+    check("p_region kept", res.p_region[:, 0].sum() > 0)
+
+
 def test_annotate_e2e():
     print("[annotate e2e]")
     with tempfile.TemporaryDirectory() as td:
@@ -634,6 +747,9 @@ def main():
            test_softmasked_decode_and_evidence,
            test_splice_acceptor_snapping,
            test_hint_rescues_weak_partner_exon,
+           test_fuse_cosine_support, test_fuse_fwd_frame_remap,
+           test_fuse_rev_frame_remap, test_fuse_impulse_placement,
+           test_fuse_region_fallback, test_apply_ablate,
            test_annotate_e2e]
     for f in fns:
         f()
