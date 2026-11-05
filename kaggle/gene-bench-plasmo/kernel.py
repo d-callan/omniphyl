@@ -8,8 +8,8 @@ scripts/eval_genes.py.
 
 Predictors:
   - OmniPhyl v6 w32 + w64, full model plus each --ablate stream
-  - Tiberius (closest available clade: Diatoms/Bacillariophyta; no
-    apicomplexan model exists)
+  - Tiberius (Fungi model — closest available clade; no apicomplexan
+    model exists)
   - ANNEVO (Zenodo precomputed predictions when the accession is in their
     566-assembly set, else local run with the Fungi lineage model; no
     apicomplexan lineage exists)
@@ -158,38 +158,91 @@ if ACC is None:
 print(f"benchmark genome: {ACC} ({SPECIES})", flush=True)
 out["genome"] = {"accession": ACC, "species": SPECIES}
 
-# VEuPathDB GTF via UCSC GenArk (same source as corpus labels tier 1),
-# seqids bridged chromAlias -> RefSeq names used in the FASTA.
-VEUP_GFF = DATA / "ref_veupathdb.gff"
-try:
-    from fetch_refseq_corpus import _ucsc_gtf_url, load_chrom_alias
-    url = _ucsc_gtf_url(ACC)
-    if url:
-        fetch(url, DATA / "veupath.gtf.gz")
-        aliases = load_chrom_alias(ACC, DATA)
-        n_bridged = n_lines = 0
-        with gzip.open(DATA / "veupath.gtf.gz", "rt") as fi, \
-                open(VEUP_GFF, "w") as fo:
-            fo.write("##gff-version 3\n")
-            for line in fi:
-                if line.startswith("#"):
+# Reference GFF priority: (a) VEuPathDB/PlasmoDB GFF3 direct download
+# (organism dir derived from species name; VEUPATHDB_API_KEY env honored
+# if present — VEuPathDB moved bulk downloads behind auth), (b) UCSC
+# GenArk veupathGenes GTF (VEuPathDB release-68 models, chromAlias
+# bridging to RefSeq seqids — same source as corpus tier-1 labels),
+# (c) RefSeq genomic.gff.
+VEUP_GFF = None
+
+
+def _veupath_slugs(species: str) -> list:
+    """'Plasmodium falciparum 3D7' -> plausible PlasmoDB dir names."""
+    parts = species.lower().split()
+    if len(parts) < 2 or parts[0] != "plasmodium":
+        return []
+    base = "p" + "".join(parts[1:])
+    # strain tokens keep their original case in dir names (3D7, ANKA, P01)
+    strain = parts[-1] if len(parts) > 2 else ""
+    core = "p" + parts[1]
+    return [base, core + strain.upper(), core + strain.capitalize(), core]
+
+
+VPDB_KEY = os.environ.get("VEUPATHDB_API_KEY", "")
+if not VPDB_KEY:
+    try:  # Kaggle "Add-ons > Secrets"
+        from kaggle_secrets import UserSecretsClient
+        VPDB_KEY = UserSecretsClient().get_secret("VEUPATHDB_API_KEY")
+    except Exception:
+        pass
+_headers = {"Authorization": f"Bearer {VPDB_KEY}"} if VPDB_KEY else {}
+for slug in _veupath_slugs(SPECIES):
+    for rel in (68, 69, 70, 71, 72):
+        for fname in (f"PlasmoDB-{rel}_{slug[0].upper()}{slug[1:]}.gff",
+                      f"PlasmoDB-{rel}_{slug[0].upper()}{slug[1:]}_GeneModel.gff"):
+            url = (f"https://plasmodb.org/common/downloads/release-{rel}/"
+                   f"{slug}/gff/data/{fname}")
+            try:
+                req = urllib.request.Request(url, headers=_headers)
+                r = urllib.request.urlopen(req, timeout=30)
+                if r.status != 200:
                     continue
-                c = line.rstrip("\n").split("\t")
-                if len(c) < 9:
-                    continue
-                grp = aliases.get(c[0], frozenset())
-                hit = next((a for a in grp if a.startswith("NC_")), None)
-                if hit:
-                    c[0] = hit
-                    n_bridged += 1
-                fo.write("\t".join(c) + "\n")
-                n_lines += 1
-        note("veupathdb_ref", f"ok ({n_bridged}/{n_lines} bridged)")
-    else:
-        note("veupathdb_ref", "skipped: no veupathGenes.gtf on hub")
-except Exception as e:
-    note("veupathdb_ref", f"failed: {e}")
-    VEUP_GFF = None
+                dest = DATA / "ref_veupathdb.gff"
+                dest.write_bytes(r.read())
+                if dest.stat().st_size > 10_000:
+                    VEUP_GFF = dest
+                    note("veupathdb_ref", f"ok (direct PlasmoDB r{rel})")
+                    break
+            except Exception:
+                continue
+        if VEUP_GFF:
+            break
+    if VEUP_GFF:
+        break
+
+if VEUP_GFF is None:
+    try:
+        from fetch_refseq_corpus import _ucsc_gtf_url, load_chrom_alias
+        url = _ucsc_gtf_url(ACC)
+        if url:
+            fetch(url, DATA / "veupath.gtf.gz")
+            aliases = load_chrom_alias(ACC, DATA)
+            n_bridged = n_lines = 0
+            dest = DATA / "ref_veupathdb.gff"
+            with gzip.open(DATA / "veupath.gtf.gz", "rt") as fi, \
+                    open(dest, "w") as fo:
+                fo.write("##gff-version 3\n")
+                for line in fi:
+                    if line.startswith("#"):
+                        continue
+                    c = line.rstrip("\n").split("\t")
+                    if len(c) < 9:
+                        continue
+                    grp = aliases.get(c[0], frozenset())
+                    hit = next((a for a in grp if a.startswith("NC_")), None)
+                    if hit:
+                        c[0] = hit
+                        n_bridged += 1
+                    fo.write("\t".join(c) + "\n")
+                    n_lines += 1
+            VEUP_GFF = dest
+            note("veupathdb_ref",
+                 f"ok (GenArk r68, {n_bridged}/{n_lines} bridged)")
+        else:
+            note("veupathdb_ref", "skipped: no veupathGenes.gtf on hub")
+    except Exception as e:
+        note("veupathdb_ref", f"failed: {e}")
 
 # ---------------- Step 3: pick region (chromosome with most CDS) ---------
 
@@ -276,7 +329,7 @@ for ck_name, ckpt in CKPTS.items():
         except Exception as e:
             note(tag, f"failed: {e}")
 
-# ---------------- Step 5: Tiberius (Diatoms clade — closest SAR) ---------
+# ---------------- Step 5: Tiberius (Fungi clade — closest available) ---
 
 try:
     if sys.version_info < (3, 12):
@@ -300,11 +353,11 @@ try:
             str(WORK / "Tiberius")])
         sh([tpy, "-m", "pip", "install", "-q", str(WORK / "Tiberius")])
 
-    # pick a clade cfg: prefer diatoms/bacillariophyta (SAR supergroup,
-    # closest to Apicomplexa among Tiberius's 7 clades), else fungi
+    # pick a clade cfg: Fungi first (user call — no protozoan model
+    # exists for either tool), then SAR/protist clades as fallback
     rc, cfgs = sh([tpy, str(WORK / "Tiberius/tiberius.py"), "--list_cfg"])
-    cand = [c for c in ("bacillariophyta", "diatoms", "chlorophyta",
-                        "fungi") if c in cfgs.lower()]
+    cand = [c for c in ("fungi", "bacillariophyta", "diatoms",
+                        "chlorophyta") if c in cfgs.lower()]
     if not cand:
         cand = ["fungi"]
     rc, tail = sh([tpy, str(WORK / "Tiberius/tiberius.py"),
