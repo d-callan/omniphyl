@@ -1009,6 +1009,11 @@ def test_end_to_end():
                 "val", {}).get("annot_heads", {}).get("region_fracs", {})
             check("intron-vs-intergenic AUROC emitted",
                   not rf or "intron_vs_intergenic_auroc" in rf, rf)
+            check("per_region breakdown + val_per_group emitted",
+                  "per_region" in rf and "val_per_group" in res and
+                  "binary_acc" in res.get("annotation_heads", {})
+                                     .get("coding_frac", {}),
+                  list(rf.get("per_region", {})))
             check("reconciled genome consensus emitted",
                   "genome_consensus" in res.get("reconciled", {}),
                   list(res.get("reconciled", {})))

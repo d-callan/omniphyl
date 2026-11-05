@@ -295,6 +295,17 @@ def main():
                     help="skip NCBI cross-rank path-score reconciliation "
                          "and ancestor-veto metrics (saves the per-batch "
                          "ancestor-chain gathers on large corpora)")
+    ap.add_argument("--cache-seqs", action="store_true",
+                    help="load evaluated fragment sequences into an in-RAM "
+                         "bytes blob in a single linear pass")
+    ap.add_argument("--legacy-split", action="store_true",
+                    help="use pre-f1301fd uniform accession shuffle in "
+                         "build_split (reproduces v5 train/val split)")
+    ap.add_argument("--val-accs-file", type=Path, default=None,
+                    help="override val_accs with accession IDs read from "
+                         "file (one per line) for cross-corpus intersection eval")
+    ap.add_argument("--no-predictions-tsv", action="store_true",
+                    help="skip writing per-fragment predictions.tsv")
     args = ap.parse_args()
 
     args.outdir.mkdir(parents=True, exist_ok=True)
@@ -376,11 +387,22 @@ def main():
     split_args = (float(train_args.get("val_frac", 0.05)),
                   float(train_args.get("holdout_genus_frac", 0.02)),
                   int(train_args.get("seed", 0)),
-                  float(train_args.get("frag_val", 0.05)))
+                  float(train_args.get("frag_val", 0.05)),
+                  bool(args.legacy_split))
+    override_val_accs = None
+    if args.val_accs_file is not None:
+        override_val_accs = {
+            line.strip() for line in args.val_accs_file.read_text().splitlines()
+            if line.strip()
+        }
     if args.val_only:
         meta_split = load_labels(args.labels, cols=SPLIT_COLS)
         val_accs, holdout_genera, val_frags = build_split(
             meta_split, *split_args)
+        if override_val_accs is not None:
+            val_accs = override_val_accs
+            holdout_genera = set()
+            val_frags = set()
         eval_accs = set(sorted(val_accs)[:args.max_genomes or None])
         # genus-holdout fragments sit on train-side accessions but were
         # never trained on; keep them so the unseen-clade safety metrics
@@ -396,6 +418,10 @@ def main():
         meta = load_labels(args.labels)
         val_accs, holdout_genera, val_frags = build_split(
             meta, *split_args)
+        if override_val_accs is not None:
+            val_accs = override_val_accs
+            holdout_genera = set()
+            val_frags = set()
         eval_accs = set(sorted(val_accs)[:args.max_genomes or None])
         fid_acc = {fid: m.get("accession", "") for fid, m in meta.items()}
     encoded = encode_labels_from_vocab(meta, vocab, cls_targets)
@@ -428,7 +454,8 @@ def main():
                          eval_crop=args.eval_crop_len,
                          eval_paired=args.eval_paired_len,
                          aa_frame=bool(train_args.get("struct_head")),
-                         annot=annot)
+                         annot=annot,
+                         cache_seqs=args.cache_seqs)
     loader = torch.utils.data.DataLoader(
         ds, args.batch_size, shuffle=False,
         num_workers=args.num_workers)
@@ -609,6 +636,8 @@ def main():
         (open question 1 in docs/annotation-cascade.md).
         """
         sel = np.asarray(idxs, dtype=np.int64)
+        if len(sel) == 0:
+            return {}
         ft, ot = frac_true[sel], off_true[sel]
         fmk, omk = ft >= 0, ot >= 0
         out = {}
@@ -616,10 +645,26 @@ def main():
             p = np.asarray(cont_out["coding_frac"])[sel][fmk]
             t_ = ft[fmk]
             r = (float(np.corrcoef(p, t_)[0, 1])
-                 if t_.std() > 0 else float("nan"))
+                 if len(t_) > 1 and t_.std() > 0 and p.std() > 0
+                 else None)
+            c_bin = (t_ >= 0.5).astype(float)
+            nc = t_ < 0.5
+            p_nc = p < 0.5
+            tp_nc = float((p_nc & nc).sum())
+            fp_nc = float((p_nc & ~nc).sum())
+            fn_nc = float((~p_nc & nc).sum())
+            nc_f1 = 2 * tp_nc / max(2 * tp_nc + fp_nc + fn_nc, 1)
             out["coding_frac"] = {
                 "mae": round(float(np.abs(p - t_).mean()), 4),
-                "pearson_r": round(r, 4), "n": int(fmk.sum())}
+                "pearson_r": round(r, 4) if r is not None else None,
+                "pred_mean": round(float(p.mean()), 4),
+                "true_mean": round(float(t_.mean()), 4),
+                "bias": round(float((p - t_).mean()), 4),
+                "binary_acc": round(float(((p >= 0.5) == (t_ >= 0.5)).mean()), 4),
+                "coding_auroc": auroc(c_bin, p),
+                "coding_auprc": auprc(c_bin, p),
+                "noncoding_f1": round(nc_f1, 4),
+                "n": int(fmk.sum())}
         if fmk.any() and cont_out.get("boundary"):
             p = np.asarray(cont_out["boundary"])[sel][fmk]
             tb = ((ft[fmk] > 0) & (ft[fmk] < 1))
@@ -631,12 +676,21 @@ def main():
                     float((flagged & tb).sum() / max(tb.sum(), 1)), 4)
             out["boundary"] = {
                 "accuracy": round(float(((p > 0.5) == tb).mean()), 4),
+                "auroc": auroc(tb.astype(float), p),
+                "auprc": auprc(tb.astype(float), p),
                 "recall_at_flag_rate": sweep,
                 "n": int(fmk.sum()), "n_pos": int(tb.sum())}
         if omk.any() and cont_out.get("offset"):
             p = np.asarray(cont_out["offset"])[sel][omk]
+            t_o = ot[omk]
+            r_o = (float(np.corrcoef(p, t_o)[0, 1])
+                   if len(t_o) > 1 and t_o.std() > 0 and p.std() > 0
+                   else None)
             out["offset"] = {
-                "mae": round(float(np.abs(p - ot[omk]).mean()), 4),
+                "mae": round(float(np.abs(p - t_o).mean()), 4),
+                "pearson_r": round(r_o, 4) if r_o is not None else None,
+                "pred_mean": round(float(p.mean()), 4),
+                "pred_std": round(float(p.std()), 4),
                 "n": int(omk.sum())}
         return out
 
@@ -655,7 +709,7 @@ def main():
         predicted frame and scores |pred - true edge| <= 3bp — the
         operationally meaningful end-to-end rate, not just head acc.
         """
-        if ann_true is None:
+        if ann_true is None or not idxs:
             return {}
         sel = np.asarray(idxs, dtype=np.int64)
         ya = ann_true[sel]
@@ -672,9 +726,33 @@ def main():
                 fp = float((pred_nc & ~nonc).sum())
                 fn = float((~pred_nc & nonc).sum())
                 f1 = 2 * tp / max(2 * tp + fp + fn, 1)
+                reg_names = ("coding", "intron", "rna", "intergenic")
+                per_reg = {}
+                for ci, rname in enumerate(reg_names):
+                    pc, tc = p[:, ci], t_[:, ci]
+                    rc = (float(np.corrcoef(pc, tc)[0, 1])
+                          if len(tc) > 1 and tc.std() > 0 and pc.std() > 0
+                          else None)
+                    thr = 0.1 if rname in ("intron", "rna") else 0.5
+                    y_bin = (tc >= thr).astype(float)
+                    per_reg[rname] = {
+                        "mae": round(float(np.abs(pc - tc).mean()), 4),
+                        "pearson_r": round(rc, 4) if rc is not None else None,
+                        "pred_mean": round(float(pc.mean()), 4),
+                        "true_mean": round(float(tc.mean()), 4),
+                        "bias": round(float((pc - tc).mean()), 4),
+                        "auroc": auroc(y_bin, pc),
+                        "auprc": auprc(y_bin, pc),
+                        "n_pos": int(y_bin.sum()),
+                    }
+                dom_true = t_.argmax(1)
+                dom_pred = p.argmax(1)
                 m = {"mae": round(float(np.abs(p - t_).mean()), 4),
+                     "dominant_region_acc": round(float((dom_pred == dom_true).mean()), 4),
                      "coding_auroc": auroc(coding_bin, p[:, 0]),
+                     "coding_auprc": auprc(coding_bin, p[:, 0]),
                      "noncoding_f1": round(f1, 4),
+                     "per_region": per_reg,
                      "n": int(rm.sum())}
                 # eukaryote subset: introns make the composition task
                 # strictly harder than the bacterial majority
@@ -684,6 +762,7 @@ def main():
                 if euk.any():
                     m["euk_coding_auroc"] = auroc(
                         coding_bin[euk], p[euk, 0])
+                    m["euk_mae"] = round(float(np.abs(p[euk] - t_[euk]).mean()), 4)
                     m["euk_n"] = int(euk.sum())
                 # intron vs intergenic separation (E3 gate): on windows
                 # where intron OR intergenic is the dominant true
@@ -705,14 +784,28 @@ def main():
             fm = ya[:, 4] >= 0
             if fm.any():
                 p = np.asarray(ann_out["active_frame"])[sel][fm]
-                t_ = ya[fm, 4]
+                t_ = ya[fm, 4].astype(int)
                 acc = float((p == t_).mean())
                 single = t_ < 6
+                multi = t_ == 6
+                nonc_f = t_ == 7
                 m = {"accuracy": round(acc, 4), "n": int(fm.sum())}
                 if single.any():
                     m["single_frame_acc"] = round(
                         float((p[single] == t_[single]).mean()), 4)
+                    p_str = (p[single] >= 3) & (p[single] < 6)
+                    t_str = t_[single] >= 3
+                    m["strand_acc"] = round(
+                        float(((p[single] < 6) & (p_str == t_str)).mean()), 4)
                     m["n_single_frame"] = int(single.sum())
+                if multi.any():
+                    m["multi_frame_acc"] = round(
+                        float((p[multi] == 6).mean()), 4)
+                    m["n_multi_frame"] = int(multi.sum())
+                if nonc_f.any():
+                    m["noncoding_frame_acc"] = round(
+                        float((p[nonc_f] == 7).mean()), 4)
+                    m["n_noncoding_frame"] = int(nonc_f.sum())
                 out["active_frame"] = m
         if ann_out["struct_flags"]:
             sm = ya[:, 5] >= 0
@@ -724,15 +817,33 @@ def main():
                          "splice_acceptor")
                 for b in range(4):
                     a = auroc(t_[:, b], p[:, b])
-                    bits[names[b]] = {"auroc": a,
+                    ap = auprc(t_[:, b], p[:, b])
+                    bits[names[b]] = {"auroc": a, "auprc": ap,
                                       "n_pos": int(t_[:, b].sum())}
                 vals = [v["auroc"] for v in bits.values()
                         if v["auroc"] is not None]
-                out["struct_flags"] = {
+                ap_vals = [v["auprc"] for v in bits.values()
+                           if v["auprc"] is not None]
+                sf_m = {
                     "per_bit": bits,
                     "macro_auroc": round(float(np.mean(vals)), 4)
                     if vals else None,
+                    "macro_auprc": round(float(np.mean(ap_vals)), 4)
+                    if ap_vals else None,
                     "n": int(sm.sum())}
+                euk_s = np.array([meta[frag_ids[i]].get("group") in
+                                  ("fungi", "protozoa")
+                                  for i in sel[sm]])
+                if euk_s.any():
+                    euk_bits = {}
+                    for b in range(4):
+                        euk_bits[names[b]] = {
+                            "auroc": auroc(t_[euk_s, b], p[euk_s, b]),
+                            "auprc": auprc(t_[euk_s, b], p[euk_s, b]),
+                            "n_pos": int(t_[euk_s, b].sum())}
+                    sf_m["euk_per_bit"] = euk_bits
+                    sf_m["euk_n"] = int(euk_s.sum())
+                out["struct_flags"] = sf_m
         if ann_out["domains"]:
             dm = ya[:, -1] >= 0
             if dm.any():
@@ -744,17 +855,29 @@ def main():
                        for j in range(K)]
                 aus = [a for a, _ in per if a is not None]
                 aps = [b for _, b in per if b is not None]
-                top5 = np.argsort(-p, 1)[:, :min(5, K)]
+                order_k = np.argsort(-p, 1)
+                top1 = order_k[:, :1]
+                top5 = order_k[:, :min(5, K)]
+                top10 = order_k[:, :min(10, K)]
                 pos_rows = t_.sum(1) > 0
+                r1 = (float(np.mean(
+                    [t_[i, top1[i]].any() for i in range(len(t_))
+                     if pos_rows[i]])) if pos_rows.any() else None)
                 r5 = (float(np.mean(
                     [t_[i, top5[i]].any() for i in range(len(t_))
+                     if pos_rows[i]])) if pos_rows.any() else None)
+                r10 = (float(np.mean(
+                    [t_[i, top10[i]].any() for i in range(len(t_))
                      if pos_rows[i]])) if pos_rows.any() else None)
                 out["domains"] = {
                     "macro_auroc": round(float(np.mean(aus)), 4)
                     if aus else None,
                     "macro_auprc": round(float(np.mean(aps)), 4)
                     if aps else None,
+                    "recall_at1": round(r1, 4) if r1 is not None else None,
                     "recall_at5": round(r5, 4) if r5 is not None else None,
+                    "recall_at10": round(r10, 4) if r10 is not None else None,
+                    "n_active_domains": len(aus),
                     "K": K, "n": int(dm.sum()),
                     "n_pos_rows": int(pos_rows.sum())}
         # ---- E4 stage-2 frame-scan gate ------------------------------
@@ -857,14 +980,17 @@ def main():
         "val_genomes": sorted(val_accs),
         "holdout_genera": sorted(holdout_genera),
         "train": {"per_target": cls_metrics(train_idxs),
-                  "annotation_heads": cont_metrics(train_idxs)},
+                  "annotation_heads": cont_metrics(train_idxs),
+                  "annot_heads": annot_metrics(train_idxs)},
         "val": {"per_target": cls_metrics(val_idxs),
                 "annotation_heads": cont_metrics(val_idxs),
                 "annot_heads": annot_metrics(val_idxs, scan=True)},
         "val_frag": {"per_target": cls_metrics(fragval_idxs),
-                     "annotation_heads": cont_metrics(fragval_idxs)},
+                     "annotation_heads": cont_metrics(fragval_idxs),
+                     "annot_heads": annot_metrics(fragval_idxs)},
         "val_genus": {"per_target": cls_metrics(val_genus_idxs),
-                      "annotation_heads": cont_metrics(val_genus_idxs)}}
+                      "annotation_heads": cont_metrics(val_genus_idxs),
+                      "annot_heads": annot_metrics(val_genus_idxs)}}
     print(f"\nSplit: {len(train_idxs)} train / {len(val_idxs)} val-genome "
           f"frags ({len(val_accs)} held-out genomes) / "
           f"{len(fragval_idxs)} within-genome held-out frags / "
@@ -1074,24 +1200,51 @@ def main():
                 for t, v in rsafety.items()))
 
     # -----------------------------------------------------------------------
-    # 3. Per-group accuracy (by RefSeq group column)
+    # 3. Per-group accuracy & annotation breakdown (by RefSeq group column)
     # -----------------------------------------------------------------------
     fid_to_group = {fid: meta[fid].get("group", "") for fid in frag_ids}
-    groups = sorted(set(fid_to_group.values()))
+    groups = sorted(g for g in set(fid_to_group.values()) if g)
     results["per_group"] = {}
+    results["val_per_group"] = {}
     print("\nPer-group domain accuracy:")
     for grp in groups:
         idxs = [i for i, fid in enumerate(frag_ids) if fid_to_group[fid] == grp]
+        v_idxs = [i for i in val_idxs if fid_to_group[frag_ids[i]] == grp]
         t = "domain"
-        if t not in all_targets:
-            continue
-        known = [i for i in idxs if all_true[t][i] != 0]
-        if not known:
-            continue
-        acc = sum(all_preds[t][i] == all_true[t][i] for i in known) / len(known)
-        results["per_group"][grp] = {"domain_accuracy": round(acc, 4),
-                                      "n": len(known)}
-        print(f"  {grp:30s}  domain_acc={acc:.3f}  n={len(known)}")
+        if t in all_targets:
+            known = [i for i in idxs if all_true[t][i] != 0]
+            if known:
+                acc = sum(all_preds[t][i] == all_true[t][i] for i in known) / len(known)
+                results["per_group"][grp] = {
+                    "domain_accuracy": round(acc, 4),
+                    "n": len(known),
+                    "per_target": cls_metrics(idxs),
+                    "annotation_heads": cont_metrics(idxs),
+                    "annot_heads": annot_metrics(idxs),
+                }
+                print(f"  {grp:30s}  domain_acc={acc:.3f}  n={len(known)}")
+        if v_idxs:
+            vg = {
+                "n_frags": len(v_idxs),
+                "per_target": cls_metrics(v_idxs),
+                "annotation_heads": cont_metrics(v_idxs),
+                "annot_heads": annot_metrics(v_idxs),
+            }
+            if chains is not None:
+                vg["reconciled_per_target"] = {
+                    rt: {
+                        "accuracy": (
+                            round(sum(recon_pred[rt][i] == all_true[rt][i]
+                                      for i in v_idxs if all_true[rt][i] != 0)
+                                  / max(sum(1 for i in v_idxs
+                                            if all_true[rt][i] != 0), 1), 4)
+                            if any(all_true[rt][i] != 0 for i in v_idxs)
+                            else None),
+                        "n": sum(1 for i in v_idxs if all_true[rt][i] != 0),
+                    }
+                    for rt in cls_targets
+                }
+            results["val_per_group"][grp] = vg
 
     # -----------------------------------------------------------------------
     # 4. Leave-phylum-out generalisation
@@ -1227,18 +1380,19 @@ def main():
     # -----------------------------------------------------------------------
     # 9. Per-fragment predictions dump (all evaluated frags)
     # -----------------------------------------------------------------------
-    hdr = "frag_id\taccession\tgroup\t" + "\t".join(
-        f"{t}_true\t{t}_pred\t{t}_conf" for t in cls_targets)
-    pred_rows = [hdr]
-    for i, fid in enumerate(frag_ids):
-        cols = [fid, fid_acc.get(fid, ""), meta[fid].get("group", "")]
-        for t in cls_targets:
-            cols += [id2name[t].get(all_true[t][i], str(all_true[t][i])),
-                     id2name[t].get(all_preds[t][i], str(all_preds[t][i])),
-                     f"{all_confs[t][i]:.4f}"]
-        pred_rows.append("\t".join(cols))
-    (args.outdir / "predictions.tsv").write_text("\n".join(pred_rows) + "\n")
-    print(f"wrote {args.outdir/'predictions.tsv'}")
+    if not args.no_predictions_tsv:
+        hdr = "frag_id\taccession\tgroup\t" + "\t".join(
+            f"{t}_true\t{t}_pred\t{t}_conf" for t in cls_targets)
+        pred_rows = [hdr]
+        for i, fid in enumerate(frag_ids):
+            cols = [fid, fid_acc.get(fid, ""), meta[fid].get("group", "")]
+            for t in cls_targets:
+                cols += [id2name[t].get(all_true[t][i], str(all_true[t][i])),
+                         id2name[t].get(all_preds[t][i], str(all_preds[t][i])),
+                         f"{all_confs[t][i]:.4f}"]
+            pred_rows.append("\t".join(cols))
+        (args.outdir / "predictions.tsv").write_text("\n".join(pred_rows) + "\n")
+        print(f"wrote {args.outdir/'predictions.tsv'}")
 
     # -----------------------------------------------------------------------
     # 10. Genome consensus: pooled log-probs per accession, M-frag sweep.

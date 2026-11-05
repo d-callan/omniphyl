@@ -388,7 +388,7 @@ def encode_annot_labels(rows: dict[str, dict],
 
 
 def build_split(meta: dict[str, dict], val_frac: float, genus_holdout: float,
-                seed: int, frag_val: float = 0.0):
+                seed: int, frag_val: float = 0.0, legacy: bool = False):
     """(val_accs, holdout_genera, val_frags).
 
     frag_val > 0 withholds a CONTIGUOUS span of ~frag_val fragments from
@@ -414,62 +414,67 @@ def build_split(meta: dict[str, dict], val_frac: float, genus_holdout: float,
                  if m["accession"] in forced_train}
     all_accs = sorted({m["accession"] for m in meta.values()}
                       - forced_val - forced_train)
-    acc_genus: dict[str, str] = {}
-    acc_species: dict[str, str] = {}
-    for m in meta.values():
-        a = m["accession"]
-        if a not in acc_genus:
-            acc_genus[a] = m.get("genus", "")
-            acc_species[a] = m.get("species", "")
-    genus_accs: dict[str, set[str]] = defaultdict(set)
-    species_accs: dict[str, set[str]] = defaultdict(set)
-    for a, g in acc_genus.items():
-        if g:
-            genus_accs[g].add(a)
-    for a, s in acc_species.items():
-        if s:
-            species_accs[s].add(a)
-    # Prefer holding out genomes whose genus has >=2 assemblies so val_accs
-    # does not silently orphan singleton genera from the training vocab
-    # (holdout_genera owns open-set genus evaluation). Within multi-genome
-    # genera, prioritize multi-assembly species and keep >=1 assembly per
-    # genus/species in train.
-    multi_sp = [a for a in all_accs
-                if len(genus_accs.get(acc_genus[a], ())) >= 2
-                and len(species_accs.get(acc_species[a], ())) >= 2]
-    single_sp_multi_g = [a for a in all_accs
-                         if len(genus_accs.get(acc_genus[a], ())) >= 2
-                         and len(species_accs.get(acc_species[a], ())) < 2]
-    single_g = [a for a in all_accs
-                if len(genus_accs.get(acc_genus[a], ())) < 2]
-    rng.shuffle(multi_sp)
-    rng.shuffle(single_sp_multi_g)
-    rng.shuffle(single_g)
     n_val = max(1, int(len(all_accs) * val_frac)) if val_frac > 0 else 0
-    g_rem = {g: len(s) for g, s in genus_accs.items()}
-    s_rem = {s: len(ac) for s, ac in species_accs.items()}
-    picked: list[str] = []
-    deferred: list[str] = []
-    for a in multi_sp + single_sp_multi_g:
-        if len(picked) >= n_val:
-            break
-        g, s = acc_genus[a], acc_species[a]
-        if g and g_rem.get(g, 0) <= 1:
-            deferred.append(a)
-            continue
-        if s and len(species_accs.get(s, ())) >= 2 and s_rem.get(s, 0) <= 1:
-            deferred.append(a)
-            continue
-        picked.append(a)
-        if g:
-            g_rem[g] -= 1
-        if s:
-            s_rem[s] -= 1
-    for a in deferred + single_g:
-        if len(picked) >= n_val:
-            break
-        picked.append(a)
-    val_accs = set(picked) | forced_val
+    if legacy:
+        accs_shuf = list(all_accs)
+        rng.shuffle(accs_shuf)
+        val_accs = set(accs_shuf[:n_val]) | forced_val
+    else:
+        acc_genus: dict[str, str] = {}
+        acc_species: dict[str, str] = {}
+        for m in meta.values():
+            a = m["accession"]
+            if a not in acc_genus:
+                acc_genus[a] = m.get("genus", "")
+                acc_species[a] = m.get("species", "")
+        genus_accs: dict[str, set[str]] = defaultdict(set)
+        species_accs: dict[str, set[str]] = defaultdict(set)
+        for a, g in acc_genus.items():
+            if g:
+                genus_accs[g].add(a)
+        for a, s in acc_species.items():
+            if s:
+                species_accs[s].add(a)
+        # Prefer holding out genomes whose genus has >=2 assemblies so val_accs
+        # does not silently orphan singleton genera from the training vocab
+        # (holdout_genera owns open-set genus evaluation). Within multi-genome
+        # genera, prioritize multi-assembly species and keep >=1 assembly per
+        # genus/species in train.
+        multi_sp = [a for a in all_accs
+                    if len(genus_accs.get(acc_genus[a], ())) >= 2
+                    and len(species_accs.get(acc_species[a], ())) >= 2]
+        single_sp_multi_g = [a for a in all_accs
+                             if len(genus_accs.get(acc_genus[a], ())) >= 2
+                             and len(species_accs.get(acc_species[a], ())) < 2]
+        single_g = [a for a in all_accs
+                    if len(genus_accs.get(acc_genus[a], ())) < 2]
+        rng.shuffle(multi_sp)
+        rng.shuffle(single_sp_multi_g)
+        rng.shuffle(single_g)
+        g_rem = {g: len(s) for g, s in genus_accs.items()}
+        s_rem = {s: len(ac) for s, ac in species_accs.items()}
+        picked: list[str] = []
+        deferred: list[str] = []
+        for a in multi_sp + single_sp_multi_g:
+            if len(picked) >= n_val:
+                break
+            g, s = acc_genus[a], acc_species[a]
+            if g and g_rem.get(g, 0) <= 1:
+                deferred.append(a)
+                continue
+            if s and len(species_accs.get(s, ())) >= 2 and s_rem.get(s, 0) <= 1:
+                deferred.append(a)
+                continue
+            picked.append(a)
+            if g:
+                g_rem[g] -= 1
+            if s:
+                s_rem[s] -= 1
+        for a in deferred + single_g:
+            if len(picked) >= n_val:
+                break
+            picked.append(a)
+        val_accs = set(picked) | forced_val
 
     holdout_genera = set()
     if genus_holdout > 0:
