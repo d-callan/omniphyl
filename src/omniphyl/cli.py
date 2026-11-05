@@ -37,6 +37,9 @@ def _annotate_parser(sub):
                          "contig_summary.tsv}")
     ap.add_argument("--window", type=int, default=500)
     ap.add_argument("--stride", type=int, default=100)
+    ap.add_argument("--bin-width", type=int, default=0,
+                    help="aggregation bin width in bp "
+                         "(0 = gcd(stride, 50))")
     # LexicMap evidence
     le = ap.add_argument_group("lexicmap evidence")
     le.add_argument("--lexicmap-bed", type=Path, default=None,
@@ -112,7 +115,8 @@ def main(argv=None) -> int:
         run_annotate(
             model_path=args.model, fasta_path=args.fasta,
             out_prefix=args.out, window=args.window,
-            stride=args.stride, batch_size=args.batch_size,
+            stride=args.stride, bin_width=args.bin_width,
+            batch_size=args.batch_size,
             device=args.device, flat_prior_tau=args.flat_prior_tau,
             lexicmap_bed=args.lexicmap_bed,
             lexicmap_bedgraph=args.lexicmap_bedgraph,

@@ -65,6 +65,7 @@ def _n_frac(seq: str) -> float:
 
 def run_annotate(model_path, fasta_path, out_prefix: Path,
                  window: int = 500, stride: int = 100,
+                 bin_width: int = 0,
                  batch_size: int = 256, device: str = "auto",
                  flat_prior_tau: float | None = None,
                  lexicmap_bed=None, lexicmap_bedgraph=None,
@@ -86,7 +87,10 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
                              flat_prior_tau=flat_prior_tau,
                              verbose=verbose)
     W, S = int(window), int(stride)
-    B = math.gcd(S, 50)            # bin width (50 bp at defaults)
+    # bin width: 50 bp at defaults; finer B upsamples the same smooth
+    # aggregate (per-window votes are spread over the ~W they cover) but
+    # resolves boundary impulses and run edges more sharply.
+    B = int(bin_width) if bin_width else math.gcd(S, 50)
     w_ev = float(evidence_weight)
 
     contigs = [(i, s, c) for i, s, c in iter_sequences(Path(fasta_path))]
