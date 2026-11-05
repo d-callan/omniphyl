@@ -58,7 +58,7 @@ def _annotate_parser(sub):
                     help="minimum bitscore for partner HSPs of an "
                          "anchored split alignment")
     le.add_argument("--lexicmap-min-single-score", type=float,
-                    default=350.0,
+                    default=300.0,
                     help="minimum bitscore for unchained (singleton) "
                          "HSPs -- stricter than the partner floor so "
                          "distant/repetitive hits need split "
@@ -70,7 +70,7 @@ def _annotate_parser(sub):
                          "intron candidate")
     le.add_argument("--lexicmap-max-per-run", type=int, default=2,
                     help="per-SRA-run depth cap per bin")
-    le.add_argument("--evidence-weight", type=float, default=0.35,
+    le.add_argument("--evidence-weight", type=float, default=0.25,
                     help="w_ev log-space boost of d~(x) into coding score")
     # decoding
     dec = ap.add_argument_group("decoding")

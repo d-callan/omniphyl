@@ -88,7 +88,8 @@ def test_io():
         # LexicMap BED two-tier filtering: unitigA chains a strong
         # anchor (400) with a weak partner (160) across a 90 bp gap ->
         # the partner survives even though it is below the singleton
-        # floor; unitigB is an unchained singleton at 300 -> dropped.
+        # floor; unitigB is an unchained singleton at 300 -> dropped
+        # under an explicit 350 singleton floor.
         bed = td / "lx.bed"
         bed.write_text(
             "c1\t10\t310\tSRR1|unitigA|hsp1\t400\t+\n"
@@ -97,6 +98,7 @@ def test_io():
         seq = "ACGT" * 200
         ev = load_lexicmap_evidence(
             bed_path=bed, source="rnaseq", min_score=150, min_len=60,
+            min_single_score=350,
             contig_seqs={"c1": seq}, keep_hsps=True)
         kept = ev["c1"].hsps
         check("lexicmap two-tier filters",
