@@ -1,0 +1,13 @@
+{
+  "id": "daniellecallan/omniphyl-infer-v6-ckpts",
+  "title": "omniphyl-infer-v6-ckpts",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": ["daniellecallan/omniphyl-infer-test", "daniellecallan/omniphyl-v6-ckpts"],
+  "competition_sources": [],
+  "kernel_sources": []
+}
