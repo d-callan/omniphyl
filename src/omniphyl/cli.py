@@ -54,8 +54,20 @@ def _annotate_parser(sub):
                     help="index provenance: rnaseq enables splice/UTR "
                          "interpretation of endpoints; genomic treats "
                          "coverage as weak conservation evidence only")
-    le.add_argument("--lexicmap-min-score", type=float, default=150.0)
+    le.add_argument("--lexicmap-min-score", type=float, default=150.0,
+                    help="minimum bitscore for partner HSPs of an "
+                         "anchored split alignment")
+    le.add_argument("--lexicmap-min-single-score", type=float,
+                    default=350.0,
+                    help="minimum bitscore for unchained (singleton) "
+                         "HSPs -- stricter than the partner floor so "
+                         "distant/repetitive hits need split "
+                         "alignments to count")
     le.add_argument("--lexicmap-min-len", type=int, default=60)
+    le.add_argument("--lexicmap-min-intron-support", type=int,
+                    default=1,
+                    help="minimum split alignments corroborating an "
+                         "intron candidate")
     le.add_argument("--lexicmap-max-per-run", type=int, default=2,
                     help="per-SRA-run depth cap per bin")
     le.add_argument("--evidence-weight", type=float, default=0.35,
@@ -124,6 +136,9 @@ def main(argv=None) -> int:
             lexicmap_source=args.lexicmap_source,
             lexicmap_min_score=args.lexicmap_min_score,
             lexicmap_min_len=args.lexicmap_min_len,
+            lexicmap_min_single_score=args.lexicmap_min_single_score,
+            lexicmap_min_intron_support=
+            args.lexicmap_min_intron_support,
             lexicmap_max_per_run=args.lexicmap_max_per_run,
             evidence_weight=args.evidence_weight,
             kingdom=args.kingdom, genetic_code=args.genetic_code,

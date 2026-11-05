@@ -85,23 +85,35 @@ def test_io():
         check("paired N-join", pair[0][1] == "AAAAN" + "AAAA",
               pair[0][1])
 
-        # LexicMap BED filtering
+        # LexicMap BED two-tier filtering: unitigA chains a strong
+        # anchor (400) with a weak partner (160) across a 90 bp gap ->
+        # the partner survives even though it is below the singleton
+        # floor; unitigB is an unchained singleton at 300 -> dropped.
         bed = td / "lx.bed"
-        # hsp1: good; hsp2: low score; hsp3: too short
         bed.write_text(
-            "c1\t10\t310\tSRR1|unitigA|hsp1\t300\t+\n"
-            "c1\t400\t700\tSRR1|unitigA|hsp2\t100\t+\n"
-            "c1\t800\t840\tSRR2|unitigB|hsp1\t300\t+\n")
+            "c1\t10\t310\tSRR1|unitigA|hsp1\t400\t+\n"
+            "c1\t400\t700\tSRR1|unitigA|hsp2\t160\t+\n"
+            "c1\t800\t1100\tSRR2|unitigB|hsp1\t300\t+\n")
         seq = "ACGT" * 200
         ev = load_lexicmap_evidence(
             bed_path=bed, source="rnaseq", min_score=150, min_len=60,
-            contig_seqs={"c1": seq})
+            contig_seqs={"c1": seq}, keep_hsps=True)
         kept = ev["c1"].hsps
-        check("lexicmap score+len filters",
-              len(kept) == 1 and kept[0].sgenome == "SRR1",
+        check("lexicmap two-tier filters",
+              len(kept) == 2 and all(h.sgenome == "SRR1" for h in kept),
               [h.score for h in kept])
         check("lexicmap sra_runs", ev["c1"].sra_runs == {"SRR1"})
         check("density positive", ev["c1"].density.sum() > 0)
+        check("split-alignment intron hint",
+              ev["c1"].intron_candidates == [(310, 400)],
+              ev["c1"].intron_candidates)
+        # singleton floor honours an explicit override
+        ev_lo = load_lexicmap_evidence(
+            bed_path=bed, source="rnaseq", min_score=150, min_len=60,
+            min_single_score=250, contig_seqs={"c1": seq},
+            keep_hsps=True)
+        check("singleton floor override",
+              len(ev_lo["c1"].hsps) == 3, len(ev_lo["c1"].hsps))
 
         # bedGraph: no filtering, density from rows
         bg = td / "lx.bedGraph"
@@ -416,6 +428,166 @@ def test_decode_frameshift_intron():
               g0["introns"])
 
 
+def test_decode_antisense_suppression():
+    """A stop-poor minus-strand ORF shadowing a strong plus gene must
+    be dropped: it passes _score_orf's 25% strand gate (share 0.30)
+    but has no independent strand evidence (share < 0.45), so
+    _nonoverlap_select suppresses the >50% cross-strand overlap."""
+    from omniphyl.annotate import _decode_genes, STOPS
+    L, B = 3999, 50
+    seq = _place("A" * L, [(900, "ATG"), (2400, "TAA"),
+                          (999, "TTA"), (2394, "CAT")])
+    res = _mk_result(L, B,
+                     coding=[(18, 48, 0.7)],
+                     frame=[(18, 48, 0, 0.7), (18, 48, 3, 0.3)],
+                     btr=[(18, 19, 0, 0.6)])
+    genes = _decode_genes(seq, res, STOPS, False, 0.0, 90, 0.5, 0.5,
+                          35, 5000, [])
+    pl = [g for g in genes if g["strand"] == "+"]
+    mn = [g for g in genes if g["strand"] == "-"]
+    check("plus gene kept", len(pl) == 1, genes)
+    check("antisense shadow suppressed", len(mn) == 0, genes)
+
+
+def test_decode_intron_inside_coding_run():
+    """An intron whose interior bins dip but stay above the coding
+    threshold is inside one contiguous coding run; the old hard
+    in_coding vote rejected every such candidate by construction.
+    The relative interior-vs-flank check must accept it."""
+    from omniphyl.annotate import _decode_genes, STOPS
+    L, B = 3999, 50
+    seq = _place("A" * L, [(999, "ATG"), (1200, "GT"), (1297, "AG"),
+                          (1398, "TAA")])
+    res = _mk_result(L, B,
+                     coding=[(19, 29, 0.7), (24, 25, 0.59)],
+                     region1=[(24, 26, 0.5)],
+                     frame=[(19, 24, 0, 0.7), (24, 25, 0, 0.0),
+                            (25, 29, 0, 0.7)],
+                     btr=[(24, 25, 2, 0.8), (26, 27, 3, 0.8)])
+    genes = _decode_genes(seq, res, STOPS, True, 0.0, 90, 0.5, 0.5,
+                          35, 5000, [])
+    plus = [g for g in genes if g["strand"] == "+"]
+    check("one gene", len(plus) == 1, genes)
+    if plus:
+        check("intron recovered", plus[0]["introns"] == [(1200, 1299)],
+              plus[0]["introns"])
+
+
+def test_decode_chained_runs():
+    """An intron whose bins all fall below the coding threshold splits
+    a gene into two runs; the chained super-run decode must bridge the
+    gap via the seeded intron and out-score the unspliced call."""
+    from omniphyl.annotate import _decode_genes, STOPS
+    L, B = 3999, 50
+    seq = _place("A" * L, [(999, "ATG"), (1200, "GT"), (1297, "AG"),
+                          (1398, "TAA")])
+    res = _mk_result(L, B,
+                     coding=[(19, 24, 0.7), (26, 29, 0.7)],
+                     frame=[(19, 24, 0, 0.7), (26, 29, 0, 0.7)])
+    genes = _decode_genes(seq, res, STOPS, True, 0.0, 90, 0.5, 0.5,
+                          35, 5000, [])
+    plus = [g for g in genes if g["strand"] == "+"]
+    check("one gene", len(plus) == 1, genes)
+    if plus:
+        g0 = plus[0]
+        check("chained intron", g0["introns"] == [(1200, 1299)],
+              g0["introns"])
+        check("span", (g0["start"], g0["end"]) == (999, 1401),
+              (g0["start"], g0["end"]))
+
+
+def test_softmasked_decode_and_evidence():
+    """Lowercase (softmasked) sequence must decode identically to its
+    uppercase form: codon and splice-motif scans normalize case, an
+    in-intron lowercase stop does not truncate the spliced ORF, and an
+    HSP lying over lowercase sequence is not discarded as 'ambiguous'."""
+    from omniphyl.annotate import _decode_genes, STOPS
+    L, B = 2000, 50
+    seq = _place("A" * L, [(300, "atg"), (450, "gt"), (500, "taa"),
+                           (598, "ag"), (900, "taa")])
+    res = _mk_result(L, B,
+                     coding=[(6, 9, 0.7), (9, 12, 0.2), (12, 18, 0.7)],
+                     region1=[(9, 12, 0.5)],
+                     frame=[(6, 9, 0, 0.7), (12, 18, 0, 0.7)],
+                     btr=[(9, 10, 2, 0.8), (12, 13, 3, 0.8)])
+    genes = _decode_genes(seq, res, STOPS, True, 0.35, 90, 0.45, 0.5,
+                          35, 5000, [(450, 600)])
+    plus = [g for g in genes if g["strand"] == "+"]
+    check("softmasked spliced gene",
+          len(plus) == 1 and plus[0]["introns"] == [(450, 600)]
+          and plus[0]["start"] == 300 and plus[0]["end"] == 903,
+          genes)
+    # an HSP spanning softmasked bases must not count them ambiguous
+    with tempfile.TemporaryDirectory() as td:
+        bed = Path(td) / "sm.bed"
+        bed.write_text("c\t10\t610\tSRR|u|hsp1\t500\t+\n")
+        sm = "ACGT" * 40
+        sm = sm[:80].lower() + sm[80:]
+        ev = load_lexicmap_evidence(
+            bed_path=bed, source="rnaseq",
+            contig_seqs={"c": sm}, keep_hsps=True)
+        check("softmasked hsp kept",
+              len(ev["c"].hsps) == 1, ev["c"].hsps)
+
+
+def test_splice_acceptor_snapping():
+    """An evidence hint must snap to ITS observed junction, not the
+    leftmost canonical acceptor in the window: a decoy AG 8 bp upstream
+    of the true acceptor previously won b
+           test_decode_antisense_suppression,
+           test_decode_intron_inside_coding_run,
+           test_decode_chained_runs,
+           test_softmasked_decode_and_evidence,
+           test_splice_acceptor_snapping,
+           test_hint_rescues_weak_partner_exon,
+          ecause the acceptor loop broke
+    at the first valid candidate."""
+    from omniphyl.annotate import _decode_genes, STOPS
+    L, B = 2000, 50
+    seq = _place("A" * L, [(300, "ATG"), (450, "GT"),
+                           (590, "AG"),   # decoy acceptor -> acc 592
+                           (598, "AG"),   # true acceptor  -> acc 600
+                           (900, "TAA")])
+    res = _mk_result(L, B,
+                     coding=[(6, 9, 0.7), (9, 12, 0.2), (12, 18, 0.7)],
+                     region1=[(9, 12, 0.5)],
+                     frame=[(6, 9, 0, 0.7), (12, 18, 0, 0.7)],
+                     btr=[(9, 10, 2, 0.8), (12, 13, 3, 0.8)])
+    genes = _decode_genes(seq, res, STOPS, True, 0.35, 90, 0.45, 0.5,
+                          35, 5000, [(450, 600)])
+    plus = [g for g in genes if g["strand"] == "+"]
+    check("hinted acceptor chosen",
+          any(g["introns"] == [(450, 600)] for g in plus), genes)
+
+
+def test_hint_rescues_weak_partner_exon():
+    """A split-alignment hint joins a strong coding run to a weak
+    leader exon beyond the local search margin: the hint-linked span
+    expansion must reach it, and shared-stop arbitration must extend
+    through coverage-backed weak frame mass."""
+    from omniphyl.annotate import _decode_genes, STOPS
+    L, B = 2000, 50
+    # exon1 [200,320): ATG at 200 (global frame 2), weak signal;
+    # intron [320,750) GT..AG; exon2 [750,1450): strong frame-0 run,
+    # its own ATG at 750; stop codon at 1449 (frame 0) -> edge 1452
+    seq = _place("A" * L, [(200, "ATG"), (320, "GT"), (748, "AG"),
+                           (1449, "TAA")])
+    res = _mk_result(L, B,
+                     coding=[(15, 29, 0.85), (4, 7, 0.25)],
+                     frame=[(15, 29, 0, 0.7), (4, 7, 2, 0.22)])
+    # coverage sits over the weak leader exon only
+    res.dtilde[4:7] = 0.9
+    genes = _decode_genes(seq, res, STOPS, True, 0.35, 90, 0.45, 0.5,
+                          35, 5000, [(320, 750)])
+    plus = [g for g in genes if g["strand"] == "+"]
+    check("leader exon rescued",
+          any(g["introns"] == [(320, 750)] and g["start"] == 200
+              and g["end"] == 1452 for g in plus), genes)
+    check("no fragment shadow",
+          not any(g["start"] == 750 and not g["introns"]
+                  for g in plus), genes)
+
+
 def test_annotate_e2e():
     print("[annotate e2e]")
     with tempfile.TemporaryDirectory() as td:
@@ -453,7 +625,14 @@ def main():
     fns = [test_io, test_frame, test_reconcile, test_pood_tau,
            test_cluster, test_feature_encoder,
            test_decode_start_scoring, test_decode_adjacent_strands,
-           test_decode_frameshift_intron, test_annotate_e2e]
+           test_decode_frameshift_intron,
+           test_decode_antisense_suppression,
+           test_decode_intron_inside_coding_run,
+           test_decode_chained_runs,
+           test_softmasked_decode_and_evidence,
+           test_splice_acceptor_snapping,
+           test_hint_rescues_weak_partner_exon,
+           test_annotate_e2e]
     for f in fns:
         f()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")

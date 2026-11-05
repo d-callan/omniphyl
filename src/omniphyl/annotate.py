@@ -72,6 +72,8 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
                  lexicmap_tsv=None, lexicmap_source: str = "rnaseq",
                  lexicmap_min_score: float = 150.0,
                  lexicmap_min_len: int = 60,
+                 lexicmap_min_single_score: float = 350.0,
+                 lexicmap_min_intron_support: int = 1,
                  lexicmap_max_per_run: int = 2,
                  evidence_weight: float = 0.35,
                  kingdom: str = "auto", genetic_code: str = "auto",
@@ -121,6 +123,8 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
             bed_path=lexicmap_bed, bedgraph_path=lexicmap_bedgraph,
             tsv_path=lexicmap_tsv, source=lexicmap_source,
             min_score=lexicmap_min_score, min_len=lexicmap_min_len,
+            min_single_score=lexicmap_min_single_score,
+            min_intron_support=lexicmap_min_intron_support,
             max_per_run=lexicmap_max_per_run, bin_width=B,
             contig_seqs=contig_seqs)
         if verbose:
@@ -414,6 +418,11 @@ def _decode_genes(seq: str, res: ContigResult, stops: set, euk: bool,
     start->stop ORF scanning, and (euk mode) interior dips linked by
     splice motifs become introns.
     """
+    # softmasked (lowercase) sequence is biologically identical to its
+    # uppercase form -- all codon/motif comparisons below are exact-
+    # string matches, so normalize once here instead of sprinkling
+    # .upper() through every scanner
+    seq = seq.upper()
     L = res.length
     B = res.bin_width
     genes = []
@@ -425,6 +434,7 @@ def _decode_genes(seq: str, res: ContigResult, stops: set, euk: bool,
                     + w_ev * utr_gate * res.dtilde)
     have_frames = res.p_frame[:, :6].sum() > 0
     in_coding = cscore >= coding_threshold
+    runs = []
     b = 0
     while b < res.n_bins:
         if not in_coding[b]:
@@ -433,7 +443,95 @@ def _decode_genes(seq: str, res: ContigResult, stops: set, euk: bool,
         b2 = b
         while b2 + 1 < res.n_bins and in_coding[b2 + 1]:
             b2 += 1
-        lo, hi = b * B, min((b2 + 1) * B, L)
+        runs.append((b, b2))
+        b = b2 + 1
+    # decode each run independently AND (euk) fused with adjacent
+    # same-dominant-strand runs across gaps <= max_intron: an intron
+    # whose bins all dip below the coding threshold splits one gene
+    # into separate runs, which per-run decoding can never re-join
+    # (chr1 benchmark: 15 of 208 RefSeq introns do this). The fused
+    # span is an ADDITIONAL decode -- each interior gap is seeded into
+    # _splice_candidates as an intron proposal and _score_orf /
+    # _better_shared_stop arbitrate merged vs split calls, so close
+    # tandem same-strand genes only fuse when a valid phased ORF
+    # actually reads through.
+    hint_xy = [(iv[0], iv[1]) for iv in intron_hints if len(iv) == 2]
+    # a run that crosses the coding threshold ONLY through fused
+    # evidence (raw model coding < threshold on every bin) is usually
+    # UTR/ncRNA coverage masquerading as a CDS: decode it standalone
+    # only when it also carries concentrated single-frame support. It
+    # still participates in chained / hint-linked super-runs below.
+    if have_frames:
+        def _standalone_ok(b0, b1):
+            return bool(coding[b0:b1 + 1].max() >= coding_threshold
+                        or res.p_frame[b0:b1 + 1, :6].max(1).mean()
+                        >= 0.40)
+    else:
+        def _standalone_ok(b0, b1):
+            return True
+    spans = [(b0 * B, min((b1 + 1) * B, L), [])
+             for b0, b1 in runs if _standalone_ok(b0, b1)]
+    if euk and have_frames and len(runs) > 1:
+        def _run_strand(rr):
+            b0, b1 = rr
+            sp = float(res.p_frame[b0:b1 + 1, :3].sum())
+            sn = float(res.p_frame[b0:b1 + 1, 3:6].sum())
+            return "+" if sp >= sn else "-"
+        i = 0
+        while i < len(runs):
+            j = i
+            seeds = []
+            while (j + 1 < len(runs)
+                   and _run_strand(runs[j]) == _run_strand(runs[j + 1])
+                   and 0 < (runs[j + 1][0] - runs[j][1] - 1) * B
+                   <= max_intron):
+                seeds.append(((runs[j][1] + 1) * B,
+                              runs[j + 1][0] * B,
+                              min(150, 3 * B)))
+                j += 1
+            if j > i:
+                spans.append((runs[i][0] * B,
+                              min((runs[j][1] + 1) * B, L), seeds))
+            i = j + 1
+    # hint-linked expansion: a split-alignment intron with exactly one
+    # junction inside a coding run pins a partner exon beyond the local
+    # search margin -- widen the span so the splice scan reaches it.
+    # Junctions bridging two runs merge them even when their gap does
+    # not satisfy the generic chain conditions; a hint fully outside
+    # all runs has no anchor and cannot be decoded anyway.
+    if euk and hint_xy:
+        def _run_of(x):
+            for i, (b0, b1) in enumerate(runs):
+                if b0 * B <= x < min((b1 + 1) * B, L):
+                    return i
+            return -1
+        for hd, ha in hint_xy:
+            i, j = _run_of(hd), _run_of(ha)
+            if i == j:
+                continue
+            if 0 <= i < j:
+                if ha - hd <= max_intron:
+                    spans.append((runs[i][0] * B,
+                                  min((runs[j][1] + 1) * B, L), []))
+            elif i >= 0 and ha - min((runs[i][1] + 1) * B, L) <= max_intron:
+                spans.append((runs[i][0] * B, min(L, ha + 300), []))
+            elif j >= 0 and runs[j][0] * B - hd <= max_intron:
+                spans.append((max(0, hd - 300),
+                              min((runs[j][1] + 1) * B, L), []))
+    # a wider span (chained super-run or hint-linked expansion) fully
+    # contains the standalone spans inside it. Decoding a contained
+    # span separately would only re-emit sub-fragments that compete
+    # with -- and can outscore and suppress -- the full-length spliced
+    # call arbitration produces in the wider context; every candidate
+    # of the narrow span is re-scanned inside the wider one anyway.
+    # Identical bounds from chaining vs hint-merging collapse too.
+    spans = [(a, b, tuple(s)) for a, b, s in dict.fromkeys(
+        (lo, hi, tuple(gs)) for lo, hi, gs in spans)]
+    spans = [(lo, hi, list(gs)) for lo, hi, gs in spans
+             if not any(olo <= lo and hi <= ohi
+                        and (olo, ohi) != (lo, hi)
+                        for olo, ohi, _ in spans)]
+    for lo, hi, gap_seeds in spans:
         # Both strands are always decoded: strand dominance is enforced
         # per-ORF inside _score_orf (over the candidate's own exonic
         # bins) rather than across the whole run -- a whole-run gate
@@ -446,6 +544,7 @@ def _decode_genes(seq: str, res: ContigResult, stops: set, euk: bool,
                 # adjacent genes (and exons across non-multiple-of-3
                 # introns) can occupy different genomic frames within
                 # a single merged coding run
+                b, b2 = lo // B, (hi - 1) // B
                 dom = res.p_frame[b:b2 + 1, g_lo:g_hi].argmax(1)
                 cnt = np.bincount(dom, minlength=3)
                 frames = [g_lo + i for i in range(3) if cnt[i] >= 2]
@@ -459,20 +558,24 @@ def _decode_genes(seq: str, res: ContigResult, stops: set, euk: bool,
                 genes += _emit_orfs(
                     seq, g, lo, hi, res, stops, strand,
                     min_cds_len, euk, min_intron, max_intron,
-                    intron_hints, in_coding, boundary_threshold,
-                    cscore, coding_threshold)
-        b = b2 + 1
-    # dedupe identical CDS intervals (different frame bins can collide)
+                    intron_hints + gap_seeds, in_coding,
+                    boundary_threshold, cscore, coding_threshold)
+    # dedupe identical CDS intervals (different frame bins and chained
+    # vs per-run decodes can collide); score-first ordering keeps the
+    # better-supported variant, e.g. a spliced call over an identical
+    # unspliced span
     seen, uniq = set(), []
-    for g in genes:
+    for g in sorted(genes, key=lambda x: -x.get("score", 0.0)):
         key = (g["start"], g["end"], g["strand"])
         if key not in seen:
             seen.add(key)
             uniq.append(g)
     # Even with frame evidence, bin-runs decoded per-strand can emit
-    # overlapping same-strand ORFs (adjacent runs, snapping drift).
-    # Greedy best-score keep: drop ORFs overlapping a kept one on the
-    # same strand by >50% of their span.
+    # overlapping ORFs (adjacent runs, snapping drift, shadow ORFs on
+    # the opposite strand). Greedy best-score keep: drop ORFs
+    # overlapping a kept one by >50% of their span -- same strand
+    # unconditionally, opposite strand unless the weaker call carries
+    # independent strand evidence of its own.
     uniq = _nonoverlap_select(uniq)
     return sorted(uniq, key=lambda g: (g["start"], g["end"]))
 
@@ -484,10 +587,21 @@ def _nonoverlap_select(genes, max_overlap_frac: float = 0.5) -> list:
         span = g["end"] - g["start"]
         drop = False
         for k in kept:
-            if k["strand"] != g["strand"]:
-                continue
             ov = min(g["end"], k["end"]) - max(g["start"], k["start"])
-            if ov > max_overlap_frac * span:
+            if ov <= max_overlap_frac * span:
+                continue
+            if k["strand"] == g["strand"]:
+                drop = True
+                break
+            # cross-strand overlap: a stop-poor opposite-strand ORF can
+            # shadow a real gene's entire span. Suppress it unless it
+            # carries independent strand evidence (strand_share = the
+            # fraction of frame mass on ITS exonic bins that agrees
+            # with its strand) and a competitive score -- those are the
+            # signatures of a real nested antisense gene.
+            if not (g.get("strand_share", 0.0) >= 0.45
+                    and g.get("score", 0.0)
+                    >= 0.8 * k.get("score", 0.0)):
                 drop = True
                 break
         if not drop:
@@ -567,15 +681,27 @@ def _score_orf(seq, res, cscore, have_frames, g):
     for _g, b0, b1 in ex_bins:
         mask[b0:b1] = True
     if have_frames:
-        body = float(sum(res.p_frame[b0:b1, gx].sum()
-                         for gx, b0, b1 in ex_bins)) / n_bins_tot
+        raw_body = float(sum(res.p_frame[b0:b1, gx].sum()
+                             for gx, b0, b1 in ex_bins)) / n_bins_tot
         s_pos = float(res.p_frame[mask, :3].sum())
         s_neg = float(res.p_frame[mask, 3:6].sum())
         own = s_pos if strand == "+" else s_neg
         if own < 0.25 * (s_pos + s_neg):
             return -1.0
+        # fraction of exonic-bin frame mass on this strand; recorded
+        # for cross-strand overlap arbitration in _nonoverlap_select
+        g["strand_share"] = own / max(1e-9, s_pos + s_neg)
+        # RNA-seq coverage corroborates an exon only in proportion to
+        # its own-strand frame mass: unstranded depth cannot rescue
+        # the minority strand, and a weak-exon frame vote backed by
+        # coverage is worth more than the same vote in empty coverage
+        dt = res.dtilde
+        ev_cov = (float(dt[mask].mean())
+                  if dt is not None and len(dt) >= res.n_bins else 0.0)
+        body = raw_body + 0.15 * g["strand_share"] * ev_cov
     else:
         body = float(cscore[mask].mean())
+        g["strand_share"] = 1.0
     se = a if strand == "+" else bnd
     edge_bin = se // B if strand == "+" else (se - 1) // B
     edge_bin = max(0, min(res.n_bins - 1, edge_bin))
@@ -592,9 +718,23 @@ def _score_orf(seq, res, cscore, have_frames, g):
              else revcomp(seq[max(0, bnd - 3):bnd]).upper())
     prior = 0.0 if codon == "ATG" else -0.15
     cds_len = sum(ee - es + 1 for es, ee in _exon_bounds(g))
+    # short unspliced ORFs need clearly-above-noise support: in
+    # stop-poor sequence a sub-200 bp intergenic ORF can pass the
+    # 50%-coding-bin gate on a handful of weak bins. The 0.35 body
+    # floor sits above the non-coding per-bin frame-mass baseline
+    # (~0.2 on the chr1 benchmark) so such calls must carry real
+    # signal. Spliced calls are exempt -- a short gene with a
+    # motif-validated intron already passed structural scrutiny.
+    if (have_frames and not g.get("introns") and cds_len < 180
+            and body < 0.35):
+        return -1.0
     g["body"] = body
+    # each intron corroborated by a split-alignment hint is a direct
+    # structural vote for the full-length spliced call over its own
+    # sub-fragments
     g["score"] = (body * math.log1p(cds_len)
-                  + 0.5 * (imp + step) + prior)
+                  + 0.5 * (imp + step) + prior
+                  + 0.4 * g.get("n_hint_introns", 0))
     return g["score"]
 
 
@@ -636,6 +776,13 @@ def _better_shared_stop(a, b, res, cscore, have_frames,
             if g_orf is None:
                 g_orf = 3 + (lng["end"] % 3)
         sup = float(res.p_frame[ext_bins, g_orf].mean())
+        # a split-alignment intron inside the longer ORF's extension
+        # corroborates a short partner exon whose window-averaged
+        # frame mass alone falls below the extension gate
+        if (lng.get("n_hint_introns", 0) > sht.get("n_hint_introns", 0)
+                and res.dtilde is not None
+                and len(res.dtilde) >= res.n_bins):
+            sup += 0.25 * float(res.dtilde[ext_bins].mean())
     else:
         sup = float(cscore[ext_bins].mean())
     ref = sht.get("body", 0.0) if have_frames else \
@@ -666,9 +813,14 @@ def _emit_orfs(seq, g, lo, hi, res, stops, strand, min_cds_len,
     L = len(seq)
     B = res.bin_width
     have_frames = res.p_frame[:, :6].sum() > 0
-    # extend search a bit beyond the bin-run so starts/stops can snap
-    s_lo = max(0, lo - 300)
-    s_hi = min(L, hi + 300)
+    hint_xy = [iv for iv in intron_hints if len(iv) == 2]
+    # euk gets a wider transcript-5' margin: short terminal exons can
+    # sit an intron away from the first bin-run that crosses the
+    # coding threshold, so the splice scan must reach further on the
+    # side where a leader exon could be hiding.
+    m5 = min(max_intron, 600) if euk else 300
+    s_lo = max(0, lo - (m5 if strand == "+" else 300))
+    s_hi = min(L, hi + (m5 if strand == "-" else 300))
     by_stop: dict = {}
     for start_edge in _scan_codons(seq, g, "start", s_lo, s_hi, stops):
         stop_edge = _orf_extends(seq, g, start_edge, +1, stops)
@@ -713,7 +865,7 @@ def _emit_orfs(seq, g, lo, hi, res, stops, strand, min_cds_len,
             for o in _emit_spliced_orfs(
                     seq_s, pos, lo, hi, res, stops, strand,
                     min_cds_len, sub, in_coding, seq, cscore,
-                    have_frames, coding_threshold):
+                    have_frames, coding_threshold, hint_xy):
                 if o["score"] < 0:
                     continue
                 se = o["end"] if strand == "+" else o["start"]
@@ -762,9 +914,13 @@ def _splice_candidates(seq, res, lo, hi, strand, min_intron,
     coding = res.p_region[:, 0]
     d_track = res.b_tracks[:, 2] if strand == "+" else res.b_tracks[:, 3]
     a_track = res.b_tracks[:, 3] if strand == "+" else res.b_tracks[:, 2]
-    # (d0, a0, snap_radius)
-    cand = [(iv[0], iv[1], 12) for iv in hints
+    # (d0, a0, snap_radius): 2-tuple hints are evidence proposals and
+    # snap +-12 bp; 3-tuples carry their own radius (chained-run gap
+    # seeds and other structural proposals).
+    cand = [(iv[0], iv[1], iv[2] if len(iv) > 2 else 12)
+            for iv in hints
             if lo < iv[0] < iv[1] < hi]
+    hint_xy = [(iv[0], iv[1]) for iv in hints if len(iv) == 2]
     b_lo = max(1, lo // B)
     b_hi = min(res.n_bins - 1, (hi - 1) // B + 1)
     for b in range(b_lo, b_hi):
@@ -780,6 +936,7 @@ def _splice_candidates(seq, res, lo, hi, strand, min_intron,
         dpos = int(np.argmax(d_track[d_lo:b + 1]) + d_lo)
         apos = int(np.argmax(a_track[b:a_hi + 1]) + b)
         cand.append((dpos * B + B // 2, apos * B + B // 2, B))
+    domf = None
     if have_frames:
         g_lo = 0 if strand == "+" else 3
         domf = res.p_frame[:, g_lo:g_lo + 3].argmax(1)
@@ -790,44 +947,79 @@ def _splice_candidates(seq, res, lo, hi, strand, min_intron,
                 continue
             if domf[bi] != domf[bj]:
                 cand.append((bi * B + B // 2, bj * B + B // 2, B))
+        # weak-signal terminal-exon seeds: a non-coding bin in the
+        # transcript-5' margin carrying real same-strand frame mass can
+        # be a short terminal exon that never reached the coding
+        # threshold. 0.35 sits between the non-coding baseline (median
+        # ~0.23 on the chr1 benchmark) and genuine exonic signal; a
+        # lower cutoff proposes from pure noise, and purely structural
+        # proposals cannot win arbitration anyway because
+        # _better_shared_stop requires extension support on the ORF's
+        # own frame.
+        sm = res.p_frame[:, g_lo:g_lo + 3].sum(1)
+        for bm in range(b_lo, b_hi):
+            if cscore[bm] >= coding_threshold or sm[bm] < 0.35:
+                continue
+            if strand == "+":
+                right = strong[strong > bm]
+                if len(right):
+                    cand.append((bm * B + B // 2,
+                                 int(right[0]) * B + B // 2, B))
+            else:
+                left = strong[strong < bm]
+                if len(left):
+                    cand.append((int(left[-1]) * B + B // 2,
+                                 bm * B + B // 2, B))
+    hint_set = {(iv[0], iv[1]) for iv in hints if len(iv) == 2}
     scored = []
     for d0, a0, rad in cand:
+        # a literal split-alignment hint outranks motif/impulse
+        # heuristics: it gets a score bonus, a tighter snap radius, and
+        # a stronger pull back toward the observed junction
+        is_hint = (d0, a0) in hint_set
         best = None
         for d in range(max(lo + 3, d0 - rad),
                        min(hi - min_intron, d0 + rad + 1)):
             if strand == "+":
-                canon = seq[d:d + 2] == "GT"
+                d_canon = seq[d:d + 2] == "GT"
                 if seq[d:d + 2] not in ("GT", "GC"):
                     continue
             else:
                 # minus strand: transcript acceptor AG -> genomic "CT"
                 # at the intron's LEFT (5'-genomic) end
-                canon = seq[d:d + 2] == "CT"
+                d_canon = seq[d:d + 2] == "CT"
                 if seq[d:d + 2] != "CT":
                     continue
             for acc in range(max(a0 - rad, d + min_intron),
                              min(a0 + rad, d + max_intron, hi) + 1):
                 if strand == "+":
-                    canon = canon and seq[acc - 2:acc] == "AG"
                     if seq[acc - 2:acc] != "AG":
                         continue
+                    a_canon = True
                 else:
                     # minus strand: transcript donor GT -> genomic "AC"
-                    # at the RIGHT (3'-genomic) end
-                    canon = canon and seq[acc - 2:acc] == "AC"
+                    # at the RIGHT (3'-genomic) end; the non-canonical
+                    # GC donor appears as "GC"
+                    a_canon = seq[acc - 2:acc] == "AC"
                     if seq[acc - 2:acc] not in ("AC", "GC"):
                         continue
-                sc = 2.0 if canon else 1.0
+                # canonicality is per-PAIR (donor AND acceptor); the
+                # donor flag must not be folded into a loop-mutated
+                # variable that leaks between acceptor iterations
+                sc = (2.0 if (d_canon and a_canon) else 1.0)
+                sc += 1.5 if is_hint else 0.0
                 sc += float(d_track[min(res.n_bins - 1, d // B)])
                 sc += float(a_track[min(res.n_bins - 1, acc // B)])
                 ib0, ib1 = (d + B - 1) // B, acc // B
                 if ib1 > ib0:
                     sc += float(res.p_region[ib0:ib1, 1].mean())
-                # break ties toward the un-snapped proposal
-                sc -= 0.001 * (abs(d - d0) + abs(acc - a0))
+                # break ties toward the un-snapped proposal; hints pull
+                # harder so every valid acceptor in the snap window is
+                # compared, not just the leftmost
+                sc -= (0.02 if is_hint else 0.001) * (
+                    abs(d - d0) + abs(acc - a0))
                 if best is None or sc > best[0]:
                     best = (sc, d, acc)
-                break
         if best:
             scored.append(best)
     # greedy non-overlapping chain in quality order: a higher-scored
@@ -839,9 +1031,37 @@ def _splice_candidates(seq, res, lo, hi, strand, min_intron,
             continue
         ib0, ib1 = (d + B - 1) // B, acc // B
         if ib1 > ib0:
-            if in_coding[ib0:ib1].mean() > 0.5:
-                continue
-            if res.p_boundary[ib0:ib1].max() > boundary_threshold:
+            # A real intron's interior codes WEAKER than its flanking
+            # exonic bins; a candidate whose interior codes as
+            # strongly as its flanks is carving a continuous exon in
+            # two -- reject unless evidence says otherwise. (A hard
+            # in_coding vote cannot work: candidates are scanned
+            # inside coding runs, so their interior bins are in_coding
+            # by construction and the old check rejected everything.)
+            has_hint = any(abs(d - hd) <= 12 and abs(acc - ha) <= 12
+                           for hd, ha in hint_xy)
+            f_shift = (domf is not None
+                       and int(domf[min(res.n_bins - 1, d // B)])
+                       != int(domf[min(res.n_bins - 1, acc // B)]))
+            if not (has_hint or f_shift):
+                int_c = float(cscore[ib0:ib1].mean())
+                flank = 0.5 * (float(cscore[min(res.n_bins - 1,
+                                               d // B)])
+                               + float(cscore[min(res.n_bins - 1,
+                                                  acc // B)]))
+                if int_c > max(0.75, flank - 0.05):
+                    continue
+            # a strong start/stop impulse inside the candidate marks a
+            # gene boundary, not a splice junction. Splice sites
+            # themselves fire p_boundary (any CDS/non-CDS transition),
+            # so p_boundary cannot discriminate -- compare structural
+            # head mass in the fully-interior bins directly. A split-
+            # alignment hint overrides this veto: observed RNA-seq
+            # reads spanning the junction are direct evidence the two
+            # sides join, whatever the impulse tracks say.
+            if (not has_hint
+                    and res.b_tracks[ib0:ib1, :2].max()
+                    > res.b_tracks[ib0:ib1, 2:4].max()):
                 continue
         chain.append((d, acc))
         chain.sort()
@@ -867,7 +1087,7 @@ def _spliced(seq, lo, hi, introns):
 
 def _emit_spliced_orfs(seq_s, pos, lo, hi, res, stops, strand,
                        min_cds_len, cands, in_coding, seq, cscore,
-                       have_frames, coding_threshold):
+                       have_frames, coding_threshold, hint_xy):
     """Start->stop ORFs on the spliced transcript, mapped to genomic.
 
     Exon-chain phase and junction codons need no explicit check: a
@@ -912,8 +1132,11 @@ def _emit_spliced_orfs(seq_s, pos, lo, hi, res, stops, strand,
                              for d, acc in ivs)]
         if exonic and in_coding[exonic].mean() < 0.5:
             continue
+        n_hint = sum(1 for d, acc in ivs
+                     if any(abs(d - hd) <= 12 and abs(acc - ha) <= 12
+                            for hd, ha in hint_xy))
         cand = {"start": a, "end": bnd, "strand": strand, "frame": None,
-                "introns": ivs, "domains": []}
+                "introns": ivs, "n_hint_introns": n_hint, "domains": []}
         if _score_orf(seq, res, cscore, have_frames, cand) < 0:
             continue
         stop_edge = bnd if strand == "+" else a

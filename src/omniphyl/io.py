@@ -10,6 +10,7 @@ from __future__ import annotations
 import gzip
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -148,9 +149,15 @@ def _dinuc_entropy(subseq: str) -> float:
     return float(-(p * np.log2(p)).sum())
 
 
-def _parse_bed(path: Path) -> dict[str, list[Hsp]]:
+# Row tuple: (contig, start, end, sgenome, sseqid, score, strand).
+# Streaming iterators keep peak memory bounded to one unitig's rows plus
+# the per-contig accumulators, so multi-hundred-MB BED/TSV files no
+# longer materialize millions of Hsp objects up front.
+BedRow = tuple
+
+
+def _iter_bed(path: Path):
     """LexicMap BED6: chrom start end sgenome|sseqid|hspN score strand."""
-    out: dict[str, list[Hsp]] = {}
     with _open(path) as f:
         for line in f:
             if not line.strip() or line.startswith(("#", "track", "browser")):
@@ -164,15 +171,12 @@ def _parse_bed(path: Path) -> dict[str, list[Hsp]]:
             parts = name.split("|")
             sgenome = parts[0] if parts else name
             sseqid = "|".join(parts[:2]) if len(parts) > 1 else name
-            out.setdefault(c[0], []).append(Hsp(
-                int(c[1]), int(c[2]), sgenome, sseqid,
-                float(c[4]), c[5]))
-    return out
+            yield (c[0], int(c[1]), int(c[2]), sgenome, sseqid,
+                   float(c[4]), c[5])
 
 
-def _parse_bedgraph(path: Path) -> dict[str, list[Hsp]]:
-    """bedGraph -> pseudo-HSPs (density rows; no per-hit metadata)."""
-    out: dict[str, list[Hsp]] = {}
+def _iter_bedgraph(path: Path):
+    """bedGraph rows -> pseudo-hits (density rows; no per-hit metadata)."""
     with _open(path) as f:
         for line in f:
             if not line.strip() or line.startswith(("#", "track", "browser")):
@@ -180,15 +184,12 @@ def _parse_bedgraph(path: Path) -> dict[str, list[Hsp]]:
             c = line.split()
             if len(c) < 4:
                 continue
-            out.setdefault(c[0], []).append(Hsp(
-                int(c[1]), int(c[2]), "bedgraph", "bedgraph",
-                float(c[3]), "+"))
-    return out
+            yield (c[0], int(c[1]), int(c[2]), "bedgraph", "bedgraph",
+                   float(c[3]), "+")
 
 
-def _parse_tsv(path: Path) -> dict[str, list[Hsp]]:
+def _iter_tsv(path: Path):
     """Raw LexicMap TSV (1-based inclusive qstart..qend -> 0-based)."""
-    out: dict[str, list[Hsp]] = {}
     with _open(path) as f:
         header = None
         for line in f:
@@ -206,20 +207,66 @@ def _parse_tsv(path: Path) -> dict[str, list[Hsp]]:
             sgenome = col.get("sgenome", "")
             sseqid = col.get("sseqid", "")
             hsp = col.get("hsp", "")
-            out.setdefault(col.get("query", ""), []).append(Hsp(
-                min(qs, qe) - 1, max(qs, qe),
-                sgenome, f"{sgenome}|{sseqid}|hsp{hsp}",
-                float(col.get("bitscore", 0) or 0),
-                col.get("sstr", "+")))
-    return out
+            yield (col.get("query", ""), min(qs, qe) - 1, max(qs, qe),
+                   sgenome, f"{sgenome}|{sseqid}|hsp{hsp}",
+                   float(col.get("bitscore", 0) or 0),
+                   col.get("sstr", "+"))
+
+
+class _ContigAcc:
+    """Bounded-memory per-contig accumulator for streaming LexicMap rows.
+
+    Only KEPT intervals are retained: per-SRA-run interval lists (for the
+    capped coverage track), endpoint bin counts, split-alignment support
+    counts, and the SRA run set. Rows themselves are discarded after
+    their unitig block is processed, so peak memory scales with kept
+    evidence rather than raw file size.
+    """
+
+    __slots__ = ("by_run", "ep_cnt", "support", "sra_runs", "bg_ivs",
+                 "hsps_kept", "max_end")
+
+    def __init__(self):
+        self.by_run: dict[str, list] = {}   # sgenome -> [(s, e), ...]
+        self.ep_cnt: Counter = Counter()    # bin -> endpoint impulses
+        self.support: Counter = Counter()   # (d, acc) -> split count
+        self.sra_runs: set = set()
+        self.bg_ivs: list = []              # (s, e, val) bedGraph rows
+        self.hsps_kept: list = []
+        self.max_end = 0
+
+
+def _hsp_seq_ok(seq: str, s: int, e: int, min_entropy: float) -> bool:
+    """Sequence-quality screen for one HSP interval.
+
+    Softmasked lowercase bases are NOT ambiguous: `b.upper() not in
+    "ACGT"` only counts true N/ambiguous symbols, so a softmasked
+    (lowercase) repeat does not automatically discard the hit. The
+    dinucleotide-entropy floor still rejects homopolymer / microsatellite
+    sequence itself (AT-rich exons of e.g. P. falciparum sit ~1.5-2.2
+    bits; simple repeats fall below).
+    """
+    sub = seq[s:e]
+    if not sub:
+        return True
+    ambig = sum(1 for b in sub if b.upper() not in "ACGT")
+    if ambig > 0.2 * len(sub):
+        return False
+    return _dinuc_entropy(sub) >= min_entropy
 
 
 def load_lexicmap_evidence(bed_path=None, bedgraph_path=None,
                            tsv_path=None, source: str = "rnaseq",
                            min_score: float = 150.0,
-                           min_len: int = 60, max_per_run: int = 2,
+                           min_len: int = 60,
+                           min_single_score: float = 350.0,
+                           min_intron_support: int = 1,
+                           min_entropy: float = 1.5,
+                           max_per_run: int = 2,
+                           max_introns: int = 500,
                            bin_width: int = 50,
                            contig_seqs: dict | None = None,
+                           keep_hsps: bool = False,
                            ) -> dict[str, ContigEvidence]:
     """Parse + filter LexicMap hits into per-contig evidence tracks.
 
@@ -229,103 +276,179 @@ def load_lexicmap_evidence(bed_path=None, bedgraph_path=None,
       "genomic" - whole-genome index: coverage is weak conservation only;
                   endpoint/intron evidence is dropped entirely.
 
-    Filters (applied to .bed/.tsv; .bedGraph rows arrive pre-aggregated):
-      score >= min_score, length >= min_len, dinucleotide entropy >= 1.8,
-      <=20% ambiguous bases; then per-SRA-run depth is capped at
-      max_per_run per bin so d(x) measures independent sample support.
+    Two-tier unitig-aware filtering (.bed/.tsv only):
+      * Chained unitigs -- a (sseqid, strand) group with >=2 HSPs
+        spanning a plausible intron gap (35-5000 bp) AND an anchor HSP
+        with score >= min_single_score -- keep partner HSPs down to
+        score >= min_score and length >= min(min_len, 45), so a short
+        exon paired with a strong anchor on the same transcript unitig
+        survives a global bitscore cutoff that would otherwise erase
+        split alignments.
+      * All other groups are held to a stricter singleton floor
+        (score >= min_single_score, length >= max(min_len, 90)) so
+        low-scoring hits from distant relatives or repetitive regions
+        contribute only where they form a coherent split alignment.
+      * Softmasked (lowercase) sequence is NOT ambiguous; only non-ACGT
+        symbols count toward the 20% ambiguity limit, and dinucleotide
+        entropy must be >= min_entropy (default 1.5).
+      * Rows of one unitig are expected adjacent in the file (true for
+        lexicmap_to_ucsc output); an interleaved unitig is processed as
+        multiple groups, which only weakens (never fabricates) its
+        chain status.
+      * Per-SRA-run depth is capped at max_per_run per bin so d(x)
+        measures independent sample support; intron candidates require
+        >= min_intron_support corroborating splits and are capped at the
+        top max_introns by support.
+      * ev.hsps is [] unless keep_hsps=True -- nothing downstream reads
+        it, and retaining millions of HSP objects is the dominant RAM
+        cost on full SRA-index output.
     """
     if tsv_path:
-        raw = _parse_tsv(Path(tsv_path))
+        stream = _iter_tsv(Path(tsv_path))
+        per_hit_meta = True
     elif bed_path:
-        raw = _parse_bed(Path(bed_path))
+        stream = _iter_bed(Path(bed_path))
+        per_hit_meta = True
     elif bedgraph_path:
-        raw = _parse_bedgraph(Path(bedgraph_path))
+        stream = _iter_bedgraph(Path(bedgraph_path))
+        per_hit_meta = False
     else:
         return {}
-    per_hit_meta = not bedgraph_path  # bedGraph has no run/hit identity
 
-    out: dict[str, ContigEvidence] = {}
-    for contig, hsps in raw.items():
-        seq = (contig_seqs or {}).get(contig)
-        clen = len(seq) if seq else max(h.end for h in hsps)
-        nbins = max(1, math.ceil(clen / bin_width))
-        ev = ContigEvidence()
-        ev.density = np.zeros(nbins, np.float32)
-        ev.endpoints = np.zeros(nbins, np.float32)
+    seqs = contig_seqs or {}
+    accs: dict[str, _ContigAcc] = {}
 
-        kept: list[Hsp] = []
-        for h in hsps:
-            if per_hit_meta:
-                if h.score < min_score or h.end - h.start < min_len:
-                    continue
-                if seq is not None:
-                    sub = seq[max(0, h.start):min(clen, h.end)]
-                    if sub:
-                        ambig = sum(1 for b in sub
-                                    if b.upper() not in "ACGT") + sum(
-                            1 for b in sub if b.islower())
-                        if ambig > 0.2 * len(sub):
-                            continue
-                        if _dinuc_entropy(sub) < 1.8:
-                            continue
-            kept.append(h)
-        ev.hsps = kept
-        ev.sra_runs = {h.sgenome for h in kept if per_hit_meta}
-
-        if not per_hit_meta:
-            # bedGraph rows are already per-interval densities; copy the
-            # row value into covered bins (max wins on overlaps)
-            for h in kept:
-                b0 = h.start // bin_width
-                b1 = (h.end - 1) // bin_width
-                ev.density[b0:b1 + 1] = np.maximum(
-                    ev.density[b0:b1 + 1], h.score)
+    def _flush_unitig(rows, st: _ContigAcc, seq, clen):
+        """Two-tier keep decision + accumulation for one unitig block."""
+        if not rows:
+            return
+        rows = sorted(rows, key=lambda r: r[1])
+        has_link = any(35 <= b[1] - a[2] <= 5000
+                       for a, b in zip(rows, rows[1:]))
+        anchor = any(r[5] >= min_single_score for r in rows)
+        if has_link and anchor:
+            sel = [r for r in rows
+                   if r[5] >= min_score
+                   and r[2] - r[1] >= min(min_len, 45)]
         else:
-            # per-SRA-run capped depth per bin: d[b] = Σ_r min(cnt_r, cap)
-            # computed as raw coverage minus per-run excess; runs with
-            # <= cap total HSPs can never exceed the cap anywhere.
-            diff = np.zeros(nbins + 1, np.float64)
-            for h in kept:
-                diff[h.start // bin_width] += 1
-                diff[(h.end - 1) // bin_width + 1] -= 1
-            ev.density = np.cumsum(diff)[:nbins]
-            by_run: dict[str, list] = {}
-            for h in kept:
-                by_run.setdefault(h.sgenome, []).append(h)
-            for hsps_r in by_run.values():
-                if len(hsps_r) <= max_per_run:
-                    continue
-                diff_r = np.zeros(nbins + 1, np.float64)
-                for h in hsps_r:
-                    diff_r[h.start // bin_width] += 1
-                    diff_r[(h.end - 1) // bin_width + 1] -= 1
-                cnt_r = np.cumsum(diff_r)[:nbins]
-                ev.density -= np.maximum(0.0, cnt_r - max_per_run)
-            ev.density = ev.density.astype(np.float32)
-
-        if source == "rnaseq" and per_hit_meta:
-            # endpoint impulses (splice-junction candidates), skipping
-            # edges within 25 bp of contig ends / N-gaps
-            for h in kept:
-                for x in (h.start, h.end):
+            sel = [r for r in rows
+                   if r[5] >= max(min_score, min_single_score)
+                   and r[2] - r[1] >= max(min_len, 90)]
+        if not sel:
+            return
+        kept = []
+        for r in sel:
+            s, e = r[1], r[2]
+            if seq is not None and not _hsp_seq_ok(
+                    seq, max(0, s), min(clen, e), min_entropy):
+                continue
+            kept.append(r)
+            st.by_run.setdefault(r[3], []).append((s, e))
+            st.sra_runs.add(r[3])
+            st.max_end = max(st.max_end, e)
+        for a, b in zip(kept, kept[1:]):
+            gap = b[1] - a[2]
+            if 35 <= gap <= 5000:
+                st.support[(a[2], b[1])] += 1
+        if source == "rnaseq":
+            for r in kept:
+                for x in (r[1], r[2]):
                     if x < 25 or x > clen - 25:
                         continue
-                    if seq is not None and "N" in seq[x - 5:x + 5]:
+                    if (seq is not None
+                            and "N" in seq[x - 5:x + 5].upper()):
                         continue
-                    ev.endpoints[min(x // bin_width, nbins - 1)] += 1
-            if ev.endpoints.max() > 0:
-                ev.endpoints /= ev.endpoints.max()
-            # split-alignment intron candidates: same unitig, same
-            # orientation, genomic gap in [35, 5000]
-            by_unitig: dict[tuple, list] = {}
-            for h in kept:
-                by_unitig.setdefault((h.sseqid, h.strand), []).append(h)
-            for group in by_unitig.values():
-                group.sort(key=lambda h: h.start)
-                for a, b in zip(group, group[1:]):
-                    gap = b.start - a.end
-                    if 35 <= gap <= 5000:
-                        ev.intron_candidates.append((a.end, b.start))
+                    st.ep_cnt[x // bin_width] += 1
+        if keep_hsps:
+            st.hsps_kept.extend(Hsp(r[1], r[2], r[3], r[4], r[5], r[6])
+                                for r in kept)
+
+    cur_key = None
+    cur_rows: list = []
+    for rec in stream:
+        contig, s, e, sgenome, sseqid, score, strand = rec
+        st = accs.setdefault(contig, _ContigAcc())
+        if not per_hit_meta:
+            st.bg_ivs.append((s, e, score))
+            st.max_end = max(st.max_end, e)
+            continue
+        ukey = (contig, sseqid, strand)
+        if ukey != cur_key:
+            if cur_rows:
+                pc = cur_rows[0][0]
+                _flush_unitig(cur_rows, accs[pc], seqs.get(pc),
+                              len(seqs[pc]) if pc in seqs
+                              else accs[pc].max_end)
+            cur_key, cur_rows = ukey, []
+        cur_rows.append(rec)
+    if cur_rows:
+        pc = cur_rows[0][0]
+        _flush_unitig(cur_rows, accs[pc], seqs.get(pc),
+                      len(seqs[pc]) if pc in seqs else accs[pc].max_end)
+
+    out: dict[str, ContigEvidence] = {}
+    for contig, st in accs.items():
+        seq = seqs.get(contig)
+        clen = len(seq) if seq else st.max_end
+        if clen <= 0:
+            continue
+        nbins = max(1, math.ceil(clen / bin_width))
+        ev = ContigEvidence()
+        ev.hsps = st.hsps_kept
+        ev.sra_runs = st.sra_runs
+        if not per_hit_meta:
+            ev.density = np.zeros(nbins, np.float32)
+            for s, e, v in st.bg_ivs:
+                b0 = s // bin_width
+                b1 = (e - 1) // bin_width
+                ev.density[b0:b1 + 1] = np.maximum(
+                    ev.density[b0:b1 + 1], v)
+        else:
+            # per-SRA-run capped depth per bin: d[b] = sum_r
+            # min(cnt_r, cap), computed as raw coverage minus each
+            # over-cap run's excess; runs with <= cap HSPs can never
+            # exceed the cap anywhere.
+            diff = np.zeros(nbins + 1, np.float64)
+            for ivs in st.by_run.values():
+                for s, e in ivs:
+                    if s // bin_width >= nbins:
+                        continue
+                    diff[s // bin_width] += 1
+                    diff[min((e - 1) // bin_width, nbins - 1) + 1] -= 1
+            density = np.cumsum(diff)[:nbins]
+            for ivs in st.by_run.values():
+                if len(ivs) <= max_per_run:
+                    continue
+                diff_r = np.zeros(nbins + 1, np.float64)
+                for s, e in ivs:
+                    if s // bin_width >= nbins:
+                        continue
+                    diff_r[s // bin_width] += 1
+                    diff_r[min((e - 1) // bin_width, nbins - 1)
+                           + 1] -= 1
+                cnt_r = np.cumsum(diff_r)[:nbins]
+                density -= np.maximum(0.0, cnt_r - max_per_run)
+            ev.density = density.astype(np.float32)
+            if source == "rnaseq":
+                ev.endpoints = np.zeros(nbins, np.float32)
+                for b, c in st.ep_cnt.items():
+                    if b < nbins:
+                        ev.endpoints[b] = c
+                # p95 (not max) normalization: one hyper-expressed
+                # locus must not squash every other junction's impulse
+                nz = ev.endpoints[ev.endpoints > 0]
+                if len(nz):
+                    scale = max(float(np.percentile(nz, 95)), 1.0)
+                    ev.endpoints = np.minimum(1.0,
+                                              ev.endpoints / scale)
+                # deduplicated split-alignment candidates ordered by
+                # descending support so high-depth junctions win the
+                # greedy non-overlap chain in _splice_candidates
+                ev.intron_candidates = [
+                    iv for iv, c in sorted(
+                        st.support.items(),
+                        key=lambda kv: (-kv[1], kv[0]))
+                    if c >= min_intron_support][:max_introns]
         out[contig] = ev
     return out
 
