@@ -1,0 +1,17 @@
+{
+  "id": "daniellecallan/omniphyl-gene-bench-plasmo",
+  "title": "omniphyl-gene-bench-plasmo",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "daniellecallan/omniphyl-v5-20k",
+    "daniellecallan/omniphyl-v6",
+    "daniellecallan/omniphyl-v6-ckpts"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}
