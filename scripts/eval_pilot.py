@@ -74,6 +74,11 @@ from train_omniphyl import (OmniPhyl, FragmentDataset, build_cell_lut,
                              encode_cont_labels, encode_annot_labels,
                              MS_KS, HASH_K, HASH_PAD,
                              rc_index_map)
+# Canonical implementations now live in src/omniphyl/; train_omniphyl
+# already inserted that path onto sys.path above.
+from omniphyl.encode import STOPS, STARTS, scan_transition  # noqa: E402
+from omniphyl.model import (ancestor_chains, build_parent_of,  # noqa: E402
+                            path_scores)
 
 RANK_ORDER = RANKS  # domain -> ... -> species
 TOPK_CONS = 512     # sparse log-prob entries stored per frag per rank
@@ -135,35 +140,6 @@ def auprc(y: np.ndarray, s: np.ndarray):
     return float((tp / np.arange(1, len(y) + 1) * y[o]).sum() / y.sum())
 
 
-STOPS = {"TAA", "TAG", "TGA"}
-STARTS = {"ATG", "GTG", "TTG"}  # ~15-20% of prokaryotic starts are non-ATG
-
-
-def scan_transition(seq: str, frame: int, kind: str,
-                    pred_pos: float):
-    """Canonical triplet edge coordinate nearest pred_pos in `frame`.
-
-    Stage-2 of the frame-scan pathway: given the predicted frame and a
-    predicted transition coordinate (window-relative bp), return the
-    genomic edge position of the closest ATG (start) or stop codon in
-    that frame, or None when no canonical triplet exists. Edge coords
-    match the fetcher's convention: CDS-interval start/end boundary,
-    transcript-oriented on the minus strand.
-    """
-    rev = frame >= 3
-    s2 = seq[::-1].translate(str.maketrans("ACGT", "TGCA")) if rev else seq
-    L = len(s2)
-    off = (frame - 3) if rev else frame
-    cands = STARTS if kind == "start" else STOPS
-    best, bd = None, 1e18
-    for i in range(off, L - 2, 3):
-        if s2[i:i + 3] not in cands:
-            continue
-        edge = (L - i if kind == "start" else L - i - 3) if rev \
-            else (i if kind == "start" else i + 3)
-        if abs(edge - pred_pos) < bd:
-            bd, best = abs(edge - pred_pos), edge
-    return best
 
 
 def macro_f1(pred: list[int], true: list[int],
@@ -203,74 +179,6 @@ def confusion_matrix_tsv(pred: list[int], true: list[int],
     return "\n".join(lines)
 
 
-def build_parent_of(rows_iter, vocab: dict, ranks: list[str]) -> dict:
-    """Majority-vote parent map when the checkpoint lacks ckpt["tree"].
-
-    parent_of[r][c] = shifted class id of the most common parent-rank
-    name on label rows carrying class c; 0 = parent missing/out-of-vocab.
-    Identical construction to train_omniphyl.build_tree's parent vote.
-    """
-    votes = {r: defaultdict(Counter) for r in ranks[1:]}
-    for m in rows_iter:
-        for ri in range(1, len(ranks)):
-            c_name = m.get(ranks[ri], "")
-            if c_name in vocab[ranks[ri]]:
-                votes[ranks[ri]][c_name][m.get(ranks[ri - 1], "")] += 1
-    parent_of = {}
-    for ri, r in enumerate(ranks):
-        po = np.zeros(len(vocab[r]) + 1, dtype=np.int64)
-        if ri:
-            for name, c in vocab[r].items():
-                pv = votes[r].get(name)
-                if pv:
-                    pname = pv.most_common(1)[0][0]
-                    po[c + 1] = vocab[ranks[ri - 1]].get(pname, -1) + 1
-        parent_of[r] = po
-    return parent_of
-
-
-def ancestor_chains(parent_of: dict, ranks: list[str]) -> dict:
-    """chains[r] -> int64 [n_r, ri+1]: col j = ancestor class id at
-    ranks[j] for each class id at rank r (col ri = self; 0 = ancestor
-    exists but is out-of-vocab/mask class; -1 = no parent known)."""
-    chains = {}
-    for ri, r in enumerate(ranks):
-        n = len(parent_of[r])
-        cols = [np.arange(n, dtype=np.int64)]
-        cur = np.arange(n, dtype=np.int64)
-        for k in range(ri, 0, -1):
-            po_k = parent_of[ranks[k]]
-            nxt = np.where(cur > 0, po_k[np.maximum(cur, 0)], -1)
-            cols.insert(0, nxt)
-            cur = nxt
-        chains[r] = np.stack(cols, axis=1)
-    return chains
-
-
-def path_scores(logp: dict, chain: np.ndarray,
-                ranks: list[str]) -> torch.Tensor:
-    """Mean log-probability of each rank-r class's full ancestor path.
-
-    chain: [C_r, L] numpy ancestor ids (col L-1 = self, -1 = missing).
-    logp[rk]: [B, C_rk] log-softmax tensors. Ancestor id 0 (the
-    out-of-vocab mask class) is treated as missing — its logit is an
-    untrained free parameter and carries no signal.
-    Returns [B, C_r] path-consistent scores (geometric-mean log-space).
-    """
-    ch = torch.from_numpy(chain)
-    valid = ch > 0                     # mask of usable ancestor evidence
-    denom = valid.sum(1).float()
-    acc = torch.zeros(next(iter(logp.values())).size(0), ch.size(0))
-    for j in range(ch.size(1)):
-        ids = ch[:, j].clamp(min=0)
-        g = logp[ranks[j]][:, ids]     # [B, C_r]
-        acc += g * valid[:, j].float()
-    # classes with zero usable ancestor evidence (the mask class 0, or
-    # fully-orphaned lineages) must not get score 0.0 — that would beat
-    # every real (negative) mean-logp path score.
-    score = acc / denom.clamp(min=1).unsqueeze(0)
-    score[:, denom == 0] = float("-inf")
-    return score
 
 
 FIXED_TAUS = (0.5, 0.7, 0.8, 0.9, 0.95)
