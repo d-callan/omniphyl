@@ -469,10 +469,13 @@ def _decode_genes(seq: str, res: ContigResult, stops: set, euk: bool,
                   intron_hints: list) -> list:
     """Segment bins -> ORF/splice-snapped gene models on both strands.
 
-    Runs of high fused-coding-score bins define candidate regions; inside
-    each region the dominant global frame per strand is decoded by
-    start->stop ORF scanning, and (euk mode) interior dips linked by
-    splice motifs become introns.
+    Two-pass design: pass 1 (here + _emit_orfs) finds coding blocks and
+    emits ATG->stop ORFs; pass 2 (euk mode) treats each motif-validated
+    splice candidate as a scored edge and selects excision subsets via
+    top-K DP (_intron_sets), so intron-vs-intergenic is an explicit
+    per-junction evidence decision rather than a window-level class.
+    A taxon-conditioned intron-length prior (_intron_prior) biases edge
+    scores; ORF scans on each subset validate phase/junction implicitly.
     """
     # softmasked (lowercase) sequence is biologically identical to its
     # uppercase form -- all codon/motif comparisons below are exact-
@@ -587,6 +590,7 @@ def _decode_genes(seq: str, res: ContigResult, stops: set, euk: bool,
              if not any(olo <= lo and hi <= ohi
                         and (olo, ohi) != (lo, hi)
                         for olo, ohi, _ in spans)]
+    iprior = _intron_prior(res)
     for lo, hi, gap_seeds in spans:
         # Both strands are always decoded: strand dominance is enforced
         # per-ORF inside _score_orf (over the candidate's own exonic
@@ -615,7 +619,8 @@ def _decode_genes(seq: str, res: ContigResult, stops: set, euk: bool,
                     seq, g, lo, hi, res, stops, strand,
                     min_cds_len, euk, min_intron, max_intron,
                     intron_hints + gap_seeds, in_coding,
-                    boundary_threshold, cscore, coding_threshold)
+                    boundary_threshold, cscore, coding_threshold,
+                    iprior)
     # dedupe identical CDS intervals (different frame bins and chained
     # vs per-run decodes can collide); score-first ordering keeps the
     # better-supported variant, e.g. a spliced call over an identical
@@ -846,9 +851,72 @@ def _better_shared_stop(a, b, res, cscore, have_frames,
     return lng if sup >= 0.5 * ref else sht
 
 
+def _intron_sets(scored, iprior, K=8):
+    """Top-K intron excision sets from scored splice candidates.
+
+    Replaces blind all/singles/adjacent-pairs subset enumeration: the
+    set of candidates a transcript should excise is a PATH decision
+    problem -- each candidate is an edge, excision sets are subsets in
+    position order (candidates arrive as a non-overlapping chain), and
+    the evidence score decides which edges belong. A spurious junction
+    scores below zero after the taxon-conditioned length penalty
+    `alpha * |len - mu| / sigma`, so it is skipped by every
+    high-scoring subset instead of mis-framing an excise-all scan.
+
+    The empty set (unspliced) and every singleton are always returned:
+    a weak-scoring intron that is nevertheless real still gets an
+    ORF-scan emission and score arbitration decides. K-best subsets
+    are found by keep/skip DP in position order.
+    """
+    mu, sigma, alpha = iprior
+    adj = [sc - alpha * abs((a - d) - mu) / sigma
+           for sc, d, a in scored]
+    best = [(0.0, ())]
+    for i, sc in enumerate(adj):
+        best += [(s + sc, st + (i,)) for s, st in best]
+        best = sorted(best, key=lambda x: -x[0])[:K]
+    idx_sets = {st for _s, st in best} | {(i,)
+                                        for i in range(len(scored))}
+    return [[(scored[i][1], scored[i][2]) for i in st]
+            for st in idx_sets]
+
+
+# Taxon-conditioned intron-length prior (mu, sigma, alpha), matched on
+# the deepest annotated rank name. Values are soft penalties -- alpha
+# scales how strongly a candidate's deviation from the clade's typical
+# intron length counts against its edge score. Chosen from reported
+# clade medians (e.g. ~100-180 bp in Apicomplexa, ~80 bp in fungi,
+# kb-scale in metazoa); the generic fallback is deliberately wide so
+# unknown taxa are barely constrained.
+_INTRON_LENGTH_PRIORS = {
+    "apicomplexa": (150.0, 100.0, 0.6),
+    "kinetoplast": (40.0, 30.0, 0.8),
+    "ascomycota": (80.0, 50.0, 0.8),
+    "basidiomycota": (80.0, 50.0, 0.8),
+    "microsporidia": (50.0, 40.0, 0.8),
+    "chordata": (1000.0, 1500.0, 0.25),
+    "arthropoda": (500.0, 800.0, 0.3),
+    "nematoda": (300.0, 400.0, 0.3),
+    "streptophyta": (300.0, 500.0, 0.3),
+}
+_INTRON_PRIOR_DEFAULT = (200.0, 600.0, 0.4)
+
+
+def _intron_prior(res):
+    """(mu, sigma, alpha) intron-length prior from the contig's pooled
+    taxonomy call; generic eukaryote fallback when unclassified."""
+    tax = getattr(res, "taxon", None)
+    names = getattr(tax, "names", None) or {}
+    blob = " ".join(str(names.get(r, "")).lower() for r in RANKS)
+    for key, prior in _INTRON_LENGTH_PRIORS.items():
+        if key in blob:
+            return prior
+    return _INTRON_PRIOR_DEFAULT
+
+
 def _emit_orfs(seq, g, lo, hi, res, stops, strand, min_cds_len,
                euk, min_intron, max_intron, intron_hints, in_coding,
-               boundary_threshold, cscore, coding_threshold):
+               boundary_threshold, cscore, coding_threshold, iprior):
     """Within one coding bin-run, emit ORFs that overlap the run;
     alternative starts sharing a stop are collapsed to the longest.
 
@@ -906,16 +974,15 @@ def _emit_orfs(seq, g, lo, hi, res, stops, strand, min_cds_len,
             by_stop[stop_edge] = _better_shared_stop(
                 prev, cand, res, cscore, have_frames, coding_threshold)
     if euk:
-        cands = _splice_candidates(
+        scored = _splice_candidates(
             seq, res, s_lo, s_hi, strand, min_intron, max_intron,
             intron_hints, boundary_threshold, in_coding, cscore,
             have_frames, coding_threshold)
-        # [] = unspliced frame-free scan: needed even when introns are
-        # proposed (ORFs in non-dominant frames), and it is the only
-        # frame-free coverage when no candidates exist.
-        subsets = [[]] + ([cands] if cands else []) + \
-            [[iv] for iv in cands] + \
-            [cands[i:i + 2] for i in range(len(cands) - 1)]
+        cands = [(d, a) for _sc, d, a in scored]
+        # excision subsets come from the top-K scored paths over the
+        # candidate chain (empty set + all singletons guaranteed); ORF
+        # scans on each set validate phase/junction implicitly.
+        subsets = _intron_sets(scored, iprior)
         for sub in subsets:
             seq_s, pos = _spliced(seq, s_lo, s_hi, sub)
             for o in _emit_spliced_orfs(
@@ -933,6 +1000,28 @@ def _emit_orfs(seq, g, lo, hi, res, stops, strand, min_cds_len,
                     by_stop[se] = _better_shared_stop(
                         prev, o, res, cscore, have_frames,
                         coding_threshold)
+        # stop-rescue splice walk: a per-ATG codon walk that excises a
+        # proposed intron only when an in-frame stop falls fully inside
+        # it. The subset enumeration above cannot assemble multi-intron
+        # transcripts when >2 introns are needed or when any single
+        # false junction in [cands] mis-frames the excise-all variant;
+        # here each start builds its own excision set, so a wrong
+        # candidate elsewhere in the span cannot pollute the call.
+        for o in _rescued_spliced_orfs(
+                seq, s_lo, s_hi, cands, strand, res, stops,
+                min_cds_len, lo, hi, in_coding, cscore,
+                have_frames, coding_threshold, hint_xy):
+            if o["score"] < 0:
+                continue
+            se = o["end"] if strand == "+" else o["start"]
+            prev = by_stop.get(se)
+            if prev is None:
+                o["frame"] = g
+                by_stop[se] = o
+            else:
+                by_stop[se] = _better_shared_stop(
+                    prev, o, res, cscore, have_frames,
+                    coding_threshold)
     out.extend(by_stop.values())
     return out
 
@@ -944,8 +1033,7 @@ def _splice_candidates(seq, res, lo, hi, strand, min_intron,
 
     Proposal sources:
       * evidence split-alignment hints (exact coords, snapped +-12 bp);
-      * model dips: a coding sag, an intron-head bin
-        (p_region[:,1] >= 0.15), or a local coding minimum, linked to
+      * model dips: a coding sag or local coding minimum linked to
         donor/acceptor impulse mass in neighbouring bins;
       * frame-shift transitions: consecutive coding bins on this
         strand whose dominant same-strand frame differs -- a short
@@ -957,14 +1045,16 @@ def _splice_candidates(seq, res, lo, hi, strand, min_intron,
     so they snap to canonical splice motifs within +-B; evidence hints
     snap within +-12 bp. Candidate pairs are scored by motif class
     (canonical GT-AG / CT-AC preferred over GC-AG / AC-GC) plus
-    donor/acceptor impulse and intron-head mass, then filtered to a
-    greedy non-overlapping chain in score order. Fully-interior bins
+    donor/acceptor impulse mass, then filtered to a greedy
+    non-overlapping chain in score order. Fully-interior bins
     that still look coding (candidate carved out of an exon) or that
     carry a gene-boundary impulse (candidate fusing two genes across
     an intergenic gap) are rejected. Junction codon/phase checks are
     deliberately absent -- they are implicit once the accepted set is
     excised and ORFs are scanned on the spliced transcript.
-    Returns an ordered list of (donor_end, acceptor_start) pairs.
+    Returns an ordered list of (score, donor_end, acceptor_start)
+    triples; the score is the junction evidence used by _intron_sets
+    to rank excision subsets.
     """
     B = res.bin_width
     coding = res.p_region[:, 0]
@@ -982,10 +1072,9 @@ def _splice_candidates(seq, res, lo, hi, strand, min_intron,
     for b in range(b_lo, b_hi):
         dip = (coding[b] <= 0.35
                and coding[b - 1] >= 0.5 and coding[b + 1] >= 0.5)
-        intron_head = res.p_region[b, 1] >= 0.15
         local_min = (coding[b] < coding[b - 1] - 0.1
                      and coding[b] < coding[b + 1] - 0.1)
-        if not (dip or intron_head or local_min):
+        if not (dip or local_min):
             continue
         d_lo = max(0, b - 3)
         a_hi = min(res.n_bins - 1, b + 3)
@@ -1066,9 +1155,6 @@ def _splice_candidates(seq, res, lo, hi, strand, min_intron,
                 sc += 1.5 if is_hint else 0.0
                 sc += float(d_track[min(res.n_bins - 1, d // B)])
                 sc += float(a_track[min(res.n_bins - 1, acc // B)])
-                ib0, ib1 = (d + B - 1) // B, acc // B
-                if ib1 > ib0:
-                    sc += float(res.p_region[ib0:ib1, 1].mean())
                 # break ties toward the un-snapped proposal; hints pull
                 # harder so every valid acceptor in the snap window is
                 # compared, not just the leftmost
@@ -1083,7 +1169,7 @@ def _splice_candidates(seq, res, lo, hi, strand, min_intron,
     scored.sort(key=lambda x: -x[0])
     chain = []
     for _sc, d, acc in scored:
-        if not all(acc <= od or d >= oa for od, oa in chain):
+        if not all(acc <= od or d >= oa for _os, od, oa in chain):
             continue
         ib0, ib1 = (d + B - 1) // B, acc // B
         if ib1 > ib0:
@@ -1119,8 +1205,8 @@ def _splice_candidates(seq, res, lo, hi, strand, min_intron,
                     and res.b_tracks[ib0:ib1, :2].max()
                     > res.b_tracks[ib0:ib1, 2:4].max()):
                 continue
-        chain.append((d, acc))
-        chain.sort()
+        chain.append((_sc, d, acc))
+        chain.sort(key=lambda t: t[1])
     return chain
 
 
@@ -1203,6 +1289,101 @@ def _emit_spliced_orfs(seq_s, pos, lo, hi, res, stops, strand,
             by_stop[stop_edge] = _better_shared_stop(
                 prev, cand, res, cscore, have_frames, coding_threshold)
     return list(by_stop.values())
+
+
+def _rescued_spliced_orfs(seq, s_lo, s_hi, cands, strand, res, stops,
+                          min_cds_len, lo, hi, in_coding, cscore,
+                          have_frames, coding_threshold, hint_xy):
+    """ATG->stop ORF walk with stop-rescue splicing, per strand.
+
+    Reads codons linearly on the strand's transcript; when an in-frame
+    stop falls fully inside an un-excised candidate intron, the intron
+    is excised -- already-consumed intronic positions are dropped from
+    the transcript, preserving codon phase across the junction -- and
+    the walk resumes at the acceptor. Only introns whose excision is
+    forced by a stop get spliced, so a false proposal never enters a
+    call; candidates without in-frame stops still rely on the subset
+    enumeration and score arbitration in the caller.
+
+    Returns the same candidate dict shape as _emit_spliced_orfs.
+    """
+    B = res.bin_width
+    if strand == "+":
+        tseq = seq[s_lo:s_hi]
+        t2g = [s_lo + t for t in range(s_hi - s_lo)]
+        cand_t = sorted((d - s_lo, a - s_lo) for d, a in cands
+                        if s_lo < d < a < s_hi)
+    else:
+        tseq = revcomp(seq[s_lo:s_hi])
+        t2g = [s_hi - 1 - t for t in range(s_hi - s_lo)]
+        cand_t = sorted((s_hi - a, s_hi - d) for d, a in cands
+                        if s_lo < d < a < s_hi)
+    n = len(tseq)
+    out = []
+    for t0 in range(n - 2):
+        if tseq[t0:t0 + 3] != "ATG":
+            continue
+        # tx = transcript indices consumed, in reading order; a rescue
+        # pops the intronic tail so triplet assembly across the
+        # junction is automatic (len(tx) mod 3 is the phase).
+        jump, excised = {}, []
+        tx = [t0]
+        p = t0
+        while True:
+            nxt = jump.get(p + 1, p + 1)
+            if nxt >= n:
+                tx = None
+                break
+            tx.append(nxt)
+            p = nxt
+            if len(tx) % 3:
+                continue
+            cod = tseq[tx[-3]] + tseq[tx[-2]] + tseq[tx[-1]]
+            if cod not in stops:
+                continue
+            # a stop codon overlapping an un-excised intron is not a
+            # real transcript codon -- any intronic base in it is
+            # replaced by splicing. Excise the intron and continue;
+            # a false proposal yields a mis-phased continuation that
+            # loses score arbitration downstream.
+            hit = next(((d, a) for d, a in cand_t
+                        if (d, a) not in excised
+                        and d <= tx[-1] and tx[-3] < a), None)
+            if hit is None:
+                break
+            d, a = hit
+            excised.append((d, a))
+            jump[d] = a
+            while tx and tx[-1] >= d:
+                tx.pop()
+            p = tx[-1] if tx else d - 1
+        if tx is None:
+            continue
+        if strand == "+":
+            a, bnd = t2g[tx[0]], t2g[tx[-1]] + 1
+            ivs = [(s_lo + d, s_lo + ac) for d, ac in excised]
+        else:
+            a, bnd = t2g[tx[-1]], t2g[tx[0]] + 1
+            ivs = [(s_hi - ac, s_hi - d) for d, ac in excised]
+        if bnd - a < min_cds_len or a >= hi or bnd <= lo:
+            continue
+        # ORF-body support over EXONIC bins only (same gate as
+        # _emit_spliced_orfs: intronic bins are transcribed, not coding)
+        exonic = [b for b in range(a // B,
+                                   min(res.n_bins, (bnd - 1) // B + 1))
+                  if not any(d <= b * B and (b + 1) * B <= ac
+                             for d, ac in ivs)]
+        if exonic and in_coding[exonic].mean() < 0.5:
+            continue
+        n_hint = sum(1 for d, ac in ivs
+                     if any(abs(d - hd) <= 12 and abs(ac - ha) <= 12
+                            for hd, ha in hint_xy))
+        cand = {"start": a, "end": bnd, "strand": strand, "frame": None,
+                "introns": ivs, "n_hint_introns": n_hint, "domains": []}
+        if _score_orf(seq, res, cscore, have_frames, cand) < 0:
+            continue
+        out.append(cand)
+    return out
 
 
 # ---------------------------------------------------------- outputs ------

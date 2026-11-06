@@ -703,6 +703,46 @@ def test_apply_ablate():
     check("p_region kept", res.p_region[:, 0].sum() > 0)
 
 
+def test_decode_stop_rescue_multi_intron():
+    """A gene whose ORF must cross TWO non-adjacent introns while a
+    false candidate sits between them in score order: the all/singles/
+    adjacent-pairs subset enumeration cannot produce the real excision
+    set (any pair containing the false intron mis-frames the
+    transcript), so only the per-ATG stop-rescue walk emits the full
+    spliced gene. Each real intron carries an in-frame stop so its
+    excision is forced; the false candidate is a motif-valid intron
+    carved out of exon 2 whose interior has no in-frame stop, so the
+    walk skips it."""
+    from omniphyl.annotate import _decode_genes, STOPS
+    L, B = 6000, 50
+    # gene: ATG@900 - exon1(900-1500) - intron1(1500-2400) -
+    #       exon2(2400-3300) - intron2(3300-4200) - exon3(4200-4800) - TAA
+    # false candidate: (2550, 2650) inside exon2, length %3 != 0 so the
+    # excise-all subset mis-frames downstream.
+    seq = _place("A" * L, [(900, "ATG"),
+                           (1500, "GT"), (1503, "TAA"), (2398, "AG"),
+                           (2550, "GT"), (2648, "AG"),
+                           (3300, "GT"), (3303, "TAA"), (4198, "AG"),
+                           (4800, "TAA")])
+    res = _mk_result(L, B,
+                     coding=[(15, 30, 0.7), (30, 48, 0.1), (48, 66, 0.7),
+                             (66, 84, 0.1), (84, 100, 0.7)],
+                     frame=[(18, 30, 0, 0.7), (48, 66, 0, 0.7),
+                            (84, 96, 0, 0.7)],
+                     btr=[(18, 19, 0, 0.6)])
+    hints = [(1500, 2400), (2550, 2650), (3300, 4200)]
+    genes = _decode_genes(seq, res, STOPS, True, 0.0, 90, 0.5, 0.5,
+                          35, 5000, hints)
+    check("one gene", len(genes) == 1, genes)
+    if genes:
+        g = genes[0]
+        check("full span", (g["start"], g["end"]) == (900, 4803),
+              (g["start"], g["end"]))
+        check("real introns only",
+              g.get("introns") == [(1500, 2400), (3300, 4200)],
+              g.get("introns"))
+
+
 def test_annotate_e2e():
     print("[annotate e2e]")
     with tempfile.TemporaryDirectory() as td:
@@ -750,6 +790,7 @@ def main():
            test_fuse_cosine_support, test_fuse_fwd_frame_remap,
            test_fuse_rev_frame_remap, test_fuse_impulse_placement,
            test_fuse_region_fallback, test_apply_ablate,
+           test_decode_stop_rescue_multi_intron,
            test_annotate_e2e]
     for f in fns:
         f()

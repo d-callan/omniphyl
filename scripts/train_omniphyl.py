@@ -588,9 +588,13 @@ def main():
                          "length crop (70% contiguous sub-window, 30% "
                          "unmerged paired-end) during training")
     ap.add_argument("--region-head", action="store_true",
-                    help="E3: add region_fracs 4-way soft head "
-                         "[coding, intron, rna, intergenic] with "
-                         "inverse-prior weight on non-coding windows")
+                    help="DEPRECATED: retired. The 4-way window-level "
+                         "[coding, intron, rna, intergenic] composition "
+                         "head was unlearnable for long-intron interiors "
+                         "(dead weight: intron-vs-intergenic is a context "
+                         "decision, resolved in the decoder DAG). The flag "
+                         "is accepted but ignored; older checkpoints "
+                         "trained with it still load and decode.")
     ap.add_argument("--struct-head", action="store_true",
                     help="E4: add active_frame (8-way) + struct_flags "
                          "(4-bit) heads on cat([z, 144-d per-frame aa "
@@ -618,6 +622,11 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cpu", action="store_true")
     args = ap.parse_args()
+    if args.region_head:
+        print("WARNING: --region-head is retired (intron-vs-intergenic "
+              "is resolved in the decoder, not per-window); ignoring.",
+              file=sys.stderr)
+        args.region_head = False
 
     device = "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
     torch.manual_seed(args.seed)
@@ -779,6 +788,14 @@ def main():
         bnd_n = torch.zeros((), device=device)
         off_err = torch.zeros((), device=device)
         off_n = torch.zeros((), device=device)
+        # per-head annotation metrics (eval only): these are the
+        # numbers the gene decoder actually depends on -- a global
+        # val loss cannot reveal a dead donor/acceptor flag head.
+        frame_ok = torch.zeros((), device=device)
+        frame_n = torch.zeros((), device=device)
+        fl_tp = torch.zeros((), device=device)
+        fl_fp = torch.zeros((), device=device)
+        fl_fn = torch.zeros((), device=device)
         for x, y, yc in loader:
             if isinstance(x, dict):
                 x = {kk: v.to(device) for kk, v in x.items()}
@@ -921,14 +938,33 @@ def main():
                     p_off = torch.sigmoid(logits["offset"][:, 0][om])
                     off_err += (p_off - yc[om, 1]).detach().abs().sum()
                     off_n += om.sum()
+                if yc.size(1) > 2:
+                    ya = yc[:, 2:]
+                    if "active_frame" in logits:
+                        lm = ya[:, 4] >= 0
+                        frame_ok += (logits["active_frame"].argmax(1)[lm]
+                                     == ya[lm, 4]).sum()
+                        frame_n += lm.sum()
+                    if "struct_flags" in logits:
+                        lm = ya[:, 5] >= 0
+                        pr = (torch.sigmoid(
+                            logits["struct_flags"][lm]) > 0.5)
+                        tg = ya[lm, 5:9] > 0.5
+                        fl_tp += (pr & tg).sum()
+                        fl_fp += (pr & ~tg).sum()
+                        fl_fn += (~pr & tg).sum()
         if train:
             return float(tot_loss_t) / max(tot_n, 1), {}, {}
         accs = {t: (float(correct[t]) / max(float(total[t]), 1))
                 for t in cls_targets}
+        tp, fp, fn = float(fl_tp), float(fl_fp), float(fl_fn)
         extras = {
             "frac_mae": float(frac_err) / max(float(frac_n), 1),
             "boundary_acc": float(bnd_ok) / max(float(bnd_n), 1),
             "offset_mae": float(off_err) / max(float(off_n), 1),
+            "frame_acc": float(frame_ok) / max(float(frame_n), 1),
+            "flags_p": tp / max(tp + fp, 1),
+            "flags_r": tp / max(tp + fn, 1),
         }
         return float(tot_loss_t) / max(tot_n, 1), accs, extras
 
