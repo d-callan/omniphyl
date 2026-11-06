@@ -8,8 +8,7 @@
   "enable_gpu": false,
   "enable_internet": true,
   "dataset_sources": [
-    "daniellecallan/omniphyl-v5-20k",
-    "daniellecallan/omniphyl-v6",
+    "daniellecallan/plasmodb71-pf3d7",
     "daniellecallan/omniphyl-v6-ckpts"
   ],
   "competition_sources": [],
