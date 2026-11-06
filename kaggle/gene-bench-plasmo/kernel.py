@@ -200,7 +200,10 @@ try:
         rc, _ = sh([sys.executable, "-m", "uv", "venv", "--python", "3.12",
                     str(uv)])
         if rc == 0:
-            sh([str(uv / "bin/pip"), "install", "-q", "tensorflow-cpu"])
+            # Tiberius core deps omit bricks2marble (needed by
+            # tiberius.main) — it lives in the from_source extra
+            sh([str(uv / "bin/pip"), "install", "-q", "tensorflow-cpu",
+                "bricks2marble[tf]"])
             rc, _ = sh(["git", "clone", "--depth", "1",
                         "https://github.com/Gaius-Augustus/Tiberius",
                         str(WORK / "Tiberius")])
@@ -213,7 +216,8 @@ try:
         sh(["git", "clone", "--depth", "1",
             "https://github.com/Gaius-Augustus/Tiberius",
             str(WORK / "Tiberius")])
-        sh([tpy, "-m", "pip", "install", "-q", str(WORK / "Tiberius")])
+        sh([tpy, "-m", "pip", "install", "-q", str(WORK / "Tiberius"),
+            "bricks2marble[tf]"])
 
     # pick a clade cfg: Fungi first (user call — no protozoan model
     # exists for either tool), then SAR/protist clades as fallback
