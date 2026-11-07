@@ -152,7 +152,8 @@ def assemble_cluster(seqs: list[str], k: int = 21, min_overlap: int = 30,
 def cluster_reads(ids: list[str], seqs: list[str], k: int = 21,
                   min_shared: int = 2, max_kmer_freq: float = 0.10,
                   max_cluster_reads: int = 64,
-                  min_overlap: int = 30
+                  min_overlap: int = 30,
+                  assemble: bool = True
                   ) -> list[tuple[list[str], list[str]]]:
     """Shared-kmer clustering -> per-cluster assembled unit sequences.
 
@@ -235,8 +236,10 @@ def cluster_reads(ids: list[str], seqs: list[str], k: int = 21,
 
     out = []
     for members in groups.values():
-        if len(members) == 1:
-            out.append(([ids[members[0]]], [seqs[members[0]]]))
+        if len(members) == 1 or not assemble:
+            # singleton, or pool-reads mode: emit member reads as-is
+            out.append(([ids[i] for i in members],
+                        [seqs[i] for i in members]))
         else:
             out.append(([ids[i] for i in members],
                         assemble_cluster([seqs[i] for i in members],
@@ -319,6 +322,7 @@ def run_profile(model_path, inputs, out_prefix: Path,
                 min_overlap: int = 30,
                 pack_below: int = 300,
                 domain_threshold: float = 0.5,
+                pool_reads: bool = False,
                 verbose: bool = True) -> dict:
     """Run profiling; writes precontig/taxonomy/function outputs;
     returns the summary dict."""
@@ -369,16 +373,23 @@ def run_profile(model_path, inputs, out_prefix: Path,
                                    min_shared=cluster_min_shared,
                                    max_kmer_freq=cluster_max_kmer_freq,
                                    max_cluster_reads=cluster_max_reads,
-                                   min_overlap=min_overlap)
+                                   min_overlap=min_overlap,
+                                   assemble=not pool_reads)
             by_id = dict(zip(ids, seqs))
             for gi, (members, useqs) in enumerate(groups):
-                # >= pack_below = real pre-contig windows; shorter
-                # leftovers 'N'-packed into <=500 bp virtual fragments
-                big = [s for s in useqs if len(s) >= pack_below]
-                frags = big + pack_fragments(
-                    [s for s in useqs if len(s) < pack_below])
-                virt = [False] * len(big) + \
-                    [True] * (len(frags) - len(big))
+                if pool_reads:
+                    # cluster defines the pooling group only; each
+                    # member read is its own real model input
+                    frags = useqs
+                    virt = [False] * len(frags)
+                else:
+                    # >= pack_below = real pre-contig windows; shorter
+                    # leftovers 'N'-packed into <=500 bp virtual frags
+                    big = [s for s in useqs if len(s) >= pack_below]
+                    frags = big + pack_fragments(
+                        [s for s in useqs if len(s) < pack_below])
+                    virt = [False] * len(big) + \
+                        [True] * (len(frags) - len(big))
                 ws, wvirt = [], []
                 for sq, v in zip(frags, virt):
                     w = _windows(sq, W, S)

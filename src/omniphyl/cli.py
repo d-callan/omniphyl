@@ -120,6 +120,10 @@ def _profile_parser(sub):
                     help="assembled seqs shorter than this are "
                          "'N'-packed into virtual <=500 bp fragments "
                          "instead of strided as real pre-contigs")
+    cl.add_argument("--pool-reads", action="store_true",
+                    help="skip unitig assembly: clusters only define "
+                         "pooling groups, each member read is its own "
+                         "model input")
     return ap
 
 
@@ -177,6 +181,7 @@ def main(argv=None) -> int:
             cluster_max_reads=args.cluster_max_reads,
             min_overlap=args.min_overlap,
             pack_below=args.pack_below,
+            pool_reads=args.pool_reads,
             domain_threshold=args.domain_threshold,
             verbose=not args.quiet)
     return 0
