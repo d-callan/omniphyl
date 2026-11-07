@@ -40,7 +40,8 @@ from omniphyl.model import (  # noqa: E402
     build_parent_of, build_flat_priors, RANKS)
 from omniphyl.encode import (  # noqa: E402
     FeatureEncoder, scan_transition, HASH_LEN)
-from omniphyl.profile import cluster_reads, _canon_kmers  # noqa: E402
+from omniphyl.profile import (  # noqa: E402
+    cluster_reads, _canon_kmers, translate_frame, pack_fragments)
 
 PASS, FAIL = [], []
 
@@ -266,17 +267,38 @@ def test_cluster():
     r2 = base[50:250]
     r3 = "".join(rng.choice(list("ACGT")) for _ in range(200))
     groups = cluster_reads(["r1", "r2", "r3"], [r1, r2, r3],
-                           min_shared=2, max_chunk=500)
+                           min_shared=2)
     member_sets = sorted(sorted(m) for m, _ in groups)
     check("shared-kmer cluster joins r1+r2",
           ["r1", "r2"] in member_sets, member_sets)
-    joined = [j for m, j in groups if len(m) > 1]
-    if joined:
-        check("joined chunk <= 500bp", len(joined[0]) <= 500)
+    # cluster returns per-cluster assembled seq lists
+    assembled = [sq for m, sqs in groups if len(m) > 1 for sq in sqs]
+    check("assembled pre-contig produced", len(assembled) >= 1)
+    if assembled:
+        # true unitig length = union of the two reads (250 bp)
+        check("assembly covers union span",
+              max(len(s) for s in assembled) >= 250,
+              [len(s) for s in assembled])
+        check("assembly is a subsequence of truth",
+              any(base.find(s) >= 0 or
+                  revcomp(base).find(s) >= 0
+                  for s in assembled if len(s) >= 250),
+              [len(s) for s in assembled])
     # canonical kmer = rc-invariant
     check("canon kmer rc-invariant",
           _canon_kmers("ACGTACGTACGTACGTACGTAC", 21)
           == _canon_kmers(revcomp("ACGTACGTACGTACGTACGTAC"), 21))
+    # translate_frame: forward ATG AAA TAA -> MK*, reverse strand
+    check("translate frame 0",
+          translate_frame("ATGAAATAA", 0) == "MK*")
+    check("translate frame 3 revcomp",
+          translate_frame("TTATTTCAT", 3) == "MK*")
+    # pack_fragments: two 200bp pieces fit one 405bp chunk
+    packed = pack_fragments(["A" * 200, "C" * 200, "G" * 480])
+    check("pack respects max_chunk",
+          all(len(p) <= 500 for p in packed), [len(p) for p in packed])
+    check("pack keeps pieces intact",
+          packed[0].count("N") >= 5 and packed[0].startswith("A"))
 
 
 def test_feature_encoder():

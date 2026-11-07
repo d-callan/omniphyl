@@ -105,14 +105,21 @@ def _profile_parser(sub):
     ap.add_argument("--mode", choices=["auto", "contig", "precontig",
                                        "raw"], default="auto")
     ap.add_argument("--window", type=int, default=500)
-    ap.add_argument("--stride", type=int, default=100)
+    ap.add_argument("--stride", type=int, default=250)
     ap.add_argument("--domain-threshold", type=float, default=0.5)
-    # pre-contig clustering
+    # pre-contig clustering + assembly
     cl = ap.add_argument_group("pre-contig clustering")
     cl.add_argument("--cluster-k", type=int, default=21)
     cl.add_argument("--cluster-min-shared", type=int, default=2)
     cl.add_argument("--cluster-max-kmer-freq", type=float, default=0.10)
-    cl.add_argument("--cluster-max-chunk", type=int, default=500)
+    cl.add_argument("--cluster-max-reads", type=int, default=64,
+                    help="max reads per pre-contig cluster")
+    cl.add_argument("--min-overlap", type=int, default=30,
+                    help="min suffix-prefix overlap for unitig merge")
+    cl.add_argument("--pack-below", type=int, default=300,
+                    help="assembled seqs shorter than this are "
+                         "'N'-packed into virtual <=500 bp fragments "
+                         "instead of strided as real pre-contigs")
     return ap
 
 
@@ -167,7 +174,9 @@ def main(argv=None) -> int:
             cluster_k=args.cluster_k,
             cluster_min_shared=args.cluster_min_shared,
             cluster_max_kmer_freq=args.cluster_max_kmer_freq,
-            cluster_max_chunk=args.cluster_max_chunk,
+            cluster_max_reads=args.cluster_max_reads,
+            min_overlap=args.min_overlap,
+            pack_below=args.pack_below,
             domain_threshold=args.domain_threshold,
             verbose=not args.quiet)
     return 0

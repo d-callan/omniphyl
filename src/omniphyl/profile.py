@@ -3,29 +3,39 @@
 Modes (docs/inference-plan.md §4):
   contig    - assembly contigs/scaffolds windowed like annotate; per-
               contig reconciled calls; abundance = fraction of BASES.
-  precontig - raw reads joined into ~500 bp virtual fragments by
-              canonical 21-mer shared-kmer clustering; abundance =
-              fraction of READS assigned to each lineage.
+  precontig - raw reads assembled into local unitigs ("pre-contigs") by
+              canonical-kmer clustering + greedy overlap-layout merge;
+              windows pooled per unit. abundance = fraction of READS.
   raw       - each read a unit (truncated/padded to model length);
               abundance = fraction of READS.
 
 Abundance is *sequence* abundance (bases or reads), NOT cell/genome-copy
 abundance — the report says so explicitly.
+
+Per-unit pooled predictions go beyond taxonomy: coding probability
+(coding_frac mean), dominant active frame (active_frame head), Pfam /
+InterPro domain hits (domains head), and an in-frame translated peptide
+for units the model believes are coding.
 """
 from __future__ import annotations
 
 import json
-import sys
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 
-from .encode import BASE2DIGIT, HASH_LEN
-from .io import iter_paired_sequences, iter_sequences
-from .model import OmniPhylPredictor, RANKS
+from .encode import _AA_LUT, AA_LETTERS, BASE2DIGIT
+from .io import iter_paired_sequences, iter_sequences, revcomp
+from .model import OmniPhylPredictor
 
 MAX_INPUT = 500          # model input budget (HASH_LEN bound)
+
+# coding status thresholds on the mean sigmoid coding_frac of a unit's
+# windows: deliberate gap between the labels because fragment-level
+# coding estimates are noisy at read scale.
+CODING_HI = 0.5
+CODING_LO = 0.3
 
 
 # ------------------------------------------------------- k-mer utils ---
@@ -49,17 +59,85 @@ def _canon_kmers(seq: str, k: int = 21) -> set:
     return set(np.minimum(idx, ridx).tolist())
 
 
+# ------------------------------------------------ pre-contig assembly --
+
+
+def _overlap_len(a: str, b: str, k: int = 21,
+                 min_id: float = 0.90) -> int:
+    """Longest suffix-prefix overlap of `a` onto `b` (>=k, identity
+    >= min_id), or 0. Vectorized per candidate length."""
+    la, lb = len(a), len(b)
+    maxl = min(la, lb)
+    if maxl < k:
+        return 0
+    A = np.frombuffer(a.encode("ascii", "replace"), dtype=np.uint8)
+    B = np.frombuffer(b.encode("ascii", "replace"), dtype=np.uint8)
+    best = 0
+    for L in range(k, maxl + 1):
+        if int((A[la - L:] == B[:L]).sum()) >= min_id * L:
+            best = L
+    return best
+
+
+def _end_anchors(seq: str, flank: int = 200, k: int = 15) -> tuple:
+    """(head, tail) canonical k-mer sets over the sequence's ends.
+
+    Any true >= k overlap must share an anchor; used to prune the
+    O(n^2) overlap scan. Short anchor k (15) tolerates mismatch-dense
+    overlaps that would erase all 21-mer anchors."""
+    return (_canon_kmers(seq[:flank], k), _canon_kmers(seq[-flank:], k))
+
+
+def assemble_cluster(seqs: list[str], k: int = 21, min_overlap: int = 30,
+                     min_id: float = 0.90) -> list[str]:
+    """Greedy overlap-layout merge of one cluster's reads -> unitig(s).
+
+    Best-overlap-first rounds; each pair is tried in both orientations
+    (b vs revcomp(b)) since read strands are arbitrary. Returns one or
+    more merged sequences -- an edge-connected cluster can still resolve
+    into disjoint contigs (insertion gap / divergent haplotype)."""
+    items = [s.upper() for s in seqs]
+    anchors = [_end_anchors(s) for s in items]
+    while len(items) > 1:
+        best = None
+        for i in range(len(items)):
+            for j in range(len(items)):
+                if i == j:
+                    continue
+                a = items[i]
+                for bb in (items[j], revcomp(items[j])):
+                    bh, _bt = _end_anchors(bb)
+                    # a-tail must share an anchor with b-head for a->b
+                    if not (anchors[i][1] & bh):
+                        continue
+                    L = _overlap_len(a, bb, k, min_id)
+                    if L >= min_overlap and \
+                            (best is None or L > best[0]):
+                        best = (L, i, j, bb)
+        if best is None:
+            break
+        L, i, j, bb = best
+        items[i] = items[i] + bb[L:]
+        anchors[i] = _end_anchors(items[i])
+        items.pop(j)
+        anchors.pop(j)
+    return items
+
+
 def cluster_reads(ids: list[str], seqs: list[str], k: int = 21,
                   min_shared: int = 2, max_kmer_freq: float = 0.10,
-                  max_chunk: int = 500, sep: str = "NNNNN"
-                  ) -> list[tuple[list[str], str]]:
-    """Bounded shared-kmer clustering -> virtual 'N'-joined fragments.
+                  max_cluster_reads: int = 64,
+                  min_overlap: int = 30
+                  ) -> list[tuple[list[str], list[str]]]:
+    """Shared-kmer clustering -> per-cluster assembled unit sequences.
 
-    Union-find over reads sharing >= min_shared canonical k-mers.
-    K-mers seen in > max_kmer_freq fraction of reads are ignored
-    (repeats / universal markers would chain everything together).
-    A cluster stops accepting new reads once joining would exceed
-    max_chunk bp.
+    Union-find over reads sharing >= min_shared canonical k-mers; a
+    union is only allowed while the merged cluster stays under
+    max_cluster_reads (bounds memory + transitive chaining). K-mers
+    occurring in > max_kmer_freq of reads are masked (repeats /
+    universal markers would chain unrelated loci). Each cluster is then
+    overlap-assembled; returns (member_ids, [assembled seqs]) --
+    usually one seq, more when assembly splits into disjoint contigs.
     """
     n = len(seqs)
     ksets = [_canon_kmers(s, k) for s in seqs]
@@ -78,7 +156,7 @@ def cluster_reads(ids: list[str], seqs: list[str], k: int = 21,
                 index[km].append(i)
 
     parent = list(range(n))
-    size = [len(s) for s in seqs]
+    size = [1] * n                     # cluster READ count
 
     def find(x):
         while parent[x] != x:
@@ -100,37 +178,104 @@ def cluster_reads(ids: list[str], seqs: list[str], k: int = 21,
         ri, rj = find(i), find(j)
         if ri == rj:
             continue
-        # bounded cluster length: joining must stay under max_chunk
-        if size[ri] + len(sep) + size[rj] > max_chunk:
+        if size[ri] + size[rj] > max_cluster_reads:
             continue
         parent[rj] = ri
-        size[ri] += len(sep) + size[rj]
+        size[ri] += size[rj]
 
     groups: dict[int, list[int]] = defaultdict(list)
     for i in range(n):
         groups[find(i)].append(i)
+
     out = []
     for members in groups.values():
-        joined = sep.join(seqs[i][:max_chunk] for i in members)
-        out.append(([ids[i] for i in members], joined[:max_chunk]))
+        if len(members) == 1:
+            out.append(([ids[members[0]]], [seqs[members[0]]]))
+        else:
+            out.append(([ids[i] for i in members],
+                        assemble_cluster([seqs[i] for i in members],
+                                         min_overlap=min_overlap)))
     return out
+
+
+def pack_fragments(seqs: list[str], max_chunk: int = MAX_INPUT,
+                   sep: str = "NNNNN") -> list[str]:
+    """'N'-join short unit seqs into <= max_chunk fragments, each seq
+    kept intact (k-mer spectrum is additive across the N break)."""
+    frags, cur = [], ""
+    for s in seqs:
+        piece = s[:max_chunk]
+        cand = piece if not cur else cur + sep + piece
+        if len(cand) > max_chunk:
+            frags.append(cur)
+            cur = piece
+        else:
+            cur = cand
+    if cur:
+        frags.append(cur)
+    return frags
+
+
+# ---------------------------------------------------- translation -----
+
+
+def translate_frame(seq: str, frame: int) -> str:
+    """In-frame peptide (standard code) for a 0-5 frame index.
+
+    frames 0/1/2 = forward offsets; 3/4/5 = reverse-complement offsets
+    (matches the model's active_frame head ordering). Codons containing
+    non-ACGT bases -> 'X'; stop -> '*'."""
+    if frame >= 3:
+        seq = revcomp(seq)
+        frame -= 3
+    codes = BASE2DIGIT[np.frombuffer(seq.upper().encode("ascii",
+                                                          "replace"),
+                                     dtype=np.uint8)]
+    aas = []
+    for i in range(frame, len(codes) - 2, 3):
+        c = codes[i:i + 3]
+        if (c < 0).any():
+            aas.append("X")
+            continue
+        aa = int(_AA_LUT[c[0] * 16 + c[1] * 4 + c[2]])
+        aas.append("*" if aa == len(AA_LETTERS) else AA_LETTERS[aa])
+    return "".join(aas)
 
 
 # --------------------------------------------------------- run_profile ---
 
 
+def _windows(seq: str, W: int, S: int) -> list:
+    """Strided windows over a unit seq, tail-window included."""
+    starts = ([0] if len(seq) <= W else
+              list(range(0, len(seq) - W + 1, S)))
+    if starts and starts[-1] + W < len(seq):
+        starts.append(len(seq) - W)
+    return [seq[a:a + W] for a in starts]
+
+
+def _rows(arr, idxs):
+    """Row-slice helper: None-safe array index, returns stacked rows."""
+    if arr is None or not idxs:
+        return None
+    return arr[idxs]
+
+
 def run_profile(model_path, inputs, out_prefix: Path,
                 mode: str = "auto", reads2=None,
-                window: int = 500, stride: int = 100,
+                window: int = 500, stride: int = 250,
                 batch_size: int = 256, device: str = "auto",
                 flat_prior_tau: float | None = None,
                 conf_tau: float = 0.5, anc_tau: float = 0.2,
                 cluster_k: int = 21, cluster_min_shared: int = 2,
                 cluster_max_kmer_freq: float = 0.10,
-                cluster_max_chunk: int = 500,
+                cluster_max_reads: int = 64,
+                min_overlap: int = 30,
+                pack_below: int = 300,
                 domain_threshold: float = 0.5,
                 verbose: bool = True) -> dict:
-    """Run profiling; writes taxonomy/pfam/reads TSVs; returns report."""
+    """Run profiling; writes precontig/taxonomy/function outputs;
+    returns the summary dict."""
     out_prefix = Path(out_prefix)
     pred = OmniPhylPredictor(model_path, device=device,
                              flat_prior_tau=flat_prior_tau,
@@ -139,146 +284,227 @@ def run_profile(model_path, inputs, out_prefix: Path,
 
     # resolve mode
     if mode == "auto":
-        first = str(inputs[0])
-        n_sample = 0
         mode = "contig"
-        for _i, s, _c in iter_sequences(Path(first)):
+        n_sample = 0
+        for _i, s, _c in iter_sequences(Path(str(inputs[0]))):
             n_sample += 1
             if len(s) < 800:
                 mode = "precontig"
             if n_sample >= 200:
                 break
 
-    units: list[tuple] = []   # (unit_id, [member_ids], [seqs or windows])
+    # units: id, member read ids, emitted seqs, windows split into
+    # real vs 'N'-joined virtual (encoded with zeroed pos channels)
+    units: list[dict] = []
     if mode == "contig":
         for path in inputs:
             for cid, seq, cov in iter_sequences(Path(path)):
-                ws = []
-                starts = ([0] if len(seq) <= W else
-                          list(range(0, len(seq) - W + 1, S)))
-                if starts and starts[-1] + W < len(seq):
-                    starts.append(len(seq) - W)
-                for a in starts:
-                    w = seq[a:a + W]
-                    if sum(1 for b in w if b.upper() not in "ACGT") \
-                            <= 0.5 * len(w):
-                        ws.append(w)
-                units.append((cid, [cid], seq, ws, float(cov), len(seq)))
+                ws = [w for w in _windows(seq, W, S)
+                      if sum(1 for b in w if b.upper() not in "ACGT")
+                      <= 0.5 * len(w)]
+                units.append({"id": cid, "members": [cid],
+                              "seqs": [seq], "windows": ws,
+                              "virtual": [False] * len(ws),
+                              "cov": float(cov), "bp": len(seq)})
     elif mode in ("precontig", "raw"):
         ids, seqs = [], []
-        for path in inputs:
-            for rid, s, c in iter_sequences(Path(path)):
+        if reads2:
+            for rid, s, _c in iter_paired_sequences(Path(inputs[0]),
+                                                    Path(reads2)):
                 ids.append(rid)
                 seqs.append(s)
-        if reads2:
-            ids2 = []
-            seqs2 = []
-            for rid, s, c in iter_paired_sequences(Path(inputs[0]),
-                                                   Path(reads2)):
-                ids2.append(rid)
-                seqs2.append(s)
-            ids, seqs = ids2, seqs2
+        else:
+            for path in inputs:
+                for rid, s, _c in iter_sequences(Path(path)):
+                    ids.append(rid)
+                    seqs.append(s)
         if mode == "precontig":
             groups = cluster_reads(ids, seqs, k=cluster_k,
                                    min_shared=cluster_min_shared,
                                    max_kmer_freq=cluster_max_kmer_freq,
-                                   max_chunk=cluster_max_chunk)
-            for gi, (members, joined) in enumerate(groups):
-                units.append((f"cluster_{gi}", members, joined,
-                              [joined], 1.0, len(joined)))
+                                   max_cluster_reads=cluster_max_reads,
+                                   min_overlap=min_overlap)
+            by_id = dict(zip(ids, seqs))
+            for gi, (members, useqs) in enumerate(groups):
+                # >= pack_below = real pre-contig windows; shorter
+                # leftovers 'N'-packed into <=500 bp virtual fragments
+                big = [s for s in useqs if len(s) >= pack_below]
+                frags = big + pack_fragments(
+                    [s for s in useqs if len(s) < pack_below])
+                virt = [False] * len(big) + \
+                    [True] * (len(frags) - len(big))
+                ws, wvirt = [], []
+                for sq, v in zip(frags, virt):
+                    w = _windows(sq, W, S)
+                    ws += w
+                    wvirt += [v] * len(w)
+                units.append({"id": f"pc_{gi}", "members": members,
+                              "seqs": frags, "windows": ws,
+                              "virtual": wvirt, "cov": 1.0,
+                              "bp": sum(len(by_id[m]) for m in members)})
         else:
             for rid, s in zip(ids, seqs):
-                w = s[:W]
-                units.append((rid, [rid], s, [w], 1.0, len(s)))
+                units.append({"id": rid, "members": [rid], "seqs": [s],
+                              "windows": [s[:W]], "virtual": [False],
+                              "cov": 1.0, "bp": len(s)})
 
     if verbose:
         print(f"omniphyl profile [{mode}]: {len(units)} units, "
-              f"{sum(len(u[3]) for u in units):,} model inputs")
+              f"{sum(len(u['windows']) for u in units):,} model inputs")
 
-    # batch inference
-    all_seqs = [w for u in units for w in u[3]]
-    virtual = mode == "precontig"
-    bp = pred.predict_sequences(all_seqs, batch_size=batch_size,
-                                virtual_joined=virtual)
+    # batch inference: real vs virtual windows in separate predict calls
+    # (virtual_joined zeroes positional channels for 'N'-joined frags)
+    seqs_r, seqs_v = [], []
+    for u in units:
+        u["rows_r"], u["rows_v"] = [], []
+        for w, v in zip(u["windows"], u["virtual"]):
+            if v:
+                u["rows_v"].append(len(seqs_v))
+                seqs_v.append(w)
+            else:
+                u["rows_r"].append(len(seqs_r))
+                seqs_r.append(w)
+    bp_r = (pred.predict_sequences(seqs_r, batch_size=batch_size,
+                                   virtual_joined=False)
+            if seqs_r else None)
+    bp_v = (pred.predict_sequences(seqs_v, batch_size=batch_size,
+                                   virtual_joined=True)
+            if seqs_v else None)
+
+    def rows(name, u, dict_key=None):
+        """Concatenate a unit's rows across both batches for field
+        `name` (or dict field keyed by `dict_key`)."""
+        parts = []
+        for bp, key in ((bp_r, "rows_r"), (bp_v, "rows_v")):
+            if bp is None or not u[key]:
+                continue
+            arr = getattr(bp, name)
+            if arr is None:
+                continue
+            a = arr[dict_key] if dict_key is not None else arr
+            parts.append(a[u[key]])
+        return np.concatenate(parts) if parts else None
 
     # per-unit pooled calls
     tax_rows = []
     read_assign: dict[str, tuple] = {}
-    pos = 0
-    for uid, members, full_seq, ws, cov, ulen in units:
-        idxs = list(range(pos, pos + len(ws)))
-        pos += len(ws)
-        if not idxs:
+    total_reads = sum(len(u["members"]) for u in units) or 1
+    total_bp = sum(u["bp"] for u in units) or 1
+    for u in units:
+        if not u["windows"]:
             continue
-        pooled = {t: bp.logp[t][idxs].mean(0, keepdims=True)
+        pooled = {t: rows("logp", u, t).mean(0, keepdims=True)
                   for t in pred.cls_targets}
-        pod = {t: bp.p_ood[t][idxs].mean() for t in pred.cls_targets}
+        pod = {t: float(rows("p_ood", u, t).mean())
+               for t in pred.cls_targets}
         call = pred.call(
             pooled, conf_tau=conf_tau, anc_tau=anc_tau,
             p_ood={t: np.array([v]) for t, v in pod.items()})[0]
         doms = []
-        if bp.domains is not None and pred.domain_vocab:
-            id2dom = {i: d for d, i in pred.domain_vocab.items()}
-            mean_p = bp.domains[idxs].mean(0)
-            doms = [id2dom[i] for i in np.argsort(-mean_p)
-                    if mean_p[i] >= domain_threshold]
-        row = {
-            "unit": uid, "mode": mode, "n_members": len(members),
-            "n_windows": len(idxs), "length": ulen,
-            "cov": cov if mode == "contig" else "",
+        if pred.domain_vocab:
+            mean_p = rows("domains", u)
+            if mean_p is not None:
+                mp = mean_p.mean(0)
+                id2dom = {i: d for d, i in pred.domain_vocab.items()}
+                doms = [id2dom[i] for i in np.argsort(-mp)
+                        if mp[i] >= domain_threshold]
+        cf = rows("coding_frac", u)
+        coding_prob = float(cf.mean()) if cf is not None else 0.0
+        status = ("coding" if coding_prob >= CODING_HI else
+                  "noncoding" if coding_prob < CODING_LO else "ambig")
+        af = rows("active_frame", u)
+        frame = int(af.mean(0).argmax()) if af is not None else -1
+        longest = max(u["seqs"], key=len) if u["seqs"] else ""
+        pep = ""
+        if status == "coding" and 0 <= frame < 6 and longest:
+            pep = translate_frame(longest, frame)
+        frame_lbl = (f"{'+' if frame < 3 else '-'}{frame % 3}"
+                     if 0 <= frame < 6 else "none")
+        tax_rows.append({
+            "unit": u["id"], "mode": mode,
+            "n_members": len(u["members"]), "n_windows":
+            len(u["windows"]),
+            "length": max((len(s) for s in u["seqs"]), default=0),
+            "member_bp": u["bp"],
+            "cov": u["cov"] if mode == "contig" else "",
             "deepest_rank": call.deepest_rank or "unclassified",
             "lineage": call.lineage,
-            "conf_at_deepest": (round(call.path_conf[call.deepest_rank], 4)
-                                if call.deepest_rank else 0.0),
+            "conf_at_deepest": (round(call.path_conf[call.deepest_rank],
+                                      4) if call.deepest_rank else 0.0),
             "p_ood_domain": round(call.p_ood.get("domain", 0.0), 4),
-            "domains": ",".join(doms),
-        }
-        tax_rows.append(row)
-        for m in members:
+            "coding_prob": round(coding_prob, 4),
+            "coding_status": status, "frame": frame_lbl,
+            "domains": ",".join(doms), "pep": pep,
+            "_seqs": u["seqs"],
+        })
+        for m in u["members"]:
             read_assign[m] = (call.lineage, call.deepest_rank)
 
     # ---------------- abundance ------------------------------------------
     if mode == "contig":
-        # sequence abundance = fraction of total BASES (weighted by
-        # contig coverage when available)
-        weights = {r["unit"]: r["length"] * max(r["cov"] or 1.0, 1e-9)
-                   for r in tax_rows}
+        weights = {r["unit"]: r["member_bp"]
+                   * max(r["cov"] or 1.0, 1e-9) for r in tax_rows}
     else:
         weights = {r["unit"]: float(r["n_members"]) for r in tax_rows}
     total_w = sum(weights.values()) or 1.0
     abund: dict[str, dict[str, float]] = {}
     for r in tax_rows:
-        lin = r["lineage"]
-        abund.setdefault(lin, {"weight": 0.0, "n_units": 0})
-        abund[lin]["weight"] += weights[r["unit"]]
-        abund[lin]["n_units"] += 1
-    abundance_rows = [
-        {"lineage": lin,
-         "sequence_abundance": round(v["weight"] / total_w, 6),
-         "n_units": v["n_units"]}
-        for lin, v in sorted(abund.items(),
-                             key=lambda x: -x[1]["weight"])]
+        a = abund.setdefault(r["lineage"], {"weight": 0.0, "bp": 0.0,
+                                            "n_units": 0})
+        a["weight"] += weights[r["unit"]]
+        a["bp"] += r["member_bp"]
+        a["n_units"] += 1
 
     # ---------------- outputs ---------------------------------------------
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(out_prefix) + ".taxonomy.tsv", "w") as f:
-        f.write("unit\tmode\tn_members\tn_windows\tlength\tcov\t"
-                "deepest_rank\tlineage\tconf_at_deepest\tp_ood_domain\t"
-                "domains\n")
+    cols = ("unit", "mode", "n_members", "n_windows", "length",
+            "member_bp", "cov", "deepest_rank", "lineage",
+            "conf_at_deepest", "p_ood_domain", "coding_prob",
+            "coding_status", "frame", "domains")
+    with open(str(out_prefix) + ".precontigs.tsv", "w") as f:
+        f.write("\t".join(cols) + "\n")
         for r in tax_rows:
-            f.write("\t".join(str(r[k]) for k in
-                              ("unit", "mode", "n_members", "n_windows",
-                               "length", "cov", "deepest_rank", "lineage",
-                               "conf_at_deepest", "p_ood_domain",
-                               "domains")) + "\n")
-    with open(str(out_prefix) + ".abundance.tsv", "w") as f:
-        unit_word = "bases" if mode == "contig" else "reads"
+            f.write("\t".join(str(r[c]) for c in cols) + "\n")
+    with open(str(out_prefix) + ".precontigs.fasta", "w") as f:
+        for r in tax_rows:
+            for si, s in enumerate(r["_seqs"]):
+                tag = r["unit"] if len(r["_seqs"]) == 1 \
+                    else f"{r['unit']}.{si}"
+                f.write(f">{tag} len={len(s)} reads={r['n_members']} "
+                        f"taxon=\"{r['lineage']}\" "
+                        f"conf={r['conf_at_deepest']} "
+                        f"coding={r['coding_prob']} "
+                        f"frame={r['frame']} domains={r['domains']}\n"
+                        f"{s}\n")
+    n_pep = 0
+    with open(str(out_prefix) + ".precontigs.pep.fasta", "w") as f:
+        for r in tax_rows:
+            if r["pep"]:
+                n_pep += 1
+                f.write(f">{r['unit']} frame={r['frame']} "
+                        f"taxon=\"{r['lineage']}\"\n{r['pep']}\n")
+    unit_word = "bases" if mode == "contig" else "reads"
+    with open(str(out_prefix) + ".taxonomic_profile.tsv", "w") as f:
         f.write(f"# sequence_abundance = fraction of {unit_word} "
                 "(NOT cell/genome-copy abundance)\n")
-        f.write("lineage\tsequence_abundance\tn_units\n")
-        for r in abundance_rows:
-            f.write(f"{r['lineage']}\t{r['sequence_abundance']}\t"
-                    f"{r['n_units']}\n")
+        f.write("deepest_rank\tlineage\tabundance\tfrac_bp\tn_units\n")
+        for lin, v in sorted(abund.items(),
+                             key=lambda x: -x[1]["weight"]):
+            rnk = next((r["deepest_rank"] for r in tax_rows
+                        if r["lineage"] == lin), "unclassified")
+            f.write(f"{rnk}\t{lin}\t{v['weight'] / total_w:.6f}\t"
+                    f"{v['bp'] / total_bp:.6f}\t{v['n_units']}\n")
+    # functional profile: domain hits normalized per Mb of coding seq
+    coding_bp = sum(r["member_bp"] for r in tax_rows
+                    if r["coding_status"] == "coding") or 1
+    dcount = defaultdict(int)
+    for r in tax_rows:
+        for d in (r["domains"].split(",") if r["domains"] else []):
+            dcount[d] += 1
+    with open(str(out_prefix) + ".functional_profile.tsv", "w") as f:
+        f.write("domain_id\tn_units\thits_per_mb_coding\n")
+        for d, cnt in sorted(dcount.items(), key=lambda x: -x[1]):
+            f.write(f"{d}\t{cnt}\t{1e6 * cnt / coding_bp:.1f}\n")
     if mode != "contig":
         with open(str(out_prefix) + ".reads.tsv", "w") as f:
             f.write("read_id\tdeepest_rank\tlineage\n")
@@ -288,18 +514,30 @@ def run_profile(model_path, inputs, out_prefix: Path,
 
     uncl = sum(weights[r["unit"]] for r in tax_rows
                if r["deepest_rank"] == "unclassified") / total_w
-    report = {
+    n_coding = sum(1 for r in tax_rows
+                   if r["coding_status"] == "coding")
+    summary = {
         "mode": mode,
         "n_units": len(tax_rows),
-        "n_lineages": len(abundance_rows),
+        "n_reads": (total_reads if mode != "contig" else ""),
+        "n_lineages": len(abund),
         "unclassified_fraction": round(uncl, 4),
+        "coding_units": n_coding,
+        "coding_fraction_units": round(n_coding / max(len(tax_rows), 1),
+                                       4),
+        "peptides_emitted": n_pep,
         "abundance_basis": ("contig bases (cov-weighted when available)"
                             if mode == "contig" else "reads assigned"),
-        "top_lineages": abundance_rows[:10],
+        "top_lineages": [
+            {"lineage": lin, "abundance": round(v["weight"] / total_w, 6)}
+            for lin, v in sorted(abund.items(),
+                                 key=lambda x: -x[1]["weight"])[:10]],
     }
-    (Path(str(out_prefix) + ".report.json")).write_text(
-        json.dumps(report, indent=1))
+    (Path(str(out_prefix) + ".summary.json")).write_text(
+        json.dumps(summary, indent=1))
     if verbose:
-        print(f"omniphyl profile: wrote {out_prefix}.{{taxonomy.tsv,"
-              f"abundance.tsv,report.json}}")
-    return report
+        print(f"omniphyl profile: wrote {out_prefix}.{{precontigs.tsv,"
+              f"precontigs.fasta,precontigs.pep.fasta,"
+              f"taxonomic_profile.tsv,functional_profile.tsv,"
+              f"summary.json}}")
+    return summary
