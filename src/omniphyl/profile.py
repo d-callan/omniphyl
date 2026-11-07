@@ -398,38 +398,93 @@ def run_profile(model_path, inputs, out_prefix: Path,
         print(f"omniphyl profile [{mode}]: {len(units)} units, "
               f"{sum(len(u['windows']) for u in units):,} model inputs")
 
-    # batch inference: real vs virtual windows in separate predict calls
-    # (virtual_joined zeroes positional channels for 'N'-joined frags)
-    seqs_r, seqs_v = [], []
-    for u in units:
-        u["rows_r"], u["rows_v"] = [], []
-        for w, v in zip(u["windows"], u["virtual"]):
-            if v:
-                u["rows_v"].append(len(seqs_v))
-                seqs_v.append(w)
-            else:
-                u["rows_r"].append(len(seqs_r))
-                seqs_r.append(w)
-    bp_r = (pred.predict_sequences(seqs_r, batch_size=batch_size,
-                                   virtual_joined=False)
+    # chunked inference + incremental pooling. predict_sequences
+    # materializes every head output for every input row (the domains
+    # head alone is B x D floats), so holding one BatchPredictions
+    # across ALL windows OOMs at metagenome scale — observed SIGKILL
+    # on Kaggle. Pool each unit's rows as fixed-size chunks complete;
+    # only the pooled running sums are retained. A single unit with
+    # more windows than the chunk is sliced across chunks (its sums
+    # still pool correctly).
+    POOL_CHUNK = 20000                          # windows per predict call
+
+    def _pool_chunk(slices):
+        """Predict one chunk -> accumulate per-unit running sums."""
+        seqs_r, seqs_v = [], []
+        rows_map = []                            # per slice: (u, rr, rv)
+        for u, off, take in slices:
+            rr, rv = [], []
+            for w, v in zip(u["windows"][off:off + take],
+                            u["virtual"][off:off + take]):
+                if v:
+                    rv.append(len(seqs_v))
+                    seqs_v.append(w)
+                else:
+                    rr.append(len(seqs_r))
+                    seqs_r.append(w)
+            rows_map.append((u, rr, rv))
+        bp_r = (pred.predict_sequences(
+            seqs_r, batch_size=batch_size, virtual_joined=False)
             if seqs_r else None)
-    bp_v = (pred.predict_sequences(seqs_v, batch_size=batch_size,
-                                   virtual_joined=True)
+        bp_v = (pred.predict_sequences(
+            seqs_v, batch_size=batch_size, virtual_joined=True)
             if seqs_v else None)
 
-    def rows(name, u, dict_key=None):
-        """Concatenate a unit's rows across both batches for field
-        `name` (or dict field keyed by `dict_key`)."""
-        parts = []
-        for bp, key in ((bp_r, "rows_r"), (bp_v, "rows_v")):
-            if bp is None or not u[key]:
-                continue
-            arr = getattr(bp, name)
-            if arr is None:
-                continue
-            a = arr[dict_key] if dict_key is not None else arr
-            parts.append(a[u[key]])
-        return np.concatenate(parts) if parts else None
+        def rows(name, rr, rv, dict_key=None):
+            parts = []
+            for bp, idxs in ((bp_r, rr), (bp_v, rv)):
+                if bp is None or not idxs:
+                    continue
+                arr = getattr(bp, name)
+                if arr is None:
+                    continue
+                a = arr[dict_key] if dict_key is not None else arr
+                parts.append(a[idxs])
+            return np.concatenate(parts) if parts else None
+
+        for u, rr, rv in rows_map:
+            a = u.setdefault("acc", {
+                "n": 0, "logp": {}, "pod": {},
+                "cf": 0.0, "af": None, "dom": None})
+            n_win = len(rr) + len(rv)
+            a["n"] += n_win
+            for t in pred.cls_targets:
+                a["logp"][t] = a["logp"].get(t, 0.0) + \
+                    rows("logp", rr, rv, t).sum(0)
+                a["pod"][t] = a["pod"].get(t, 0.0) + \
+                    float(rows("p_ood", rr, rv, t).sum())
+            r = rows("coding_frac", rr, rv)
+            if r is not None:
+                a["cf"] += float(r.sum())
+            r = rows("active_frame", rr, rv)
+            if r is not None:
+                a["af"] = r.sum(0) + (a["af"]
+                                      if a["af"] is not None else 0)
+            r = rows("domains", rr, rv)
+            if r is not None:
+                a["dom"] = r.sum(0) + (a["dom"]
+                                       if a["dom"] is not None else 0)
+
+    # build slices: units in order, intra-unit slicing for units
+    # larger than POOL_CHUNK
+    slices, nw = [], 0
+    for u in units:
+        off = 0
+        while off < len(u["windows"]):
+            take = min(POOL_CHUNK - nw, len(u["windows"]) - off)
+            slices.append((u, off, take))
+            off += take
+            nw += take
+            if nw >= POOL_CHUNK:
+                _pool_chunk(slices)
+                if verbose:
+                    done = sum(a["n"] for a in
+                               (x.get("acc") or {} for x in units))
+                    print(f"  profile: pooled {done:,} windows",
+                          flush=True)
+                slices, nw = [], 0
+    if slices:
+        _pool_chunk(slices)
 
     # per-unit pooled calls
     tax_rows = []
@@ -439,27 +494,24 @@ def run_profile(model_path, inputs, out_prefix: Path,
     for u in units:
         if not u["windows"]:
             continue
-        pooled = {t: rows("logp", u, t).mean(0, keepdims=True)
+        a, nn = u["acc"], max(u["acc"]["n"], 1)
+        pooled = {t: (a["logp"][t] / nn).reshape(1, -1)
                   for t in pred.cls_targets}
-        pod = {t: float(rows("p_ood", u, t).mean())
-               for t in pred.cls_targets}
         call = pred.call(
             pooled, conf_tau=conf_tau, anc_tau=anc_tau,
-            p_ood={t: np.array([v]) for t, v in pod.items()})[0]
+            p_ood={t: np.array([a["pod"][t] / nn])
+                   for t in pred.cls_targets})[0]
         doms = []
-        if pred.domain_vocab:
-            mean_p = rows("domains", u)
-            if mean_p is not None:
-                mp = mean_p.mean(0)
-                id2dom = {i: d for d, i in pred.domain_vocab.items()}
-                doms = [id2dom[i] for i in np.argsort(-mp)
-                        if mp[i] >= domain_threshold]
-        cf = rows("coding_frac", u)
-        coding_prob = float(cf.mean()) if cf is not None else 0.0
+        if pred.domain_vocab and a["dom"] is not None:
+            mp = a["dom"] / nn
+            id2dom = {i: d for d, i in pred.domain_vocab.items()}
+            doms = [id2dom[i] for i in np.argsort(-mp)
+                    if mp[i] >= domain_threshold]
+        coding_prob = a["cf"] / nn
         status = ("coding" if coding_prob >= CODING_HI else
                   "noncoding" if coding_prob < CODING_LO else "ambig")
-        af = rows("active_frame", u)
-        frame = int(af.mean(0).argmax()) if af is not None else -1
+        frame = (int((a["af"] / nn).argmax())
+                 if a["af"] is not None else -1)
         longest = max(u["seqs"], key=len) if u["seqs"] else ""
         pep = ""
         if status == "coding" and 0 <= frame < 6 and longest:
