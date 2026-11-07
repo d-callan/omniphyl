@@ -112,17 +112,20 @@ env = dict(os.environ,
            PYTHONUNBUFFERED="1",
            OMP_NUM_THREADS="4")
 
-print(f"\n=== omniphyl profile [precontig] on {device} ===",
-      flush=True)
-subprocess.run(
-    [sys.executable, "-m", "omniphyl", "profile",
-     "--model", CKPT,
-     "--out", f"{WORK}/zymo",
-     "--mode", "precontig",
-     "--reads2", r2,
-     "--device", device,
-     "--batch-size", "256",
-     r1],
-    env=env, check=True)
+# A/B: assembled unitigs vs pool-reads (cluster->pool member reads)
+for tag, extra in (("zymo_asm", []),
+                   ("zymo_pool", ["--pool-reads"])):
+    print(f"\n=== omniphyl profile [{tag}] on {device} ===",
+          flush=True)
+    subprocess.run(
+        [sys.executable, "-m", "omniphyl", "profile",
+         "--model", CKPT,
+         "--out", f"{WORK}/{tag}",
+         "--mode", "precontig",
+         "--reads2", r2,
+         "--device", device,
+         "--batch-size", "256"] + extra + [r1],
+        env=env, check=True)
 
-print("\ndone — zymo.* outputs in /kaggle/working", flush=True)
+print("\ndone — zymo_asm.*/zymo_pool.* outputs in /kaggle/working",
+      flush=True)
