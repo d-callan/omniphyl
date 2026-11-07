@@ -19,6 +19,7 @@ for units the model believes are coding.
 """
 from __future__ import annotations
 
+import heapq
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -41,22 +42,27 @@ CODING_LO = 0.3
 # ------------------------------------------------------- k-mer utils ---
 
 
-def _canon_kmers(seq: str, k: int = 21) -> set:
-    """Canonical (min of fwd/RC) base-4 k-mer ids for a sequence."""
+def _kmer_ids(seq: str, k: int = 21) -> np.ndarray:
+    """Canonical k-mer id per valid position (raw — intra-seq dupes
+    kept). Clustering dedupes (kmer, read) pairs globally via one
+    argsort, which is much cheaper than a Python set() per read."""
     codes = BASE2DIGIT[np.frombuffer(seq.upper().encode("ascii", "replace"),
                                      dtype=np.uint8)]
-    n = len(codes)
-    if n < k:
-        return set()
+    if len(codes) < k:
+        return np.empty(0, dtype=np.int64)
     win = np.lib.stride_tricks.sliding_window_view(codes, k)
-    valid = (win >= 0).all(axis=1)
-    if not valid.any():
-        return set()
-    w = win[valid]
-    idx = (w * (4 ** np.arange(k - 1, -1, -1, dtype=np.int64))).sum(1)
-    comp = 3 - w[:, ::-1]
-    ridx = (comp * (4 ** np.arange(k - 1, -1, -1, dtype=np.int64))).sum(1)
-    return set(np.minimum(idx, ridx).tolist())
+    w = win[(win >= 0).all(axis=1)]
+    if not len(w):
+        return np.empty(0, dtype=np.int64)
+    pow4 = 4 ** np.arange(k - 1, -1, -1, dtype=np.int64)
+    idx = (w * pow4).sum(1)
+    ridx = ((3 - w[:, ::-1]) * pow4).sum(1)
+    return np.minimum(idx, ridx)
+
+
+def _canon_kmers(seq: str, k: int = 21) -> set:
+    """Canonical (min of fwd/RC) base-4 k-mer ids for a sequence."""
+    return set(_kmer_ids(seq, k).tolist())
 
 
 # ------------------------------------------------ pre-contig assembly --
@@ -92,36 +98,55 @@ def assemble_cluster(seqs: list[str], k: int = 21, min_overlap: int = 30,
                      min_id: float = 0.90) -> list[str]:
     """Greedy overlap-layout merge of one cluster's reads -> unitig(s).
 
-    Best-overlap-first rounds; each pair is tried in both orientations
-    (b vs revcomp(b)) since read strands are arbitrary. Returns one or
-    more merged sequences -- an edge-connected cluster can still resolve
-    into disjoint contigs (insertion gap / divergent haplotype)."""
+    Best-overlap-first via a lazy edge heap: candidate a->b edges
+    (a-tail shares an anchor with b-head) are scored once; each merge
+    bumps a per-item version so stale heap entries are skipped, and
+    only the merged item's edges are rescanned. revcomp(b)'s head
+    anchors ARE b's tail anchors (canonical kmers are rc-invariant),
+    so both orientations cost one anchor pair. Returns one or more
+    merged sequences -- an edge-connected cluster can still resolve
+    into disjoint contigs (insertion gap / divergent haplotype), and
+    reads fully contained in a contig simply stay separate units.
+    """
     items = [s.upper() for s in seqs]
-    anchors = [_end_anchors(s) for s in items]
-    while len(items) > 1:
-        best = None
-        for i in range(len(items)):
-            for j in range(len(items)):
-                if i == j:
+    anc = [_end_anchors(s) for s in items]      # (head, tail)
+    alive = [True] * len(items)
+    ver = [0] * len(items)
+    heap: list[tuple] = []
+
+    def scan_edges(i: int):
+        """Push all valid i->j edges (both b orientations) for item i."""
+        for j in range(len(items)):
+            if j == i or not alive[j]:
+                continue
+            a_tail = anc[i][1]
+            # b fwd: b-head; b rc: rc-head anchors == b-tail anchors
+            for b_rc in (False, True):
+                bh = anc[j][1] if b_rc else anc[j][0]
+                if not (a_tail & bh):
                     continue
-                a = items[i]
-                for bb in (items[j], revcomp(items[j])):
-                    bh, _bt = _end_anchors(bb)
-                    # a-tail must share an anchor with b-head for a->b
-                    if not (anchors[i][1] & bh):
-                        continue
-                    L = _overlap_len(a, bb, k, min_id)
-                    if L >= min_overlap and \
-                            (best is None or L > best[0]):
-                        best = (L, i, j, bb)
-        if best is None:
-            break
-        L, i, j, bb = best
+                bb = revcomp(items[j]) if b_rc else items[j]
+                L = _overlap_len(items[i], bb, k, min_id)
+                if L >= min_overlap:
+                    heapq.heappush(
+                        heap, (-L, i, j, b_rc, ver[i]))
+
+    for i in range(len(items)):
+        scan_edges(i)
+
+    while heap:
+        negs, i, j, b_rc, v = heapq.heappop(heap)
+        if not (alive[i] and alive[j]) or ver[i] != v:
+            continue                                  # stale
+        L = -negs
+        bb = revcomp(items[j]) if b_rc else items[j]
         items[i] = items[i] + bb[L:]
-        anchors[i] = _end_anchors(items[i])
-        items.pop(j)
-        anchors.pop(j)
-    return items
+        anc[i] = _end_anchors(items[i])
+        alive[j] = False
+        ver[i] += 1
+        scan_edges(i)
+
+    return [s for s, a in zip(items, alive) if a]
 
 
 def cluster_reads(ids: list[str], seqs: list[str], k: int = 21,
@@ -138,22 +163,51 @@ def cluster_reads(ids: list[str], seqs: list[str], k: int = 21,
     universal markers would chain unrelated loci). Each cluster is then
     overlap-assembled; returns (member_ids, [assembled seqs]) --
     usually one seq, more when assembly splits into disjoint contigs.
+
+    Single-sort design: an earlier version held per-read k-mer sets +
+    a kmer->reads dict over ALL distinct kmers, which needed tens of
+    GB at ~400k reads (SIGKILL on Kaggle). Here all (kmer, read) pairs
+    go into two flat int64 arrays; one argsort groups equal kmers, an
+    adjacent-pair dedup makes each read count a kmer once, run lengths
+    are the frequencies, and only non-singleton capped groups emit
+    member pairs. Peak ~ n * read-kmers * ~30 B — a few GB at 400k
+    reads vs ~30 GB before.
     """
     n = len(seqs)
-    ksets = [_canon_kmers(s, k) for s in seqs]
-    freq = defaultdict(int)
-    for ks in ksets:
-        for km in ks:
-            freq[km] += 1
-    # floor at 2: a k-mer present in exactly 2 reads is always a
-    # legitimate pairwise signal — the mask exists to drop near-universal
-    # kmers, which needs a large n to be meaningful
+    ka, ra = [], []
+    for i, s in enumerate(seqs):
+        kids = _kmer_ids(s, k)
+        if kids.size:
+            ka.append(kids)
+            ra.append(np.full(kids.size, i, dtype=np.int32))
+    shared: dict[tuple[int, int], int] = defaultdict(int)
     cap = max(2, int(max_kmer_freq * n))
-    index: dict[int, list[int]] = defaultdict(list)
-    for i, ks in enumerate(ksets):
-        for km in ks:
-            if freq[km] <= cap:
-                index[km].append(i)
+    if ka:
+        km = np.concatenate(ka)
+        rd = np.concatenate(ra)
+        del ka, ra
+        order = np.argsort(km)
+        km, rd = km[order], rd[order]
+        del order
+        # dedupe adjacent (kmer, read) repeats — a read counts a kmer
+        # once regardless of how many positions it occurs at
+        keep = np.r_[True, (km[1:] != km[:-1]) | (rd[1:] != rd[:-1])]
+        km, rd = km[keep], rd[keep]
+        del keep
+        starts = np.flatnonzero(np.r_[True, km[1:] != km[:-1]])
+        ends = np.r_[starts[1:], len(km)]
+        del km
+        # groups >200 members are combinatorially skipped (same rule
+        # as before: each member pair is O(1) work only for small
+        # groups; huge groups are near-mask kmers anyway)
+        for st, en in zip(starts.tolist(), ends.tolist()):
+            m = en - st
+            if m < 2 or m > cap or m > 200:
+                continue
+            mem = rd[st:en]
+            for a_i in range(m):
+                for b_i in range(a_i + 1, m):
+                    shared[(int(mem[a_i]), int(mem[b_i]))] += 1
 
     parent = list(range(n))
     size = [1] * n                     # cluster READ count
@@ -164,24 +218,16 @@ def cluster_reads(ids: list[str], seqs: list[str], k: int = 21,
             x = parent[x]
         return x
 
-    shared: dict[tuple[int, int], int] = defaultdict(int)
-    for km, members in index.items():
-        for a_i in range(len(members)):
-            for b_i in range(a_i + 1, len(members)):
-                if len(members) > 200:   # skip combinatorial blowup
-                    break
-                shared[(members[a_i], members[b_i])] += 1
-
     for (i, j), cnt in sorted(shared.items(), key=lambda x: -x[1]):
         if cnt < min_shared:
             continue
-        ri, rj = find(i), find(j)
-        if ri == rj:
+        ri_, rj_ = find(i), find(j)
+        if ri_ == rj_:
             continue
-        if size[ri] + size[rj] > max_cluster_reads:
+        if size[ri_] + size[rj_] > max_cluster_reads:
             continue
-        parent[rj] = ri
-        size[ri] += size[rj]
+        parent[rj_] = ri_
+        size[ri_] += size[rj_]
 
     groups: dict[int, list[int]] = defaultdict(list)
     for i in range(n):
