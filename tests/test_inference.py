@@ -811,6 +811,115 @@ def test_coarse_tracks():
     check("bg end clamped", ends[-1] == 1230, ends)
 
 
+def test_refiner():
+    """Stage-2 neural refiner: 22-ch input build (frame rotation to
+    chunk-local frame, bin->base interpolation), cond vector, model
+    shapes/param count, GFF->label conventions on both strands + RC
+    flip, and the refiner decode path recovering an exact 2-exon
+    model per strand from oracle posteriors."""
+    print("[refiner]")
+    from omniphyl.annotate import STOPS
+    from omniphyl.refiner import (OmniPhylRefiner, build_refiner_inputs,
+                                  build_contig_cond, decode_with_refiner,
+                                  S_START_P, S_STOP_P, S_DON_P,
+                                  S_ACC_P, S_START_M, S_STOP_M,
+                                  S_DON_M, S_ACC_M)
+    from train_refiner import build_refiner_labels, rc_labels
+
+    # ---- input tensor / cond / model
+    L, B = 1230, 50
+    res = _mk_result(L, B, coding=[(2, 20, 0.7)],
+                     frame=[(2, 20, 0, 0.7)])
+    x = build_refiner_inputs("ACGT" * 400, res, 0, 1600, 0.0)
+    check("refiner input shape", x.shape == (22, 1600), x.shape)
+    check("refiner input finite", np.isfinite(x).all())
+    check("refiner onehot", x[0, 0] == 1 and x[1, 1] == 1
+          and x[2, 2] == 1 and x[3, 3] == 1, x[:4, :4])
+    # chunk offset lo=1: base 900 has global frame 0 -> local frame 2
+    x1 = build_refiner_inputs("ACGT" * 400, res, 1, 1201, 0.0)
+    check("frame rotated to chunk-local",
+          x1[10, 899] > 0.5 and x1[8, 899] < 0.5, x1[8:11, 899])
+    cond = build_contig_cond(res, "ACGT" * 308)
+    check("cond shape+finite", cond.shape == (12,)
+          and np.isfinite(cond).all(), cond)
+    ref = OmniPhylRefiner()
+    n_par = sum(p.numel() for p in ref.parameters())
+    check("refiner param count", 5e5 <= n_par <= 3e6, n_par)
+    rng = np.random.default_rng(0)
+    sl, tl = ref(torch.from_numpy(
+        rng.standard_normal((2, 22, 1024)).astype(np.float32)),
+        torch.zeros(2, 12))
+    check("refiner out shapes", sl.shape == (2, 7, 1024)
+          and tl.shape == (2, 8, 1024), (sl.shape, tl.shape))
+
+    # ---- label conventions + RC flip
+    rows = [("t1", "+", (300, 600)), ("t1", "+", (700, 1000)),
+            ("t2", "-", (1101, 1200)), ("t2", "-", (1300, 1600))]
+    st, si = build_refiner_labels(rows, 2000)
+    check("cds+ state", st[350] == 1 and st[750] == 1)
+    check("int+ state", st[650] == 2)
+    check("cds- state", st[1150] == 3 and st[1400] == 3)
+    check("int- state", st[1250] == 4)
+    check("intergenic state", st[200] == 0)
+    check("+ site coords",
+          si[S_START_P, 300] > 0.9 and si[S_STOP_P, 997] > 0.9
+          and si[S_DON_P, 600] > 0.9 and si[S_ACC_P, 699] > 0.9,
+          si[:, [300, 997, 600, 699]])
+    check("- site coords",
+          si[S_START_M, 1599] > 0.9 and si[S_STOP_M, 1103] > 0.9
+          and si[S_DON_M, 1299] > 0.9 and si[S_ACC_M, 1200] > 0.9,
+          si[:, [1599, 1103, 1299, 1200]])
+    st_rc, si_rc = rc_labels(st, si)
+    check("rc state flip", st_rc[2000 - 1 - 350] == 3
+          and st_rc[2000 - 1 - 1150] == 1)
+    check("rc site flip", si_rc[S_START_M, 2000 - 1 - 300] > 0.9)
+
+    # ---- oracle-posterior decode: exact 2-exon model per strand
+    seq = _place("A" * 2000, [
+        (300, "ATG"),                 # + start
+        (600, "GT"), (698, "AG"),     # + intron [600,700)
+        (997, "TAA"),                 # + stop
+        (1101, "TTA"),                # - transcript stop TAA
+        (1200, "CT"),                 # - acceptor (tx AG)
+        (1298, "AC"),                 # - donor (tx GT)
+        (1597, "CAT")])               # - transcript ATG
+    ps = np.zeros((2000, 7), np.float32)
+    ps[:, 0] = 1.0
+    ps[300:600, [1, 0]] = (0.9, 0.1)
+    ps[600:700, [2, 0]] = (0.9, 0.1)
+    ps[700:1000, [1, 0]] = (0.9, 0.1)
+    ps[1101:1200, [3, 0]] = (0.9, 0.1)
+    ps[1200:1300, [4, 0]] = (0.9, 0.1)
+    ps[1300:1600, [3, 0]] = (0.9, 0.1)
+    si2 = np.zeros((2000, 8), np.float32)
+    si2[300, S_START_P] = si2[997, S_STOP_P] = 0.9
+    si2[600, S_DON_P] = si2[699, S_ACC_P] = 0.9
+    si2[1599, S_START_M] = si2[1103, S_STOP_M] = 0.9
+    si2[1299, S_DON_M] = si2[1200, S_ACC_M] = 0.9
+    res2 = _mk_result(2000, 50,
+                      coding=[(6, 12, 0.7), (14, 20, 0.7),
+                              (22, 24, 0.7), (26, 32, 0.7)],
+                      frame=[(6, 12, 0, 0.8), (14, 20, 1, 0.8),
+                             (22, 24, 3, 0.8), (26, 32, 4, 0.8)])
+    genes = decode_with_refiner(
+        None, seq, res2, stops=STOPS, euk=True,
+        p_state=ps, p_site=si2)
+    plus = [g for g in genes if g["strand"] == "+"]
+    minus = [g for g in genes if g["strand"] == "-"]
+    check("refiner + gene", len(plus) == 1
+          and (plus[0]["start"], plus[0]["end"]) == (300, 1000), plus)
+    if plus:
+        check("refiner + intron", plus[0]["introns"] == [(600, 700)],
+              plus[0]["introns"])
+    check("refiner - gene", len(minus) == 1
+          and (minus[0]["start"], minus[0]["end"]) == (1101, 1600),
+          minus)
+    if minus:
+        check("refiner - intron",
+              minus[0]["introns"] == [(1200, 1300)],
+              minus[0]["introns"])
+
+
 # --------------------------------------------- annotate end-to-end -------
 
 
@@ -902,7 +1011,7 @@ def main():
            test_fuse_rev_frame_remap, test_fuse_impulse_placement,
            test_fuse_region_fallback, test_apply_ablate,
            test_decode_stop_rescue_multi_intron,
-           test_coarse_tracks, test_annotate_e2e]
+           test_coarse_tracks, test_refiner, test_annotate_e2e]
     for f in fns:
         f()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")

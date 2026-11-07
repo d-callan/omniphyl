@@ -95,6 +95,13 @@ def _annotate_parser(sub):
                      help="skip Stage-2 ORF/intron decoding; emit "
                           "coarse coding-region BED/bedGraph tracks "
                           "plus taxonomy report only")
+    dec.add_argument("--refiner", type=Path, default=None,
+                     help="Stage-2 neural refiner .pt (default: use "
+                          "refiner bundled in the model checkpoint "
+                          "when present)")
+    dec.add_argument("--no-refiner", action="store_true",
+                     help="force the heuristic Stage-2 decoder even "
+                          "when a refiner is bundled")
     return ap
 
 
@@ -171,6 +178,7 @@ def main(argv=None) -> int:
             conf_tau=args.conf_tau, anc_tau=args.anc_tau,
             min_intron=args.min_intron, max_intron=args.max_intron,
             tracks_only=args.tracks_only,
+            refiner_path=args.refiner, no_refiner=args.no_refiner,
             verbose=not args.quiet)
     elif args.cmd == "profile":
         from .profile import run_profile

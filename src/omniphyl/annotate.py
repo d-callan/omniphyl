@@ -98,6 +98,7 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
                  conf_tau: float = 0.5, anc_tau: float = 0.2,
                  min_intron: int = 35, max_intron: int = 5000,
                  ablate: str = "", tracks_only: bool = False,
+                 refiner_path=None, no_refiner: bool = False,
                  verbose: bool = True) -> dict:
     """Full annotate pipeline; writes all outputs, returns report dict."""
     out_prefix = Path(out_prefix)
@@ -234,6 +235,17 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
     # tracks (coding_regions.bed, frame/coding/boundary bedGraphs) are
     # written from the fused Stage-1 signals alone.
     stops = _gcode_stops(gcode)
+    refiner = None
+    if not tracks_only and not no_refiner:
+        # a bundled "refiner" key in the Stage-1 ckpt, or an explicit
+        # --refiner .pt file
+        src = refiner_path or (pred.ckpt if isinstance(pred.ckpt, dict)
+                               and "refiner" in pred.ckpt else None)
+        if src is not None:
+            from .refiner import load_refiner
+            refiner = load_refiner(src, device=pred.device)
+            if verbose:
+                print("omniphyl annotate: neural refiner enabled")
     if not tracks_only:
         for ci, res in enumerate(results):
             seq = contig_seqs[res.contig]
@@ -244,14 +256,25 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
             prok = (kingdom == "prokaryote" or kingdom == "viral"
                     or (kingdom == "auto" and dom in
                         ("Bacteria", "Archaea", "Viruses")))
-            res.genes = _decode_genes(
-                seq, res, stops=stops, euk=euk and not prok,
-                w_ev=w_ev, min_cds_len=min_cds_len,
-                coding_threshold=coding_threshold,
-                boundary_threshold=boundary_threshold,
-                min_intron=min_intron, max_intron=max_intron,
-                intron_hints=(evidence.get(res.contig).intron_candidates
-                              if res.contig in evidence else []))
+            hints = (evidence.get(res.contig).intron_candidates
+                     if res.contig in evidence else [])
+            if refiner is not None:
+                from .refiner import decode_with_refiner
+                res.genes = decode_with_refiner(
+                    refiner, seq, res, stops=stops,
+                    euk=euk and not prok, gcode=gcode, w_ev=w_ev,
+                    min_cds_len=min_cds_len,
+                    coding_threshold=coding_threshold,
+                    min_intron=min_intron, max_intron=max_intron,
+                    intron_hints=hints, device=pred.device)
+            else:
+                res.genes = _decode_genes(
+                    seq, res, stops=stops, euk=euk and not prok,
+                    w_ev=w_ev, min_cds_len=min_cds_len,
+                    coding_threshold=coding_threshold,
+                    boundary_threshold=boundary_threshold,
+                    min_intron=min_intron, max_intron=max_intron,
+                    intron_hints=hints)
             # per-gene Pfam assignment
             if bp.domains is not None and pred.domain_vocab:
                 id2dom = {i: d for d, i in pred.domain_vocab.items()}
