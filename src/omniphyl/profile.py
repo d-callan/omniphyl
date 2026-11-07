@@ -506,8 +506,18 @@ def run_profile(model_path, inputs, out_prefix: Path,
         if not u["windows"]:
             continue
         a, nn = u["acc"], max(u["acc"]["n"], 1)
-        pooled = {t: (a["logp"][t] / nn).reshape(1, -1)
-                  for t in pred.cls_targets}
+        # Arithmetic mean of log-probabilities is an unnormalized
+        # log-geometric-mean (mean(log p) <= log(mean p) by Jensen's
+        # inequality); without log-softmax renormalization over the
+        # known classes (cols 1..), total probability mass collapses
+        # across multi-window units and conf_tau rejects deeper ranks.
+        pooled = {}
+        for t in pred.cls_targets:
+            v = (a["logp"][t] / nn).copy()
+            v[0] = -1e9
+            m = v.max()
+            v = v - (m + np.log(np.exp(v - m).sum()))
+            pooled[t] = v.reshape(1, -1)
         call = pred.call(
             pooled, conf_tau=conf_tau, anc_tau=anc_tau,
             p_ood={t: np.array([a["pod"][t] / nn])
