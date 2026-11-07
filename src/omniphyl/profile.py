@@ -489,8 +489,8 @@ def run_profile(model_path, inputs, out_prefix: Path,
             if nw >= POOL_CHUNK:
                 _pool_chunk(slices)
                 if verbose:
-                    done = sum(a["n"] for a in
-                               (x.get("acc") or {} for x in units))
+                    done = sum((x.get("acc") or {}).get("n", 0)
+                               for x in units)
                     print(f"  profile: pooled {done:,} windows",
                           flush=True)
                 slices, nw = [], 0
