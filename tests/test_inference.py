@@ -18,6 +18,8 @@ Covers (docs/inference-plan.md §7):
 Run: python3 -m pytest tests/test_inference.py  (or python3 tests/test_inference.py)
 """
 import gzip
+import io
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -557,14 +559,7 @@ def test_softmasked_decode_and_evidence():
 def test_splice_acceptor_snapping():
     """An evidence hint must snap to ITS observed junction, not the
     leftmost canonical acceptor in the window: a decoy AG 8 bp upstream
-    of the true acceptor previously won b
-           test_decode_antisense_suppression,
-           test_decode_intron_inside_coding_run,
-           test_decode_chained_runs,
-           test_softmasked_decode_and_evidence,
-           test_splice_acceptor_snapping,
-           test_hint_rescues_weak_partner_exon,
-          ecause the acceptor loop broke
+    of the true acceptor previously won because the acceptor loop broke
     at the first valid candidate."""
     from omniphyl.annotate import _decode_genes, STOPS
     L, B = 2000, 50
@@ -765,19 +760,69 @@ def test_decode_stop_rescue_multi_intron():
               g.get("introns"))
 
 
-def test_annotate_e2e():
-    print("[annotate e2e]")
-    with tempfile.TemporaryDirectory() as td:
+def test_coarse_tracks():
+    """Coarse browser tracks: a 1-bin same-strand dip closes into one
+    BED9 block carrying the dominant global frame + RGB color, the
+    signed strand signal flips sign per strand, and bedGraph
+    intervals clamp at the contig end (25*50=1250 > L=1230)."""
+    print("[coarse tracks]")
+    from omniphyl.annotate import (ContigResult, _coarse_coding_blocks,
+                                   _signed_frame_signal, _write_bg)
+    L, B = 1230, 50
+    nb = (L + B - 1) // B                        # 25 bins
+    p_region = np.zeros((nb, 4))
+    p_frame = np.zeros((nb, 8))
+    p_region[2:7, 0] = 0.85                      # coding run A
+    p_frame[2:7, 1] = 0.8                        # dominant +1
+    p_region[7:8, 0] = 0.30                      # 1-bin dip, same frame
+    p_frame[7:8, 1] = 0.7
+    p_region[8:12, 0] = 0.80                     # coding run B
+    p_frame[8:12, 1] = 0.8
+    p_region[15:21, 0] = 0.90                    # coding run C
+    p_frame[15:21, 5] = 0.85                     # dominant -2
+    res = ContigResult("c", L, nb, B,
+                       p_region=p_region, p_frame=p_frame,
+                       b_tracks=np.zeros((nb, 4)),
+                       p_boundary=np.zeros(nb), p_coding=np.zeros(nb),
+                       dtilde=np.zeros(nb), e_lex=np.zeros(nb))
+    blocks = _coarse_coding_blocks(res)
+    check("gap-closed block count", len(blocks) == 2,
+          [(b["start"], b["end"]) for b in blocks])
+    if len(blocks) == 2:
+        b0, b1 = blocks
+        check("block0 span+strand",
+              (b0["start"], b0["end"], b0["strand"]) == (100, 600, "+"),
+              b0)
+        check("block0 frame+rgb", "f=+1" in b0["name"]
+              and b0["rgb"] == "44,160,44", b0["name"])
+        check("block1 span+strand",
+              (b1["start"], b1["end"], b1["strand"]) == (750, 1050, "-"),
+              b1)
+        check("block1 frame+rgb", "f=-2" in b1["name"]
+              and b1["rgb"] == "148,103,189", b1["name"])
+    sig = _signed_frame_signal(res, 0.0)
+    check("signed + strand", sig[2] > 0 and sig[8] > 0, sig[2])
+    check("signed - strand", sig[15] < 0 and sig[20] < 0, sig[15])
+    check("signal range", -1.0 <= float(sig.min())
+          and float(sig.max()) <= 1.0)
+    buf = io.StringIO()
+    _write_bg(buf, "c", np.ones(nb), B, L)
+    ends = [int(r.split("\t")[2]) for r in buf.getvalue().splitlines()]
+    check("bg end clamped", ends[-1] == 1230, ends)
+
+
 # --------------------------------------------- annotate end-to-end -------
 
 
+def test_annotate_e2e():
+    print("[annotate e2e]")
+    with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         ckpt, _, _ = _toy_model(td)
         # synthetic contig with an embedded fwd ORF: ATG ... TAA
         rng = np.random.default_rng(1)
         flank = "".join(rng.choice(list("ACGT")) for _ in range(150))
-        orf = "Arev_frame_grid, test_TG" + "".join(rng.choice(
-          ["AAA", "CAG", "GGA"])
+        orf = "ATG" + "".join(rng.choice(["AAA", "CAG", "GGA"])
                               for _ in range(60)) + "TAA"
         contig = flank + orf + flank
         fa = td / "g.fna"
@@ -797,6 +842,50 @@ def test_annotate_e2e():
         # the embedded ORF should produce at least one CDS feature
         check("CDS emitted", "CDS" in gff)
 
+        # tracks-only run: tracks + report, no Stage-2 gene decoding
+        out2 = td / "ann_tr"
+        rep2 = run_annotate(
+            model_path=ckpt, fasta_path=fa, out_prefix=out2,
+            window=50, stride=25, batch_size=8, device="cpu",
+            tracks_only=True, verbose=False)
+        check("tracks_only no genes", rep2["features"]["n_genes"] == 0)
+        check("block count key",
+              "n_coding_blocks" in rep2["features"])
+        gff2 = (Path(str(out2) + ".gff3")).read_text()
+        check("tracks_only gff3 empty",
+              "\tCDS\t" not in gff2 and "\tgene\t" not in gff2)
+
+        # BED9 schema + coordinate bounds on both runs' track files
+        rgb_ok = re.compile(r"^\d+,\d+,\d+$")
+        for pref in (out, out2):
+            bed = Path(str(pref) + ".coding_regions.bed")
+            check(f"coding_regions.bed exists ({pref.name})",
+                  bed.exists())
+            rows = [ln.split("\t")
+                    for ln in bed.read_text().splitlines()
+                    if not ln.startswith("track")]
+            ok = all(len(c) == 9
+                     and 0 <= int(c[1]) < int(c[2]) <= len(contig)
+                     and 0 <= int(c[4]) <= 1000
+                     and c[5] in "+-."
+                     and int(c[1]) <= int(c[6]) <= int(c[7]) <= int(c[2])
+                     and rgb_ok.match(c[8]) for c in rows)
+            check(f"bed9 schema ({pref.name})", ok, rows[:2])
+            for ext in ("coding.bedGraph", "boundary.bedGraph",
+                        "frame.bedGraph"):
+                bg = Path(str(pref) + "." + ext)
+                ends = [int(r.split("\t")[2])
+                        for r in bg.read_text().splitlines()
+                        if not r.startswith("track")]
+                check(f"{ext} bounds ({pref.name})",
+                      ends and all(e <= len(contig) for e in ends))
+            vals = [float(r.split("\t")[3])
+                    for r in Path(str(pref) + ".frame.bedGraph")
+                    .read_text().splitlines()
+                    if not r.startswith("track")]
+            check(f"frame.bedGraph range ({pref.name})",
+                  all(-1.0 <= v <= 1.0 for v in vals), vals[:3])
+
 
 def main():
     fns = [test_io, test_frame, test_reconcile, test_pood_tau,
@@ -813,7 +902,7 @@ def main():
            test_fuse_rev_frame_remap, test_fuse_impulse_placement,
            test_fuse_region_fallback, test_apply_ablate,
            test_decode_stop_rescue_multi_intron,
-           test_annotate_e2e]
+           test_coarse_tracks, test_annotate_e2e]
     for f in fns:
         f()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")

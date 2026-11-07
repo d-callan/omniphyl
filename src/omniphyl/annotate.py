@@ -97,7 +97,7 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
                  domain_threshold: float = 0.5,
                  conf_tau: float = 0.5, anc_tau: float = 0.2,
                  min_intron: int = 35, max_intron: int = 5000,
-                 ablate: str = "",
+                 ablate: str = "", tracks_only: bool = False,
                  verbose: bool = True) -> dict:
     """Full annotate pipeline; writes all outputs, returns report dict."""
     out_prefix = Path(out_prefix)
@@ -230,37 +230,43 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
         print(f"omniphyl annotate: genetic code = {gcode}")
 
     # ---------------- Step 4c: Stage-2 gene decoding -------------------------
+    # tracks_only skips ORF/splice decoding entirely: the bin-grid
+    # tracks (coding_regions.bed, frame/coding/boundary bedGraphs) are
+    # written from the fused Stage-1 signals alone.
     stops = _gcode_stops(gcode)
-    for ci, res in enumerate(results):
-        seq = contig_seqs[res.contig]
-        dom = (res.taxon.names.get("domain", "") if res.taxon else "")
-        euk = (kingdom == "eukaryote"
-               or (kingdom == "auto" and dom == "Eukaryota"))
-        prok = (kingdom == "prokaryote" or kingdom == "viral"
-                or (kingdom == "auto" and dom in
-                    ("Bacteria", "Archaea", "Viruses")))
-        res.genes = _decode_genes(
-            seq, res, stops=stops, euk=euk and not prok,
-            w_ev=w_ev, min_cds_len=min_cds_len,
-            coding_threshold=coding_threshold,
-            boundary_threshold=boundary_threshold,
-            min_intron=min_intron, max_intron=max_intron,
-            intron_hints=(evidence.get(res.contig).intron_candidates
-                          if res.contig in evidence else []))
-        # per-gene Pfam assignment
-        if bp.domains is not None and pred.domain_vocab:
-            id2dom = {i: d for d, i in pred.domain_vocab.items()}
-            for g in res.genes:
-                s, e, strand = g["start"], g["end"], g["strand"]
-                pool = [bp.domains[wi] for wi, (_ci, a, wl)
-                        in enumerate(win_meta)
-                        if _ci == ci and a < e and a + wl > s]
-                if pool:
-                    mean_p = np.mean(pool, axis=0)
-                    g["domains"] = [id2dom[i] for i in np.argsort(-mean_p)
-                                    if mean_p[i] >= domain_threshold]
-                else:
-                    g["domains"] = []
+    if not tracks_only:
+        for ci, res in enumerate(results):
+            seq = contig_seqs[res.contig]
+            dom = (res.taxon.names.get("domain", "")
+                   if res.taxon else "")
+            euk = (kingdom == "eukaryote"
+                   or (kingdom == "auto" and dom == "Eukaryota"))
+            prok = (kingdom == "prokaryote" or kingdom == "viral"
+                    or (kingdom == "auto" and dom in
+                        ("Bacteria", "Archaea", "Viruses")))
+            res.genes = _decode_genes(
+                seq, res, stops=stops, euk=euk and not prok,
+                w_ev=w_ev, min_cds_len=min_cds_len,
+                coding_threshold=coding_threshold,
+                boundary_threshold=boundary_threshold,
+                min_intron=min_intron, max_intron=max_intron,
+                intron_hints=(evidence.get(res.contig).intron_candidates
+                              if res.contig in evidence else []))
+            # per-gene Pfam assignment
+            if bp.domains is not None and pred.domain_vocab:
+                id2dom = {i: d for d, i in pred.domain_vocab.items()}
+                for g in res.genes:
+                    s, e, strand = g["start"], g["end"], g["strand"]
+                    pool = [bp.domains[wi] for wi, (_ci, a, wl)
+                            in enumerate(win_meta)
+                            if _ci == ci and a < e and a + wl > s]
+                    if pool:
+                        mean_p = np.mean(pool, axis=0)
+                        g["domains"] = [
+                            id2dom[i] for i in np.argsort(-mean_p)
+                            if mean_p[i] >= domain_threshold]
+                    else:
+                        g["domains"] = []
 
     # ---------------- Step 4d: chimeric contig flagging ----------------------
     consensus_deep = {}
@@ -292,7 +298,8 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
             pickle.dump({"results": results, "contig_seqs": contig_seqs,
                          "stops": stops, "gcode": gcode}, fh)
     report = _write_outputs(out_prefix, results, contigs, genome_call,
-                            gcode, w_ev, lexicmap_source, verbose)
+                            gcode, w_ev, coding_threshold,
+                            lexicmap_source, verbose)
     return report
 
 
@@ -402,6 +409,30 @@ def _apply_ablate(results: list[ContigResult], abl: set):
                 getattr(res, attr)[:] = 0.0
 
 
+# ------------------------------------------------ fused coding score ---
+
+
+def _coding_track(res: ContigResult) -> np.ndarray:
+    """Model coding probability per bin; region head when present."""
+    return res.p_region[:, 0] if res.p_region[:, 0].sum() > 0 \
+        else res.p_coding
+
+
+def _fused_cscore(res: ContigResult, w_ev: float,
+                  coding: np.ndarray | None = None) -> np.ndarray:
+    """Coding score fused with evidence coverage (plan §3.2).
+
+    log-space boost w_ev * UTR_gate * d~(x); the UTR gate keeps
+    coverage over noncoding RNA / UTR sequence from manufacturing
+    coding mass where the model sees none. Shared by the Stage-2
+    decoder and the coarse browser tracks."""
+    if coding is None:
+        coding = _coding_track(res)
+    utr_gate = np.minimum(1.0, coding / 0.25)
+    return np.exp(np.log(np.clip(coding, 1e-6, 1.0))
+                  + w_ev * utr_gate * res.dtilde)
+
+
 # ---------------------------------------------------------- Stage-2 ------
 
 
@@ -485,12 +516,8 @@ def _decode_genes(seq: str, res: ContigResult, stops: set, euk: bool,
     L = res.length
     B = res.bin_width
     genes = []
-    coding = res.p_region[:, 0] if res.p_region[:, 0].sum() > 0 \
-        else res.p_coding
-    utr_gate = np.minimum(1.0, coding / 0.25)
-    # fused evidence: log p_coding + w_ev * UTR_gate * d~(x)  (plan §3.2)
-    cscore = np.exp(np.log(np.clip(coding, 1e-6, 1.0))
-                    + w_ev * utr_gate * res.dtilde)
+    coding = _coding_track(res)
+    cscore = _fused_cscore(res, w_ev, coding)
     have_frames = res.p_frame[:, :6].sum() > 0
     in_coding = cscore >= coding_threshold
     runs = []
@@ -1401,8 +1428,116 @@ def _lineage_str(call) -> str:
     return ";".join(parts)
 
 
+# ---------------------------------------------- coarse browser tracks --
+
+
+# dominant global frame -> UCSC itemRgb. Distinct hues per frame make
+# frame shifts across a locus visible at a glance.
+_FRAME_RGB = ("31,119,180", "44,160,44", "23,190,207",   # +0 +1 +2
+              "214,39,40", "255,127,14", "148,103,189")  # -0 -1 -2
+_FRAME_RGB_NONE = "127,127,127"
+
+
+def _signed_frame_signal(res: ContigResult, w_ev: float) -> np.ndarray:
+    """Signed per-bin coding score for the .frame.bedGraph track.
+
+    Bins whose frame mass favors the + strand score +cscore and -
+    strand bins -cscore, so the track renders as a two-sided wiggle
+    (viewLimits -1:1). Without a frame head the unsigned fused score
+    is emitted."""
+    cscore = np.clip(_fused_cscore(res, w_ev), 0.0, 1.0)
+    if res.p_frame[:, :6].sum() <= 0:
+        return cscore
+    p_plus = res.p_frame[:, :3].sum(axis=1)
+    p_minus = res.p_frame[:, 3:6].sum(axis=1)
+    strand_dir = (p_plus - p_minus) / np.maximum(p_plus + p_minus, 1e-9)
+    return cscore * strand_dir
+
+
+def _coarse_coding_blocks(res: ContigResult, coding_threshold=0.45,
+                          w_ev=0.25, min_block_bp=100,
+                          max_gap_bins=1) -> list[dict]:
+    """BED9 coarse coding blocks from the fused bin tracks.
+
+    Contiguous runs of bins with fused coding score >=
+    coding_threshold, closed across <= max_gap_bins dips sharing a
+    dominant strand so one noisy bin does not split a locus. These
+    are visual intervals, not gene calls -- no ORF/splice logic runs
+    here, so a block can span a whole multi-exon locus or overlap
+    adjacent genes.
+    """
+    B, L = res.bin_width, res.length
+    cscore = _fused_cscore(res, w_ev)
+    in_coding = cscore >= coding_threshold
+    have_frames = res.p_frame[:, :6].sum() > 0
+
+    def _dom_strand(b0, b1):
+        sp = float(res.p_frame[b0:b1 + 1, :3].sum())
+        sn = float(res.p_frame[b0:b1 + 1, 3:6].sum())
+        return "+" if sp >= sn else "-"
+
+    runs = []
+    b = 0
+    while b < res.n_bins:
+        if not in_coding[b]:
+            b += 1
+            continue
+        b2 = b
+        while b2 + 1 < res.n_bins and in_coding[b2 + 1]:
+            b2 += 1
+        runs.append((b, b2))
+        b = b2 + 1
+    if max_gap_bins > 0 and len(runs) > 1:
+        merged = [runs[0]]
+        for r in runs[1:]:
+            prev = merged[-1]
+            same_strand = (not have_frames
+                           or _dom_strand(*prev) == _dom_strand(*r))
+            if r[0] - prev[1] - 1 <= max_gap_bins and same_strand:
+                merged[-1] = (prev[0], r[1])
+            else:
+                merged.append(r)
+        runs = merged
+
+    blocks = []
+    for idx, (b0, b1) in enumerate(runs):
+        start, end = b0 * B, min((b1 + 1) * B, L)
+        if end - start < min_block_bp:
+            continue
+        mean_c = float(cscore[b0:b1 + 1].mean())
+        score = int(round(min(1000.0, max(0.0, mean_c * 1000.0))))
+        if have_frames:
+            f_mean = res.p_frame[b0:b1 + 1, :6].mean(axis=0)
+            p_plus, p_minus = float(f_mean[:3].sum()), \
+                float(f_mean[3:].sum())
+            strand = "+" if p_plus >= p_minus else "-"
+            g_dom = (int(f_mean[:3].argmax()) if strand == "+"
+                     else 3 + int(f_mean[3:].argmax()))
+            frame_label = f"{'+' if g_dom < 3 else '-'}{g_dom % 3}"
+            frame_conf = float(f_mean[g_dom]
+                               / max(p_plus + p_minus, 1e-9))
+            rgb = _FRAME_RGB[g_dom]
+        else:
+            strand, frame_label, frame_conf = ".", "none", 0.0
+            rgb = _FRAME_RGB_NONE
+        # thick region = high-confidence core of the block
+        hi_thr = max(coding_threshold + 0.15, 0.65)
+        core = np.flatnonzero(cscore[b0:b1 + 1] >= hi_thr)
+        if len(core):
+            t0 = start + int(core[0]) * B
+            t1 = min(start + int(core[-1] + 1) * B, end)
+        else:
+            t0, t1 = start, end
+        blocks.append({
+            "start": start, "end": end, "strand": strand,
+            "score": score, "thick": (t0, t1), "rgb": rgb,
+            "name": f"cblock_{idx}|f={frame_label}"
+                    f"|p={mean_c:.2f}|fc={frame_conf:.2f}"})
+    return blocks
+
+
 def _write_outputs(out_prefix: Path, results: list[ContigResult],
-                   contigs, genome_call, gcode, w_ev,
+                   contigs, genome_call, gcode, w_ev, coding_threshold,
                    lexicmap_source, verbose) -> dict:
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
     gid = 0
@@ -1470,13 +1605,37 @@ def _write_outputs(out_prefix: Path, results: list[ContigResult],
     with open(str(out_prefix) + ".coding.bedGraph", "w") as f:
         f.write("track type=bedGraph name=omniphyl_coding\n")
         for res in results:
-            _write_bg(f, res.contig, res.p_region[:, 0]
-                      if res.p_region[:, 0].sum() > 0 else res.p_coding,
-                      res.bin_width)
+            _write_bg(f, res.contig, _coding_track(res),
+                      res.bin_width, res.length)
     with open(str(out_prefix) + ".boundary.bedGraph", "w") as f:
         f.write("track type=bedGraph name=omniphyl_boundary\n")
         for res in results:
-            _write_bg(f, res.contig, res.p_boundary, res.bin_width)
+            _write_bg(f, res.contig, res.p_boundary, res.bin_width,
+                      res.length)
+    with open(str(out_prefix) + ".frame.bedGraph", "w") as f:
+        f.write('track type=bedGraph name=omniphyl_frame '
+                'description="OmniPhyl signed strand coding score '
+                '(+strand > 0, -strand < 0)" viewLimits=-1:1 '
+                'autoScale=off\n')
+        for res in results:
+            _write_bg(f, res.contig, _signed_frame_signal(res, w_ev),
+                      res.bin_width, res.length)
+
+    # BED9 coarse coding blocks, colored by dominant global frame
+    n_blocks = 0
+    with open(str(out_prefix) + ".coding_regions.bed", "w") as f:
+        f.write('track name="omniphyl_coding_regions" '
+                'description="OmniPhyl coarse coding regions (colored '
+                'by global frame)" itemRgb="On"\n')
+        for res in results:
+            for blk in _coarse_coding_blocks(
+                    res, coding_threshold=coding_threshold, w_ev=w_ev):
+                n_blocks += 1
+                t0, t1 = blk["thick"]
+                f.write("\t".join(map(str, (
+                    res.contig, blk["start"], blk["end"], blk["name"],
+                    blk["score"], blk["strand"], t0, t1,
+                    blk["rgb"]))) + "\n")
 
     # contig summary
     with open(str(out_prefix) + ".contig_summary.tsv", "w") as f:
@@ -1522,6 +1681,7 @@ def _write_outputs(out_prefix: Path, results: list[ContigResult],
         "features": {
             "n_genes": n_genes, "n_multi_exon": n_multi,
             "n_single_exon": n_genes - n_multi,
+            "n_coding_blocks": n_blocks,
             "n_chimeric_contigs": n_chimeras,
             "top_domains": top_doms,
         },
@@ -1535,6 +1695,7 @@ def _write_outputs(out_prefix: Path, results: list[ContigResult],
         print(md)
         print(f"omniphyl annotate: wrote {out_prefix}.{{gff3,report.md,"
               f"report.json,coding.bedGraph,boundary.bedGraph,"
+              f"frame.bedGraph,coding_regions.bed,"
               f"contig_summary.tsv}}")
     return report
 
@@ -1557,14 +1718,23 @@ def _exon_bounds(g):
     return exons
 
 
-def _write_bg(f, seqid, values, bin_width):
+def _write_bg(f, seqid, values, bin_width, length=None):
+    """Run-length-encode per-bin values into bedGraph rows.
+
+    `length` clamps interval ends to the contig: when the contig is
+    not a multiple of bin_width the last bin would otherwise overhang,
+    which bedGraphToBigWig/bedToBigBed reject as out of bounds."""
     i, n = 0, len(values)
     while i < n:
         v = float(values[i])
         j = i + 1
         while j < n and float(values[j]) == v:
             j += 1
-        f.write(f"{seqid}\t{i * bin_width}\t{j * bin_width}\t{v:.3f}\n")
+        end = j * bin_width
+        if length is not None:
+            end = min(end, length)
+        if end > i * bin_width:
+            f.write(f"{seqid}\t{i * bin_width}\t{end}\t{v:.3f}\n")
         i = j
 
 

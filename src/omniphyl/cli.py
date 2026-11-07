@@ -34,6 +34,7 @@ def _annotate_parser(sub):
     ap.add_argument("--out", required=True, type=Path,
                     help="output prefix; writes PREFIX.{gff3,report.md,"
                          "report.json,coding.bedGraph,boundary.bedGraph,"
+                         "frame.bedGraph,coding_regions.bed,"
                          "contig_summary.tsv}")
     ap.add_argument("--window", type=int, default=500)
     ap.add_argument("--stride", type=int, default=100)
@@ -90,6 +91,10 @@ def _annotate_parser(sub):
                           "post-aggregation (contribution audit): "
                           "frame,flags,region,coding,boundary,evidence,"
                           "domains")
+    dec.add_argument("--tracks-only", action="store_true",
+                     help="skip Stage-2 ORF/intron decoding; emit "
+                          "coarse coding-region BED/bedGraph tracks "
+                          "plus taxonomy report only")
     return ap
 
 
@@ -165,6 +170,7 @@ def main(argv=None) -> int:
             domain_threshold=args.domain_threshold,
             conf_tau=args.conf_tau, anc_tau=args.anc_tau,
             min_intron=args.min_intron, max_intron=args.max_intron,
+            tracks_only=args.tracks_only,
             verbose=not args.quiet)
     elif args.cmd == "profile":
         from .profile import run_profile
