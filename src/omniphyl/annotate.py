@@ -24,6 +24,11 @@ from .model import OmniPhylPredictor, RANKS
 
 REGION_NAMES = ("coding", "intron", "rna", "intergenic")
 FLAG_NAMES = ("start", "stop", "donor", "acceptor")
+# Max windows fused per predict_sequences call -- bounds peak RAM to
+# ~2.5 GB of per-residue predictions regardless of genome size
+# (metagenomes / >20 Mb genomes OOM'd when all windows were predicted
+# at once).
+WINDOW_GROUP_MAX = 40960
 
 _CODE4_STOPS = {"TAA", "TAG"}  # TGA->Trp in genetic code 4
 
@@ -124,21 +129,6 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
               f"{sum(len(s) for _, s, _ in contigs):,} bp")
     contig_seqs = {i: s for i, s, _ in contigs}
 
-    # ---------------- Step 1: windows across ALL contigs, batched ---------
-    win_meta: list[tuple] = []     # (contig_idx, a_w, win_len)
-    win_seqs: list[str] = []
-    for ci, (cid, seq, _cov) in enumerate(contigs):
-        for a in _window_starts(len(seq), W, S):
-            w = seq[a:a + W]
-            if _n_frac(w) > 0.5:
-                continue
-            win_meta.append((ci, a, len(w)))
-            win_seqs.append(w)
-    if verbose:
-        print(f"omniphyl annotate: {len(win_seqs)} windows "
-              f"(W={W}, S={S}, batch={batch_size})")
-    bp = pred.predict_sequences(win_seqs, batch_size=batch_size)
-
     # ---------------- Step 3 (early load): LexicMap evidence ---------------
     evidence: dict[str, ContigEvidence] = {}
     if ((lexicmap_bed or lexicmap_bedgraph or lexicmap_tsv)
@@ -155,17 +145,76 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
             print(f"omniphyl annotate: lexicmap evidence ({lexicmap_source}) "
                   f"on {len(evidence)} contigs")
 
-    # ---------------- Step 2: raised-cosine aggregation --------------------
+    # ------ Steps 1+2: windowed inference fused in bounded-size groups -----
+    # predict_sequences materializes per-residue head outputs for EVERY
+    # window it is handed (~60 KB/window at W=500); feeding a whole
+    # genome at once scales RAM with total bp and SIGKILLs on 20+ Mb
+    # genomes / metagenomes. Groups capped at WINDOW_GROUP_MAX keep the
+    # peak at ~2.5 GB regardless of input size; fusion is identical.
     results: list[ContigResult] = []
+    n_win = 0
+    g_meta: list[tuple] = []       # (contig_idx, a_w, win_len)
+    g_seqs: list[str] = []
+    g_cis: list[int] = []
+    # Small per-window outputs (n_windows x n_class, ~100x smaller than
+    # the per-residue heads) accumulated across groups for the
+    # taxonomy calls and per-gene domain pooling below.
+    sm_logp: dict[str, list] = {t: [] for t in pred.cls_targets}
+    sm_pood: dict[str, list] = {t: [] for t in pred.cls_targets}
+    sm_dom: list[np.ndarray] = []
+    has_af = [False]
     logp_by_contig: list[list[int]] = [[] for _ in contigs]
-    for wi, (ci, a, wl) in enumerate(win_meta):
-        logp_by_contig[ci].append(wi)
+    wmeta_by_contig: list[list] = [[] for _ in contigs]
+    woff = [0]                    # global index of first window in group
 
-    for ci, (cid, seq, cov) in enumerate(contigs):
-        res = _fuse_contig(cid, len(seq), logp_by_contig[ci], win_meta,
-                           bp, B, evidence.get(cid), lexicmap_source)
-        res.n_windows = len(logp_by_contig[ci])
-        results.append(res)
+    def _flush_group():
+        if not g_seqs:
+            return
+        bp = pred.predict_sequences(g_seqs, batch_size=batch_size)
+        for ci in g_cis:
+            cid, seq, _cov = contigs[ci]
+            wi = [i for i, m in enumerate(g_meta) if m[0] == ci]
+            res = _fuse_contig(cid, len(seq), wi, g_meta, bp, B,
+                               evidence.get(cid), lexicmap_source)
+            res.n_windows = len(wi)
+            results.append(res)
+            logp_by_contig[ci].extend(woff[0] + i for i in wi)
+            wmeta_by_contig[ci].extend(g_meta[i][1:] for i in wi)
+        for t in pred.cls_targets:
+            sm_logp[t].append(bp.logp[t])
+            sm_pood[t].append(bp.p_ood[t])
+        if bp.domains is not None:
+            sm_dom.append(bp.domains)
+        has_af[0] = has_af[0] or bp.active_frame is not None
+        woff[0] += len(g_seqs)
+        g_meta.clear()
+        g_seqs.clear()
+        g_cis.clear()
+
+    for ci, (cid, seq, _cov) in enumerate(contigs):
+        wins = []
+        for a in _window_starts(len(seq), W, S):
+            w = seq[a:a + W]
+            if _n_frac(w) <= 0.5:
+                wins.append((a, len(w)))
+        if g_seqs and len(g_seqs) + len(wins) > WINDOW_GROUP_MAX:
+            _flush_group()
+        for a, wl in wins:
+            g_meta.append((ci, a, wl))
+            g_seqs.append(seq[a:a + wl])
+        g_cis.append(ci)
+        n_win += len(wins)
+        if len(g_seqs) > WINDOW_GROUP_MAX:
+            _flush_group()
+    _flush_group()
+    if verbose:
+        print(f"omniphyl annotate: {n_win} windows "
+              f"(W={W}, S={S}, batch={batch_size})")
+    logp_all = {t: np.concatenate(v) for t, v in sm_logp.items()
+                if v and len(v[0])}
+    pood_all = {t: np.concatenate(v) for t, v in sm_pood.items()
+                if v and len(v[0])}
+    dom_all = np.concatenate(sm_dom) if sm_dom else None
 
     # ablation: zero fused tracks so the decoder falls back to simpler
     # signals (ABLATE_FIELDS). "evidence"/"domains" were handled above
@@ -181,17 +230,17 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
         # for every rank. log-mean-exp keeps pooled a proper log-softmax.
         pooled = {}
         for t in pred.cls_targets:
-            lp = bp.logp[t][idxs]
+            lp = logp_all[t][idxs]
             m = lp.max(0, keepdims=True)
             pooled[t] = m + np.log(
                 np.exp(lp - m).mean(0, keepdims=True))
-        pod = {t: bp.p_ood[t][idxs].mean(0, keepdims=False)
+        pod = {t: pood_all[t][idxs].mean(0, keepdims=False)
                for t in pred.cls_targets}
         calls = pred.call(pooled, conf_tau=conf_tau, anc_tau=anc_tau,
                           p_ood={t: v[None] for t, v in pod.items()})
         return calls[0]
 
-    genome_call = _pooled_call(list(range(len(win_seqs))))
+    genome_call = _pooled_call(list(range(n_win)))
     for ci, res in enumerate(results):
         res.taxon = _pooled_call(logp_by_contig[ci])
 
@@ -203,7 +252,7 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
         n_cod = {"TAA": 0, "TAG": 0, "TGA": 0}
         total = 0
         for ci, res in enumerate(results):
-            if bp.active_frame is None:
+            if not has_af[0]:
                 break
             seq = contig_seqs[res.contig]
             gstar = res.p_frame[:, :6].argmax(1)
@@ -276,13 +325,14 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
                     min_intron=min_intron, max_intron=max_intron,
                     intron_hints=hints)
             # per-gene Pfam assignment
-            if bp.domains is not None and pred.domain_vocab:
+            if dom_all is not None and pred.domain_vocab:
                 id2dom = {i: d for d, i in pred.domain_vocab.items()}
                 for g in res.genes:
                     s, e, strand = g["start"], g["end"], g["strand"]
-                    pool = [bp.domains[wi] for wi, (_ci, a, wl)
-                            in enumerate(win_meta)
-                            if _ci == ci and a < e and a + wl > s]
+                    pool = [dom_all[gwi] for gwi, (a, wl)
+                            in zip(logp_by_contig[ci],
+                                   wmeta_by_contig[ci])
+                            if a < e and a + wl > s]
                     if pool:
                         mean_p = np.mean(pool, axis=0)
                         g["domains"] = [
