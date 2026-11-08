@@ -172,13 +172,19 @@ class RefinerChunks(Dataset):
         tr = tr_no_ev if np.random.default_rng(
             self.seed + i).random() < self.p_no_ev else tr
         x = build_refiner_inputs(seq, res, lo, hi, self.w_ev, tracks=tr)
-        # torch.tensor (copy) not torch.from_numpy: numpy-backed
-        # storages are non-resizable and default_collate's shared-
-        # memory path resize_()s them -> "storage that is not
-        # resizable" in worker processes.
-        return (torch.tensor(x), torch.tensor(cond),
-                torch.tensor(state[lo:hi]),
-                torch.tensor(site[:, lo:hi]))
+        return (torch.from_numpy(x), torch.from_numpy(cond),
+                torch.from_numpy(state[lo:hi].copy()),
+                torch.from_numpy(site[:, lo:hi].copy()))
+
+
+def _chunk_collate(batch):
+    """torch.stack collate. default_collate's worker shared-memory
+    path (elem.new(storage).resize_) raises 'storage that is not
+    resizable' on some torch builds (kaggle), so stack here and let
+    the batch cross the worker pipe as a normal tensor."""
+    x, cond, ys, yt = zip(*batch)
+    return (torch.stack(x), torch.stack(cond),
+            torch.stack(ys), torch.stack(yt))
 
 
 def _make_items(res_pkl: dict, labels_by_seqid: dict, gcode: int,
@@ -359,10 +365,12 @@ def main():
     trn = DataLoader(RefinerChunks(trn_items, args.evidence_weight,
                                    seed=args.seed),
                      batch_size=args.batch_size, shuffle=True,
-                     num_workers=args.num_workers)
+                     num_workers=args.num_workers,
+                     collate_fn=_chunk_collate)
     val = DataLoader(RefinerChunks(val_items, args.evidence_weight,
                                    p_no_ev=0.0, seed=args.seed),
-                     batch_size=args.batch_size)
+                     batch_size=args.batch_size,
+                     collate_fn=_chunk_collate)
     print(f"chunks: {len(trn.dataset)} train / {len(val.dataset)} val "
           f"({len(trn_items)} / {len(val_items)} contigs)", flush=True)
 
