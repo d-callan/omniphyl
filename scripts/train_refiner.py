@@ -28,9 +28,11 @@ dtilde/e_lex channels for 25% of chunks.
 """
 
 import argparse
+import json
 import math
 import os
 import pickle
+import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -51,7 +53,7 @@ from omniphyl.refiner import (OmniPhylRefiner, build_refiner_inputs,
                               ST_INT_P, ST_CDS_M, ST_INT_M,
                               S_START_P, S_STOP_P, S_DON_P, S_ACC_P,
                               S_START_M, S_STOP_M, S_DON_M, S_ACC_M)
-from omniphyl.annotate import ContigResult, run_annotate
+from omniphyl.annotate import ContigResult
 from omniphyl.io import iter_sequences, revcomp
 from eval_genes import parse_cds
 
@@ -395,19 +397,48 @@ def _split_items(tr_pairs, val_pairs, val_seqids, val_frac, seed):
 
 def _stage1_cache(fasta: Path, model, cache_dir: Path, args):
     """ContigResult dict for a fasta: cached .res.pkl else a tracks-only
-    annotate run with OMNIPHYL_DUMP_RES."""
+    annotate run with OMNIPHYL_DUMP_RES.
+
+    The annotate runs in a SUBPROCESS: stage-1 holds the whole genome's
+    ContigResults plus multi-GB prediction batches, and Python/glibc do
+    not reliably return that memory to the OS. Isolating it per genome
+    keeps multi-genome runs from accumulating RSS until the OOM killer
+    fires; the parent only ever touches the pickled cache.
+
+    Returns the loaded res dict, or None if stage-1 failed (caller
+    skips the genome; main() gates on how many failures to tolerate)."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     pk = cache_dir / (fasta.stem + ".res.pkl")
     if not pk.exists():
         if model is None:
             sys.exit(f"no Stage-1 cache {pk} and no --model given")
-        os.environ["OMNIPHYL_DUMP_RES"] = "1"
-        run_annotate(model_path=model, fasta_path=fasta,
-                     out_prefix=cache_dir / fasta.stem,
-                     window=args.window, stride=args.stride,
-                     bin_width=args.bin_width,
-                     batch_size=args.stage1_batch, device=args.device,
-                     tracks_only=True, verbose=False)
+        spec = json.dumps({
+            "model_path": str(model), "fasta_path": str(fasta),
+            "out_prefix": str(cache_dir / fasta.stem),
+            "window": args.window, "stride": args.stride,
+            "bin_width": args.bin_width,
+            "batch_size": args.stage1_batch, "device": args.device,
+            "tracks_only": True, "verbose": False})
+        print(f"{fasta.name}: stage-1 annotate (subprocess)",
+              flush=True)
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, json\n"
+             "from pathlib import Path\n"
+             "from omniphyl.annotate import run_annotate\n"
+             "kw = json.loads(sys.argv[1])\n"
+             "kw['out_prefix'] = Path(kw['out_prefix'])\n"
+             "run_annotate(**kw)\n",
+             spec],
+            env={**os.environ, "OMNIPHYL_DUMP_RES": "1",
+                 # child needs the repo's src on path; sys.path edits
+                 # in this process don't propagate to subprocesses
+                 "PYTHONPATH": str(ROOT / "src") + os.pathsep
+                 + os.environ.get("PYTHONPATH", "")})
+        if r.returncode != 0 or not pk.exists():
+            print(f"{fasta.name}: stage-1 FAILED rc={r.returncode} "
+                  "-- skipping this genome", flush=True)
+            return None
     with open(pk, "rb") as fh:
         return pickle.load(fh)
 
@@ -462,7 +493,7 @@ def main():
     # Each entry: (item, group) where group is the base contig seqid --
     # a contig and its _rc partner share a group so a grouped split
     # can't leak the opposite strand across the train/val boundary.
-    tr_pairs, val_pairs = [], []
+    tr_pairs, val_pairs, failed = [], [], []
 
     def _load_pair(pi, fa_s, gff_s, is_val):
         fasta, gff = Path(fa_s), Path(gff_s)
@@ -476,6 +507,8 @@ def main():
                          "a cache")
             cache = args.cache_dir or args.out.parent / "refiner_cache"
             res_pkl = _stage1_cache(fasta, args.model, cache, args)
+            if res_pkl is None:
+                return None
         labels = parse_cds(str(gff))
         gcode = res_pkl.get("gcode", 1)
         items, groups = _make_items(res_pkl, labels, gcode,
@@ -485,9 +518,24 @@ def main():
         return list(zip(items, groups))
 
     for pi, (fa_s, gff_s) in enumerate(args.data):
-        tr_pairs += _load_pair(pi, fa_s, gff_s, is_val=False)
+        pairs = _load_pair(pi, fa_s, gff_s, is_val=False)
+        if pairs is None:
+            failed.append(fa_s)
+        else:
+            tr_pairs += pairs
     for pi, (fa_s, gff_s) in enumerate(args.val_data):
-        val_pairs += _load_pair(pi, fa_s, gff_s, is_val=True)
+        pairs = _load_pair(pi, fa_s, gff_s, is_val=True)
+        if pairs is None:
+            failed.append(fa_s)
+        else:
+            val_pairs += pairs
+    if len(failed) > 1:
+        sys.exit(f"{len(failed)} genomes failed stage-1 {failed} -- "
+                 "more than 1 allowed; successful caches are on disk, "
+                 "rerun to retry only the failures")
+    if failed:
+        print(f"WARNING: training without failed genome(s): "
+              f"{[Path(f).name for f in failed]}", flush=True)
     if not tr_pairs:
         sys.exit("no labelled contigs (check seqid match fasta<->gff3)")
 

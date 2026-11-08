@@ -185,9 +185,15 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
                 ci, {"logp": {}, "pood": {}, "n": 0})
             d["n"] += len(wi)
             for t in pred.cls_targets:
-                d["logp"][t] = (d["logp"].get(t, 0.0) +
-                                np.exp(bp.logp[t][wi].astype(
-                                    np.float64)).sum(0))
+                # exp in float32 + f64 accumulation over window slices:
+                # a full wi x C_r float64 exp would transiently cost
+                # ~3.4 GB at species-rank class counts per flush group
+                lp = bp.logp[t]
+                acc = np.zeros(lp.shape[1], np.float64)
+                for i0 in range(0, len(wi), 2048):
+                    acc += np.exp(lp[wi[i0:i0 + 2048]]).sum(
+                        0, dtype=np.float64)
+                d["logp"][t] = d["logp"].get(t, 0.0) + acc
                 d["pood"][t] = (d["pood"].get(t, 0.0) +
                                 bp.p_ood[t][wi].astype(
                                     np.float64).sum())
@@ -233,7 +239,11 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
         # the n_windows x n_class matrix. p_ood is a plain mean.
         if not n:
             return None
-        pooled = {t: np.log(tax["logp"][t] / n)[None].astype(np.float32)
+        # floor: classes with total prob 0 (e.g. masked class 0) get a
+        # large finite negative logp rather than -inf, which would
+        # propagate nan through downstream softmax/path-score ops
+        pooled = {t: np.log(np.clip(tax["logp"][t] / n, 1e-300, None)
+                            )[None].astype(np.float32)
                   for t in pred.cls_targets}
         pod = {t: (tax["pood"][t] / n)[None].astype(np.float32)
                for t in pred.cls_targets}
