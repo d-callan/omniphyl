@@ -24,11 +24,12 @@ from .model import OmniPhylPredictor, RANKS
 
 REGION_NAMES = ("coding", "intron", "rna", "intergenic")
 FLAG_NAMES = ("start", "stop", "donor", "acceptor")
-# Max windows fused per predict_sequences call -- bounds peak RAM to
-# ~2.5 GB of per-residue predictions regardless of genome size
-# (metagenomes / >20 Mb genomes OOM'd when all windows were predicted
-# at once).
-WINDOW_GROUP_MAX = 40960
+# Max windows fused per predict_sequences call. Bounds peak RAM from
+# the per-residue heads AND the per-window taxonomy logits (the model
+# emits logp + p_ood over ~52k classes -> ~3.4 GB per 8192-window
+# group); genome-wide prediction OOM'd on >20 Mb genomes and
+# metagenomes.
+WINDOW_GROUP_MAX = 8192
 
 _CODE4_STOPS = {"TAA", "TAG"}  # TGA->Trp in genetic code 4
 
@@ -156,16 +157,15 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
     g_meta: list[tuple] = []       # (contig_idx, a_w, win_len)
     g_seqs: list[str] = []
     g_cis: list[int] = []
-    # Small per-window outputs (n_windows x n_class, ~100x smaller than
-    # the per-residue heads) accumulated across groups for the
-    # taxonomy calls and per-gene domain pooling below.
-    sm_logp: dict[str, list] = {t: [] for t in pred.cls_targets}
-    sm_pood: dict[str, list] = {t: [] for t in pred.cls_targets}
-    sm_dom: list[np.ndarray] = []
-    has_af = [False]
-    logp_by_contig: list[list[int]] = [[] for _ in contigs]
+    # The taxonomy calls below only need log-mean-exp / mean over a
+    # contig's windows, i.e. SUMS over exp(logp) and p_ood -- so we
+    # accumulate O(n_class) sums per contig instead of the full
+    # n_windows x n_class matrix (~98 GB at Pf3D7's 236k x ~52k).
+    # Skipped under tracks_only (no taxonomy/domain steps downstream).
+    tax_by_contig: dict[int, dict] = {}
+    dom_by_contig: list[list] = [[] for _ in contigs]
     wmeta_by_contig: list[list] = [[] for _ in contigs]
-    woff = [0]                    # global index of first window in group
+    has_af = [False]
 
     def _flush_group():
         if not g_seqs:
@@ -178,15 +178,22 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
                                evidence.get(cid), lexicmap_source)
             res.n_windows = len(wi)
             results.append(res)
-            logp_by_contig[ci].extend(woff[0] + i for i in wi)
+            if tracks_only:
+                continue
+            d = tax_by_contig.setdefault(
+                ci, {"logp": {}, "pood": {}, "n": 0})
+            d["n"] += len(wi)
+            for t in pred.cls_targets:
+                d["logp"][t] = (d["logp"].get(t, 0.0) +
+                                np.exp(bp.logp[t][wi].astype(
+                                    np.float64)).sum(0))
+                d["pood"][t] = (d["pood"].get(t, 0.0) +
+                                bp.p_ood[t][wi].astype(
+                                    np.float64).sum())
+            if bp.domains is not None:
+                dom_by_contig[ci].append(bp.domains[wi])
             wmeta_by_contig[ci].extend(g_meta[i][1:] for i in wi)
-        for t in pred.cls_targets:
-            sm_logp[t].append(bp.logp[t])
-            sm_pood[t].append(bp.p_ood[t])
-        if bp.domains is not None:
-            sm_dom.append(bp.domains)
         has_af[0] = has_af[0] or bp.active_frame is not None
-        woff[0] += len(g_seqs)
         g_meta.clear()
         g_seqs.clear()
         g_cis.clear()
@@ -210,39 +217,39 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
     if verbose:
         print(f"omniphyl annotate: {n_win} windows "
               f"(W={W}, S={S}, batch={batch_size})")
-    logp_all = {t: np.concatenate(v) for t, v in sm_logp.items()
-                if v and len(v[0])}
-    pood_all = {t: np.concatenate(v) for t, v in sm_pood.items()
-                if v and len(v[0])}
-    dom_all = np.concatenate(sm_dom) if sm_dom else None
-
     # ablation: zero fused tracks so the decoder falls back to simpler
     # signals (ABLATE_FIELDS). "evidence"/"domains" were handled above
     # and below, not by zeroing a track.
     _apply_ablate(results, abl)
 
     # ---------------- Step 4a: taxonomy calls -------------------------------
-    def _pooled_call(idxs):
-        if not idxs:
+    def _pooled_call(tax, n):
+        # Pooled log-probs from accumulated sums: log-mean-exp(lp) =
+        # log(sum(exp(lp))/n) -- identical to the per-window
+        # log-mean-exp the old code computed, without materializing
+        # the n_windows x n_class matrix. p_ood is a plain mean.
+        if not n:
             return None
-        # mean of log-probs must be renormalized: arithmetic averaging
-        # drops total mass (mean log != log mean), deflating confidence
-        # for every rank. log-mean-exp keeps pooled a proper log-softmax.
-        pooled = {}
-        for t in pred.cls_targets:
-            lp = logp_all[t][idxs]
-            m = lp.max(0, keepdims=True)
-            pooled[t] = m + np.log(
-                np.exp(lp - m).mean(0, keepdims=True))
-        pod = {t: pood_all[t][idxs].mean(0, keepdims=False)
+        pooled = {t: np.log(tax["logp"][t] / n)[None].astype(np.float32)
+                  for t in pred.cls_targets}
+        pod = {t: (tax["pood"][t] / n)[None].astype(np.float32)
                for t in pred.cls_targets}
         calls = pred.call(pooled, conf_tau=conf_tau, anc_tau=anc_tau,
-                          p_ood={t: v[None] for t, v in pod.items()})
+                          p_ood=pod)
         return calls[0]
 
-    genome_call = _pooled_call(list(range(n_win)))
+    gen_tax = {"logp": {}, "pood": {}}
+    for d in tax_by_contig.values():
+        for t in pred.cls_targets:
+            gen_tax["logp"][t] = (gen_tax["logp"].get(t, 0.0) +
+                                  d["logp"].get(t, 0.0))
+            gen_tax["pood"][t] = (gen_tax["pood"].get(t, 0.0) +
+                                  d["pood"].get(t, 0.0))
+    genome_call = _pooled_call(
+        gen_tax, sum(d["n"] for d in tax_by_contig.values()))
     for ci, res in enumerate(results):
-        res.taxon = _pooled_call(logp_by_contig[ci])
+        d = tax_by_contig.get(ci)
+        res.taxon = _pooled_call(d, d["n"]) if d else None
 
     # ---------------- Step 4b: genetic-code inference -----------------------
     gcode = 1
@@ -325,13 +332,13 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
                     min_intron=min_intron, max_intron=max_intron,
                     intron_hints=hints)
             # per-gene Pfam assignment
-            if dom_all is not None and pred.domain_vocab:
+            if pred.domain_vocab and dom_by_contig[ci]:
+                doms = np.concatenate(dom_by_contig[ci])
                 id2dom = {i: d for d, i in pred.domain_vocab.items()}
                 for g in res.genes:
                     s, e, strand = g["start"], g["end"], g["strand"]
-                    pool = [dom_all[gwi] for gwi, (a, wl)
-                            in zip(logp_by_contig[ci],
-                                   wmeta_by_contig[ci])
+                    pool = [doms[k] for k, (a, wl)
+                            in enumerate(wmeta_by_contig[ci])
                             if a < e and a + wl > s]
                     if pool:
                         mean_p = np.mean(pool, axis=0)
