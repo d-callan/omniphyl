@@ -77,8 +77,28 @@ def _interp_track(track: np.ndarray, lo: int, hi: int,
                     axis=1).astype(np.float32)
 
 
+def _stage1_tracks(res: ContigResult,
+                   w_ev: float = 0.25) -> np.ndarray:
+    """(n_bins, 17) track stack for input channels 5..21, shared by
+    every chunk of a contig. The fused-coding and tanh transforms are
+    O(n_bins) over the whole contig, so callers iterating chunks must
+    precompute this once and pass it to build_refiner_inputs -- the
+    per-chunk cost is then only the O(chunk) interpolation."""
+    return np.column_stack([
+        _coding_track(res),            # 5
+        np.clip(_fused_cscore(res, w_ev), 0.0, 1.0),  # 6
+        res.p_boundary,                # 7
+        res.p_frame,                   # 8-15
+        np.tanh(res.b_tracks),         # 16-19
+        res.dtilde,                    # 20
+        np.tanh(res.e_lex),            # 21
+    ])
+
+
 def build_refiner_inputs(seq: str, res: ContigResult, lo: int, hi: int,
-                         w_ev: float = 0.25) -> np.ndarray:
+                         w_ev: float = 0.25,
+                         tracks: np.ndarray | None = None
+                         ) -> np.ndarray:
     """(22, L) float32 input tensor for slice seq[lo:hi].
 
     Channels:
@@ -103,16 +123,8 @@ def build_refiner_inputs(seq: str, res: ContigResult, lo: int, hi: int,
     x[codes[valid], np.flatnonzero(valid)] = 1.0
     x[4] = (~valid).astype(np.float32)
 
-    cscore = np.clip(_fused_cscore(res, w_ev), 0.0, 1.0)
-    tracks = np.column_stack([
-        _coding_track(res),            # 5
-        cscore,                        # 6
-        res.p_boundary,                # 7
-        res.p_frame,                   # 8-15
-        np.tanh(res.b_tracks),         # 16-19
-        res.dtilde,                    # 20
-        np.tanh(res.e_lex),            # 21
-    ])
+    if tracks is None:
+        tracks = _stage1_tracks(res, w_ev)
     x[5:] = _interp_track(tracks, lo, hi, res.bin_width).T
     rot = lo % 3
     if rot:
@@ -265,10 +277,12 @@ def refiner_tracks(refiner: OmniPhylRefiner, seq: str,
     p_state = np.zeros((L, N_STATES), np.float64)
     p_site = np.zeros((L, N_SITES), np.float64)
     wsum = np.zeros(L, np.float64)
+    tr = _stage1_tracks(res, w_ev)
     for i in range(0, len(starts), batch_size):
         batch = starts[i:i + batch_size]
         xs = np.stack([build_refiner_inputs(
-            seq, res, a, min(a + CHUNK, L), w_ev) for a in batch])
+            seq, res, a, min(a + CHUNK, L), w_ev,
+            tracks=tr) for a in batch])
         sl, tl = refiner(torch.from_numpy(xs).to(device),
                          cond.repeat(len(batch), 1))
         ps = torch.softmax(sl.float(), 1).cpu().numpy()

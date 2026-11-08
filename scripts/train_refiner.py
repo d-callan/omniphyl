@@ -44,6 +44,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from omniphyl.refiner import (OmniPhylRefiner, build_refiner_inputs,
                               build_contig_cond, save_refiner,
+                              _stage1_tracks,
                               _chunk_starts, N_STATES, N_SITES, CHUNK,
                               CHUNK_STRIDE, ST_INTERGENIC, ST_CDS_P,
                               ST_INT_P, ST_CDS_M, ST_INT_M,
@@ -144,39 +145,42 @@ def rc_labels(state, site):
 # ----------------------------------------------------------- dataset ---
 
 class RefinerChunks(Dataset):
-    """(seq, res, state, site, cond, res_no_ev) items -> chunks.
+    """(seq, res, state, site, cond, tr, tr_no_ev) items -> chunks.
 
-    res_no_ev is the same ContigResult with dtilde/e_lex zeroed;
-    25% of chunks draw inputs from it (evidence dropout) so the
+    tr_no_ev is the track stack with dtilde/e_lex zeroed;
+    ~25% of chunks draw inputs from it (evidence dropout) so the
     refiner stays accurate when LexicMap evidence is absent."""
 
     def __init__(self, items, w_ev=0.25, p_no_ev=0.25, seed=0):
         self.items = items
         self.w_ev = w_ev
         self.p_no_ev = p_no_ev
-        self.rng = np.random.default_rng(seed)
+        self.seed = seed
         self.chunks = []
-        for i, (seq, _res, _st, _si, _c, _rne) in enumerate(items):
-            for a in _chunk_starts(len(seq), CHUNK, CHUNK_STRIDE):
-                self.chunks.append((i, a, min(a + CHUNK, len(seq))))
+        for i, it in enumerate(items):
+            for a in _chunk_starts(len(it[0]), CHUNK, CHUNK_STRIDE):
+                self.chunks.append((i, a, min(a + CHUNK, len(it[0]))))
 
     def __len__(self):
         return len(self.chunks)
 
     def __getitem__(self, i):
         it, lo, hi = self.chunks[i]
-        seq, res, state, site, cond, res_no_ev = self.items[it]
-        src = res_no_ev if self.rng.random() < self.p_no_ev else res
-        x = build_refiner_inputs(seq, src, lo, hi, self.w_ev)
+        seq, res, state, site, cond, tr, tr_no_ev = self.items[it]
+        # per-index RNG: identical evidence-dropout decisions regardless
+        # of DataLoader worker partitioning
+        tr = tr_no_ev if np.random.default_rng(
+            self.seed + i).random() < self.p_no_ev else tr
+        x = build_refiner_inputs(seq, res, lo, hi, self.w_ev, tracks=tr)
         return (torch.from_numpy(x), torch.from_numpy(cond),
                 torch.from_numpy(state[lo:hi].copy()),
                 torch.from_numpy(site[:, lo:hi].copy()))
 
 
 def _make_items(res_pkl: dict, labels_by_seqid: dict, gcode: int,
-                include_rc=True):
+                w_ev: float = 0.25, include_rc=True):
     """Per-annotated-contig training items: (seq, res, state, site,
-    cond, res_no_evidence)."""
+    cond, tracks, tracks_no_evidence)."""
     results = {r.contig: r for r in res_pkl["results"]}
     seqs = res_pkl["contig_seqs"]
     items = []
@@ -193,13 +197,16 @@ def _make_items(res_pkl: dict, labels_by_seqid: dict, gcode: int,
             dtilde=np.zeros_like(res.dtilde),
             e_lex=np.zeros_like(res.e_lex))
         cond = build_contig_cond(res, seq, gcode)
-        items.append((seq, res, state, site, cond, no_ev))
+        items.append((seq, res, state, site, cond,
+                      _stage1_tracks(res, w_ev),
+                      _stage1_tracks(no_ev, w_ev)))
         if include_rc:
             res_rc = revcomp_result(res)
             st_rc, si_rc = rc_labels(state, site)
             no_ev_rc = revcomp_result(no_ev)
             items.append((revcomp(seq), res_rc, st_rc, si_rc, cond,
-                          no_ev_rc))
+                          _stage1_tracks(res_rc, w_ev),
+                          _stage1_tracks(no_ev_rc, w_ev)))
     return items
 
 
@@ -297,6 +304,8 @@ def main():
     ap.add_argument("--bundle-out", type=Path, default=None)
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch-size", type=int, default=4)
+    ap.add_argument("--num-workers", type=int, default=4,
+                    help="DataLoader workers for chunk feature build")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--val-frac", type=float, default=0.15,
                     help="fraction of contigs held out (>=1 contig)")
@@ -330,7 +339,8 @@ def main():
             res_pkl = _stage1_cache(fasta, args.model, cache, args)
         labels = parse_cds(str(gff))
         gcode = res_pkl.get("gcode", 1)
-        got = _make_items(res_pkl, labels, gcode)
+        got = _make_items(res_pkl, labels, gcode,
+                          w_ev=args.evidence_weight)
         print(f"{fasta.name}: {len(got)} contig items "
               f"({sum(1 for _ in got)} incl. RC)", flush=True)
         items += got
@@ -345,7 +355,7 @@ def main():
     trn = DataLoader(RefinerChunks(trn_items, args.evidence_weight,
                                    seed=args.seed),
                      batch_size=args.batch_size, shuffle=True,
-                     num_workers=0)
+                     num_workers=args.num_workers)
     val = DataLoader(RefinerChunks(val_items, args.evidence_weight,
                                    p_no_ev=0.0, seed=args.seed),
                      batch_size=args.batch_size)
