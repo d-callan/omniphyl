@@ -172,16 +172,24 @@ class RefinerChunks(Dataset):
         tr = tr_no_ev if np.random.default_rng(
             self.seed + i).random() < self.p_no_ev else tr
         x = build_refiner_inputs(seq, res, lo, hi, self.w_ev, tracks=tr)
+        ys, yt = state[lo:hi].copy(), site[:, lo:hi].copy()
+        if hi - lo < CHUNK:
+            # tail chunk at a contig end: pad to CHUNK so batch
+            # tensors are uniform (default_collate's shared-storage
+            # resize_ and torch.stack both require equal sizes).
+            # state pad = intergenic so the site-loss mask stays off
+            # the pad; site pad = no sites outside the contig.
+            pad = CHUNK - (hi - lo)
+            x = np.pad(x, ((0, 0), (0, pad)))
+            ys = np.pad(ys, (0, pad), constant_values=ST_INTERGENIC)
+            yt = np.pad(yt, ((0, 0), (0, pad)))
         return (torch.from_numpy(x), torch.from_numpy(cond),
-                torch.from_numpy(state[lo:hi].copy()),
-                torch.from_numpy(site[:, lo:hi].copy()))
+                torch.from_numpy(ys), torch.from_numpy(yt))
 
 
 def _chunk_collate(batch):
-    """torch.stack collate. default_collate's worker shared-memory
-    path (elem.new(storage).resize_) raises 'storage that is not
-    resizable' on some torch builds (kaggle), so stack here and let
-    the batch cross the worker pipe as a normal tensor."""
+    """Uniform torch.stack collate (items are already fixed-size,
+    but this avoids default_collate's shared-memory resize path)."""
     x, cond, ys, yt = zip(*batch)
     return (torch.stack(x), torch.stack(cond),
             torch.stack(ys), torch.stack(yt))
