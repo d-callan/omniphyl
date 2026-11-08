@@ -172,9 +172,13 @@ class RefinerChunks(Dataset):
         tr = tr_no_ev if np.random.default_rng(
             self.seed + i).random() < self.p_no_ev else tr
         x = build_refiner_inputs(seq, res, lo, hi, self.w_ev, tracks=tr)
-        return (torch.from_numpy(x), torch.from_numpy(cond),
-                torch.from_numpy(state[lo:hi].copy()),
-                torch.from_numpy(site[:, lo:hi].copy()))
+        # torch.tensor (copy) not torch.from_numpy: numpy-backed
+        # storages are non-resizable and default_collate's shared-
+        # memory path resize_()s them -> "storage that is not
+        # resizable" in worker processes.
+        return (torch.tensor(x), torch.tensor(cond),
+                torch.tensor(state[lo:hi]),
+                torch.tensor(site[:, lo:hi]))
 
 
 def _make_items(res_pkl: dict, labels_by_seqid: dict, gcode: int,
