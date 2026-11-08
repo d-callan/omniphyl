@@ -151,12 +151,27 @@ def rc_labels(state, site):
 
 # ----------------------------------------------------------- dataset ---
 
-class RefinerChunks(Dataset):
-    """(seq, res, state, site, cond, tr, tr_no_ev) items -> chunks.
+def _site_coords(site: np.ndarray) -> list[tuple]:
+    """(C, L) site map -> per-channel (pos_i32, val_f32) pairs.
 
-    tr_no_ev is the track stack with dtilde/e_lex zeroed;
-    ~25% of chunks draw inputs from it (evidence dropout) so the
-    refiner stays accurate when LexicMap evidence is absent."""
+    Site targets are Gaussian-smoothed impulses (sigma=0.75 ramp over
+    ~19 positions per site), so positions alone are not enough -- the
+    BCE reads the soft values. ~19 nonzeros per site means this costs
+    ~nothing vs 32 B/bp for the float32 bitmap."""
+    return [(np.flatnonzero(site[c]).astype(np.int32),
+             site[c][site[c] != 0].astype(np.float32))
+            for c in range(site.shape[0])]
+
+
+class RefinerChunks(Dataset):
+    """(seq, bin_width, state_u8, site_coords, cond, tr) -> chunks.
+
+    Evidence dropout: ~25% of chunks get dtilde/e_lex (output
+    channels 20-21) zeroed, so the refiner stays accurate when
+    LexicMap evidence is absent. Sites are stored as per-channel
+    (pos, val) coordinate lists (sparse Gaussian impulses) and state
+    as uint8 -- the full bitmap/int64 forms cost ~40 B/bp/item and
+    OOM multi-genome corpora; this form is ~9 B/bp."""
 
     def __init__(self, items, w_ev=0.25, p_no_ev=0.25, seed=0):
         self.items = items
@@ -173,13 +188,20 @@ class RefinerChunks(Dataset):
 
     def __getitem__(self, i):
         it, lo, hi = self.chunks[i]
-        seq, res, state, site, cond, tr, tr_no_ev = self.items[it]
+        seq, bw, state, sites, cond, tr = self.items[it]
+        x = build_refiner_inputs(seq, None, lo, hi, self.w_ev,
+                                 tracks=tr, bin_width=bw)
         # per-index RNG: identical evidence-dropout decisions regardless
-        # of DataLoader worker partitioning
-        tr = tr_no_ev if np.random.default_rng(
-            self.seed + i).random() < self.p_no_ev else tr
-        x = build_refiner_inputs(seq, res, lo, hi, self.w_ev, tracks=tr)
-        ys, yt = state[lo:hi].copy(), site[:, lo:hi].copy()
+        # of DataLoader worker partitioning; zeroing post-interp is
+        # identical to interpolating a zeroed track
+        if np.random.default_rng(self.seed + i).random() < self.p_no_ev:
+            x[20:22] = 0.0
+        ys = state[lo:hi].astype(np.int64)
+        yt = np.zeros((N_SITES, hi - lo), np.float32)
+        for c, (pos, val) in enumerate(sites):
+            m = (pos >= lo) & (pos < hi)
+            if m.any():
+                yt[c, pos[m] - lo] = val[m]
         if hi - lo < CHUNK:
             # tail chunk at a contig end: pad to CHUNK so batch
             # tensors are uniform (default_collate's shared-storage
@@ -206,7 +228,7 @@ def _make_items(res_pkl: dict, labels_by_seqid: dict, gcode: int,
                 w_ev: float = 0.25, include_rc=True):
     """Per-annotated-contig training items: (items, groups).
 
-    items: (seq, res, state, site, cond, tracks, tracks_no_evidence)
+    items: (seq, bin_width, state_u8, site_coords, cond, tracks)
     groups: parallel base-contig seqid for each item -- a contig and
     its reverse-complement partner share a group so a grouped split
     can never leak one strand into train and the other into val."""
@@ -218,25 +240,18 @@ def _make_items(res_pkl: dict, labels_by_seqid: dict, gcode: int,
             continue
         res, seq = results[cid], seqs[cid].upper()
         state, site = build_refiner_labels(rows, len(seq))
-        no_ev = ContigResult(
-            res.contig, res.length, res.n_bins, res.bin_width,
-            p_region=res.p_region, p_frame=res.p_frame,
-            b_tracks=res.b_tracks, p_boundary=res.p_boundary,
-            p_coding=res.p_coding,
-            dtilde=np.zeros_like(res.dtilde),
-            e_lex=np.zeros_like(res.e_lex))
         cond = build_contig_cond(res, seq, gcode)
-        items.append((seq, res, state, site, cond,
-                      _stage1_tracks(res, w_ev),
-                      _stage1_tracks(no_ev, w_ev)))
+        bw = res.bin_width
+        items.append((seq, bw, state.astype(np.uint8),
+                      _site_coords(site), cond,
+                      _stage1_tracks(res, w_ev)))
         groups.append(cid)
         if include_rc:
             res_rc = revcomp_result(res)
             st_rc, si_rc = rc_labels(state, site)
-            no_ev_rc = revcomp_result(no_ev)
-            items.append((revcomp(seq), res_rc, st_rc, si_rc, cond,
-                          _stage1_tracks(res_rc, w_ev),
-                          _stage1_tracks(no_ev_rc, w_ev)))
+            items.append((revcomp(seq), bw, st_rc.astype(np.uint8),
+                          _site_coords(si_rc), cond,
+                          _stage1_tracks(res_rc, w_ev)))
             groups.append(cid)
     return items, groups
 

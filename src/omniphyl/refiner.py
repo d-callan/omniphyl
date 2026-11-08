@@ -98,7 +98,8 @@ def _stage1_tracks(res: ContigResult,
 
 def build_refiner_inputs(seq: str, res: ContigResult, lo: int, hi: int,
                          w_ev: float = 0.25,
-                         tracks: np.ndarray | None = None
+                         tracks: np.ndarray | None = None,
+                         bin_width: int | None = None
                          ) -> np.ndarray:
     """(22, L) float32 input tensor for slice seq[lo:hi].
 
@@ -126,7 +127,8 @@ def build_refiner_inputs(seq: str, res: ContigResult, lo: int, hi: int,
 
     if tracks is None:
         tracks = _stage1_tracks(res, w_ev)
-    x[5:] = _interp_track(tracks, lo, hi, res.bin_width).T
+    B = res.bin_width if res is not None else bin_width
+    x[5:] = _interp_track(tracks, lo, hi, B).T
     rot = lo % 3
     if rot:
         # p_frame channel g encodes global frame x % 3 == g; after a
