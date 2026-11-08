@@ -81,24 +81,26 @@ sys.path.insert(0, str(WORK / "omniphyl/src"))
 
 CKPT = Path(find_one("w64_e15_best.pt"))
 
-# pair fasta+gff within each top-level dataset directory
+# pair each fasta with a gff in the SAME containing directory --
+# datasets mount under /kaggle/input/datasets/<owner>/<slug>/, so
+# depth is not fixed and top-level grouping is wrong
+fas = []
+for pat in FASTA_GLOBS:
+    fas += glob.glob(f"/kaggle/input/**/{pat}", recursive=True)
 pairs = []
-for ds in sorted(Path("/kaggle/input").iterdir()):
-    if not ds.is_dir():
-        continue
-    fas, gffs = [], []
-    for pat in FASTA_GLOBS:
-        fas += list(ds.rglob(pat))
+for fa in sorted(set(fas)):
+    d = Path(fa).parent
+    gffs = []
     for pat in GFF_GLOBS:
-        gffs += list(ds.rglob(pat))
-    # exclude predicted-output gff3s and non-annotation aux files
+        gffs += sorted(d.glob(pat))
     gffs = [g for g in gffs if "out" not in g.stem.lower()
             and "pred" not in g.stem.lower()]
-    if fas and gffs:
-        pairs.append((ds.name, fas[0], gffs[0]))
+    if gffs:
+        pairs.append((str(d.relative_to("/kaggle/input")),
+                      Path(fa), gffs[0]))
 if not pairs:
     raise SystemExit("no fasta+gff dataset pairs under /kaggle/input")
-tr_pairs = [p for p in pairs if HELDOUT and HELDOUT not in p[0]]
+tr_pairs = [p for p in pairs if not HELDOUT or HELDOUT not in p[0]]
 val_pairs = [p for p in pairs if HELDOUT and HELDOUT in p[0]]
 print("data pairs:")
 for name, fa, gff in pairs:
