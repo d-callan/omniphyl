@@ -1658,12 +1658,14 @@ def _write_outputs(out_prefix: Path, results: list[ContigResult],
                 prev_len = sum(x2 - x1 + 1 for x1, x2 in ex_sorted[:ei])
                 cds_phase = (3 - prev_len % 3) % 3 if ei else 0
                 feats.append({"seqid": res.contig, "type": "exon",
-                              "start": es + 1, "end": ee, "strand": strand,
+                              "start": es + 1, "end": ee + 1,
+                              "strand": strand,
                               "score": ".",
                               "attributes": {"ID": f"{gene_id}.e{ei+1}",
                                              "Parent": f"{gene_id}.t1"}})
                 feats.append({"seqid": res.contig, "type": "CDS",
-                              "start": es + 1, "end": ee, "strand": strand,
+                              "start": es + 1, "end": ee + 1,
+                              "strand": strand,
                               "score": ".", "phase": cds_phase,
                               "attributes": {"ID": f"{gene_id}.c{ei+1}",
                                              "Parent": f"{gene_id}.t1"}})
