@@ -6,8 +6,9 @@ Two halves per plan docs/neural-refiner-plan.md §5:
   inputs    Stage-1 ContigResult tracks (from a cached .res.pkl or by
             running `omniphyl annotate` stage-1 via OMNIPHYL_DUMP_RES)
             interpolated to per-base + nucleotide one-hot + clade cond
-  targets   7-state per-base labels + 8 boundary-site channels (sigma=3
-            gaussian smoothing) built from reference CDS rows
+  targets   7-state per-base labels + 8 boundary-site channels (sigma=0.75
+            gaussian smoothing + local peak CE) built from reference
+            CDS rows
 
 The Stage-1 model is FROZEN -- this script never touches its weights.
 Chunks are 8192 bp with 6144 stride; RC augmentation doubles each
@@ -54,7 +55,13 @@ from omniphyl.annotate import ContigResult, run_annotate
 from omniphyl.io import iter_sequences, revcomp
 from eval_genes import parse_cds
 
-SITE_SIGMA = 3.0
+# Site-target smoothing width. sigma=3 saturated a ~13 bp plateau
+# around each boundary, which made shifted decoy sites score as well
+# as the true position during decode; sigma=0.75 keeps the impulse
+# essentially local (<=1 bp context) so the site heads learn exact
+# boundary placement. L_peak then adds the explicit argmax-at-site
+# supervision the plateau erased.
+SITE_SIGMA = 0.75
 # state CE class weights: intergenic, CDS+, int+, CDS-, int-, rna, dual
 STATE_W = torch.tensor([1.0, 1.5, 2.5, 1.5, 2.5, 1.0, 2.0])
 
@@ -100,7 +107,7 @@ def build_refiner_labels(rows, L):
             for i in range(len(ivs) - 1):
                 site[S_DON_M, ivs[i + 1][0] - 1] = 1.0
                 site[S_ACC_M, ivs[i][1]] = 1.0
-    # sigma=3 gaussian smoothing on site impulses
+    # sigma=0.75 gaussian smoothing on site impulses (see SITE_SIGMA)
     k = np.exp(-0.5 * (np.arange(-9, 10) / SITE_SIGMA) ** 2)
     k /= k.max()
     site = np.stack([np.convolve(ch, k, mode="same") for ch in site])
@@ -197,11 +204,15 @@ def _chunk_collate(batch):
 
 def _make_items(res_pkl: dict, labels_by_seqid: dict, gcode: int,
                 w_ev: float = 0.25, include_rc=True):
-    """Per-annotated-contig training items: (seq, res, state, site,
-    cond, tracks, tracks_no_evidence)."""
+    """Per-annotated-contig training items: (items, groups).
+
+    items: (seq, res, state, site, cond, tracks, tracks_no_evidence)
+    groups: parallel base-contig seqid for each item -- a contig and
+    its reverse-complement partner share a group so a grouped split
+    can never leak one strand into train and the other into val."""
     results = {r.contig: r for r in res_pkl["results"]}
     seqs = res_pkl["contig_seqs"]
-    items = []
+    items, groups = [], []
     for cid, rows in labels_by_seqid.items():
         if cid not in results or cid not in seqs:
             continue
@@ -218,6 +229,7 @@ def _make_items(res_pkl: dict, labels_by_seqid: dict, gcode: int,
         items.append((seq, res, state, site, cond,
                       _stage1_tracks(res, w_ev),
                       _stage1_tracks(no_ev, w_ev)))
+        groups.append(cid)
         if include_rc:
             res_rc = revcomp_result(res)
             st_rc, si_rc = rc_labels(state, site)
@@ -225,7 +237,8 @@ def _make_items(res_pkl: dict, labels_by_seqid: dict, gcode: int,
             items.append((revcomp(seq), res_rc, st_rc, si_rc, cond,
                           _stage1_tracks(res_rc, w_ev),
                           _stage1_tracks(no_ev_rc, w_ev)))
-    return items
+            groups.append(cid)
+    return items, groups
 
 
 # ------------------------------------------------------------- loss ----
@@ -240,13 +253,17 @@ def refiner_loss(sl, tl, y_state, y_site, min_intron=35,
     m = F.max_pool1d(m, 1001, stride=1, padding=500)
     p = torch.sigmoid(tl)
     pt = p * y_site + (1.0 - p) * (1.0 - y_site)
+    # pos_weight 12 (was 50): with sharp sigma=0.75 targets the true
+    # positive mass is ~1 bp per site, and 50 pushed the whole head
+    # toward saturation -- every motif lit up as a confident boundary.
     bce = F.binary_cross_entropy_with_logits(
         tl, y_site, reduction="none", pos_weight=torch.tensor(
-            50.0, device=tl.device))
+            12.0, device=tl.device))
     L_site = (bce * (1.0 - pt).clamp(min=0) ** 2
               * m).sum() / m.sum().clamp(min=1.0) / N_SITES
     L_phase = _phase_loss(tl, y_site, min_intron, max_intron)
-    return L_state + L_site + 0.5 * L_phase
+    L_peak = _peak_loss(tl, y_site)
+    return L_state + L_site + 0.5 * L_phase + L_peak
 
 
 def _phase_loss(tl, y_site, min_intron, max_intron):
@@ -270,6 +287,49 @@ def _phase_loss(tl, y_site, min_intron, max_intron):
     return torch.stack(losses).mean()
 
 
+def _peak_loss(tl, y_site, half=6):
+    """Local peak-localization CE: at each annotated site, softmax over
+    the +-half bp window of that channel's logits with the label
+    window's argmax as target. BCE alone grades each base
+    independently and is satisfied by a bump anywhere near the site;
+    this term requires the channel's local argmax to sit exactly on
+    the annotated boundary, which is what the decoder's site-maxima
+    scan actually reads."""
+    losses = []
+    for b in range(tl.shape[0]):
+        for ch in range(N_SITES):
+            for p in (y_site[b, ch] > 0.5).nonzero()[:, 0]:
+                p = int(p)
+                lo = max(0, p - half)
+                hi = min(tl.shape[-1], p + half + 1)
+                if hi - lo < 3:
+                    continue
+                tgt = int(y_site[b, ch, lo:hi].argmax())
+                losses.append(F.cross_entropy(
+                    tl[b, ch, lo:hi][None],
+                    torch.tensor([tgt], device=tl.device)))
+    if not losses:
+        return tl.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def _peak_acc(tl, y_site, half=6):
+    """Fraction of annotated sites whose predicted site-probability
+    local argmax (+-half bp) sits on the exact labelled position --
+    the decode-time quantity the sharp site loss optimizes."""
+    p = torch.sigmoid(tl)
+    n = ok = 0
+    for b in range(tl.shape[0]):
+        for ch in range(N_SITES):
+            for pos in (y_site[b, ch] > 0.5).nonzero()[:, 0]:
+                pos = int(pos)
+                lo = max(0, pos - half)
+                hi = min(p.shape[-1], pos + half + 1)
+                n += 1
+                ok += int(int(p[b, ch, lo:hi].argmax()) + lo == pos)
+    return ok / max(n, 1)
+
+
 def _nuc_f1(sl, y_state):
     """Nucleotide CDS F1: predicted CDS+/- vs labelled CDS+/-."""
     pred = sl.argmax(1)
@@ -282,6 +342,38 @@ def _nuc_f1(sl, y_state):
     sn = tp / max(tp + fn, 1)
     sp = tp / max(tp + fp, 1)
     return f1, sn, sp
+
+
+def _split_items(tr_pairs, val_pairs, val_seqids, val_frac, seed):
+    """(train, val) item lists from (item, group) pair lists.
+
+    Selection order: --val-data items are already in val_pairs;
+    --val-seqids moves whole base-contig groups out of tr_pairs; if
+    nothing named a val set, a random val_frac share of distinct
+    groups is held out. A group always moves as a unit so a contig's
+    forward and reverse-complement items can never straddle the
+    split.
+    """
+    tr_pairs, val_pairs = list(tr_pairs), list(val_pairs)
+    val_seqids = set(val_seqids)
+    if val_seqids:
+        hit = {g for _it, g in tr_pairs} & val_seqids
+        missing = val_seqids - hit
+        if missing:
+            print(f"warning: --val-seqids not in training pool: "
+                  f"{sorted(missing)}", flush=True)
+        val_pairs += [(it, g) for it, g in tr_pairs if g in val_seqids]
+        tr_pairs = [(it, g) for it, g in tr_pairs
+                    if g not in val_seqids]
+    if not val_pairs:
+        groups = sorted({g for _it, g in tr_pairs})
+        idx = np.random.default_rng(seed).permutation(len(groups))
+        n_val = max(1, int(len(groups) * val_frac))
+        held = {groups[i] for i in idx[:n_val]}
+        val_pairs = [(it, g) for it, g in tr_pairs if g in held]
+        tr_pairs = [(it, g) for it, g in tr_pairs if g not in held]
+    return ([it for it, _g in tr_pairs],
+            [it for it, _g in val_pairs])
 
 
 # ------------------------------------------------------------- main ----
@@ -310,6 +402,16 @@ def main():
     ap.add_argument("--data", nargs=2, action="append", required=True,
                     metavar=("FASTA", "GFF3"),
                     help="(genome fasta, CDS gff3) pair; repeatable")
+    ap.add_argument("--val-data", nargs=2, action="append", default=[],
+                    metavar=("FASTA", "GFF3"),
+                    help="(genome fasta, CDS gff3) pair reserved entirely "
+                         "for validation; repeatable. When given, no "
+                         "--data contigs are held out unless "
+                         "--val-seqids also names some")
+    ap.add_argument("--val-seqids", nargs="+", default=[],
+                    help="base contig seqids from --data to hold out for "
+                         "validation (both strands move together); "
+                         "overrides --val-frac for those contigs")
     ap.add_argument("--model", default=None,
                     help="Stage-1 ckpt to run/freeze for features")
     ap.add_argument("--res-pkl", type=Path, default=None,
@@ -342,10 +444,14 @@ def main():
     torch.manual_seed(args.seed)
 
     # ---- items per data pair -----------------------------------------
-    items = []
-    for pi, (fa_s, gff_s) in enumerate(args.data):
+    # Each entry: (item, group) where group is the base contig seqid --
+    # a contig and its _rc partner share a group so a grouped split
+    # can't leak the opposite strand across the train/val boundary.
+    tr_pairs, val_pairs = [], []
+
+    def _load_pair(pi, fa_s, gff_s, is_val):
         fasta, gff = Path(fa_s), Path(gff_s)
-        if pi == 0 and args.res_pkl:
+        if pi == 0 and args.res_pkl and not is_val:
             with open(args.res_pkl, "rb") as fh:
                 res_pkl = pickle.load(fh)
         else:
@@ -357,19 +463,24 @@ def main():
             res_pkl = _stage1_cache(fasta, args.model, cache, args)
         labels = parse_cds(str(gff))
         gcode = res_pkl.get("gcode", 1)
-        got = _make_items(res_pkl, labels, gcode,
-                          w_ev=args.evidence_weight)
-        print(f"{fasta.name}: {len(got)} contig items "
-              f"({sum(1 for _ in got)} incl. RC)", flush=True)
-        items += got
-    if not items:
+        items, groups = _make_items(res_pkl, labels, gcode,
+                                    w_ev=args.evidence_weight)
+        print(f"{fasta.name}: {len(items)} contig items "
+              f"({'val' if is_val else 'train-pool'})", flush=True)
+        return list(zip(items, groups))
+
+    for pi, (fa_s, gff_s) in enumerate(args.data):
+        tr_pairs += _load_pair(pi, fa_s, gff_s, is_val=False)
+    for pi, (fa_s, gff_s) in enumerate(args.val_data):
+        val_pairs += _load_pair(pi, fa_s, gff_s, is_val=True)
+    if not tr_pairs:
         sys.exit("no labelled contigs (check seqid match fasta<->gff3)")
 
-    # contig-level split: no chunk shares a contig across val/train
-    idx = np.random.default_rng(args.seed).permutation(len(items))
-    n_val = max(1, int(len(items) * args.val_frac))
-    val_items = [items[i] for i in idx[:n_val]]
-    trn_items = [items[i] for i in idx[n_val:]]
+    # contig-group split: no chunk shares a base contig across
+    # val/train, and a contig's forward+rc items always stay together
+    trn_items, val_items = _split_items(
+        tr_pairs, val_pairs, args.val_seqids, args.val_frac,
+        args.seed)
     trn = DataLoader(RefinerChunks(trn_items, args.evidence_weight,
                                    seed=args.seed),
                      batch_size=args.batch_size, shuffle=True,
@@ -400,7 +511,7 @@ def main():
             tot += float(loss.detach())
             nb += 1
         refiner.eval()
-        f1s, vloss = [], []
+        f1s, vloss, pacc = [], [], []
         with torch.no_grad():
             for x, cond, y_state, y_site in val:
                 x, cond = x.to(device), cond.to(device)
@@ -409,12 +520,15 @@ def main():
                 vloss.append(float(refiner_loss(sl, tl, y_state,
                                                 y_site)))
                 f1s.append(_nuc_f1(sl.cpu(), y_state.cpu()))
+                pacc.append(_peak_acc(tl.cpu(), y_site.cpu()))
         f1 = float(np.mean([f[0] for f in f1s]))
         sn = float(np.mean([f[1] for f in f1s]))
         sp = float(np.mean([f[2] for f in f1s]))
+        pk = float(np.mean(pacc)) if pacc else 0.0
         print(f"ep {ep + 1}: train {tot / max(nb, 1):.4f} "
               f"val {np.mean(vloss):.4f} nucF1 {f1:.3f} "
-              f"(sn {sn:.3f} sp {sp:.3f})", flush=True)
+              f"peakAcc {pk:.3f} (sn {sn:.3f} sp {sp:.3f})",
+              flush=True)
         if f1 > best_f1:
             best_f1, best_sd = f1, {k: v.detach().clone()
                                     for k, v in

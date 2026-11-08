@@ -1,0 +1,17 @@
+{
+  "id": "daniellecallan/omniphyl-refiner-train-3d7",
+  "title": "omniphyl-refiner-train-3d7",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "daniellecallan/plasmodb71-pf3d7",
+    "daniellecallan/omniphyl-v6-ckpts",
+    "daniellecallan/pf3d7-stage1-cache"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

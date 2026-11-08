@@ -821,6 +821,7 @@ def test_refiner():
     from omniphyl.annotate import STOPS
     from omniphyl.refiner import (OmniPhylRefiner, build_refiner_inputs,
                                   build_contig_cond, decode_with_refiner,
+                                  N_COND,
                                   S_START_P, S_STOP_P, S_DON_P,
                                   S_ACC_P, S_START_M, S_STOP_M,
                                   S_DON_M, S_ACC_M)
@@ -840,7 +841,7 @@ def test_refiner():
     check("frame rotated to chunk-local",
           x1[10, 899] > 0.5 and x1[8, 899] < 0.5, x1[8:11, 899])
     cond = build_contig_cond(res, "ACGT" * 308)
-    check("cond shape+finite", cond.shape == (12,)
+    check("cond shape+finite", cond.shape == (N_COND,)
           and np.isfinite(cond).all(), cond)
     ref = OmniPhylRefiner()
     n_par = sum(p.numel() for p in ref.parameters())
@@ -848,7 +849,7 @@ def test_refiner():
     rng = np.random.default_rng(0)
     sl, tl = ref(torch.from_numpy(
         rng.standard_normal((2, 22, 1024)).astype(np.float32)),
-        torch.zeros(2, 12))
+        torch.zeros(2, N_COND))
     check("refiner out shapes", sl.shape == (2, 7, 1024)
           and tl.shape == (2, 8, 1024), (sl.shape, tl.shape))
 
@@ -918,6 +919,108 @@ def test_refiner():
         check("refiner - intron",
               minus[0]["introns"] == [(1200, 1300)],
               minus[0]["introns"])
+
+
+def test_refiner_v2():
+    """Refiner decoder v2: a 4-exon gene embedded among decoy splice
+    motifs must decode exactly; the train/val split must keep every
+    contig's fwd+rc items together; L_peak must reward argmax-on-site
+    logits over shifted peaks."""
+    print("[refiner v2]")
+    from omniphyl.annotate import STOPS
+    from omniphyl.refiner import (decode_with_refiner,
+                                  S_START_P, S_STOP_P, S_DON_P,
+                                  S_ACC_P)
+    from train_refiner import (_make_items, _split_items,
+                               _peak_loss, _peak_acc)
+
+    # ---- 4-exon decode with decoys -----------------------------------
+    # exons 300-600 / 700-1000 / 1150-1501 / 1601-1901 (spliced len
+    # 1251 = 417 codons), introns (600,700),(1000,1150),(1501,1601);
+    # stop TAA is the last codon of exon 4 at 1898-1901.
+    seq = _place("A" * 2000, [
+        (300, "ATG"),
+        (600, "GT"), (698, "AG"),      # intron 1
+        (1000, "GT"), (1148, "AG"),    # intron 2
+        (1501, "GT"), (1599, "AG"),    # intron 3
+        (1898, "TAA"),
+        # decoys: shifted donors/acceptors inside the introns get weak
+        # site posterior -- the boundary step-contrast must rank the
+        # true state-transition sites above them
+        (620, "GT"), (640, "GT"), (658, "AG"),
+        (1128, "AG"), (1550, "GT"), (1570, "AG")])
+    ps = np.zeros((2000, 7), np.float32)
+    ps[:, 0] = 1.0
+    for s, e in ((300, 600), (700, 1000), (1150, 1501), (1601, 1901)):
+        ps[s:e, [1, 0]] = (0.9, 0.1)
+    for s, e in ((600, 700), (1000, 1150), (1501, 1601)):
+        ps[s:e, [2, 0]] = (0.9, 0.1)
+    si = np.zeros((2000, 8), np.float32)
+    si[300, S_START_P] = si[1898, S_STOP_P] = 0.9
+    for d in (600, 1000, 1501):
+        si[d, S_DON_P] = 0.9
+    for a in (699, 1149, 1600):
+        si[a, S_ACC_P] = 0.9
+    for d in (620, 640, 1550):
+        si[d, S_DON_P] = 0.3
+    for a in (659, 1129, 1571):
+        si[a, S_ACC_P] = 0.3
+    res = _mk_result(2000, 50,
+                     coding=[(6, 12, 0.7), (14, 20, 0.7),
+                             (23, 30, 0.7), (32, 38, 0.7)],
+                     frame=[(6, 12, 0, 0.8), (14, 20, 1, 0.8),
+                            (23, 30, 1, 0.8), (32, 38, 2, 0.8)])
+    genes = decode_with_refiner(
+        None, seq, res, stops=STOPS, euk=True,
+        p_state=ps, p_site=si)
+    plus = [g for g in genes if g["strand"] == "+"]
+    check("v2 4-exon gene", len(plus) == 1
+          and (plus[0]["start"], plus[0]["end"]) == (300, 1901), plus)
+    if plus:
+        check("v2 3-intron chain",
+              plus[0]["introns"] == [(600, 700), (1000, 1150),
+                                     (1501, 1601)],
+              plus[0]["introns"])
+
+    # ---- grouped split: fwd+rc of a contig never straddle ------------
+    tr_pairs = [((c, s), c)
+                for c in ("c1", "c2", "c3", "c4", "c5")
+                for s in ("f", "r")]
+    for seed in range(5):
+        trn, val = _split_items(tr_pairs, [], [], 0.4, seed)
+        trn_g = {g for _it, g in
+                 [((it, g)) for it, g in
+                  zip([i[0] for i in trn],
+                      [i[0][0] for i in trn])]}
+        # items are (cid,strand) tuples; group key = cid
+        trn_c = {i[0] for i in trn}
+        val_c = {i[0] for i in val}
+        check(f"split disjoint seed{seed}", not (trn_c & val_c),
+              (trn_c & val_c))
+        # both items of a group on the same side
+        both = all((sum(1 for i in trn if i[0] == g) in (0, 2))
+                   for g in ("c1", "c2", "c3", "c4", "c5"))
+        check(f"split rc-together seed{seed}", both)
+    trn, val = _split_items(tr_pairs, [], ["c2"], 0.4, 0)
+    check("val-seqids holdout",
+          sorted(i[1] for i in val) == ["f", "r"]
+          and all(i[0] == "c2" for i in val)
+          and all(i[0] != "c2" for i in trn), val)
+
+    # ---- peak loss: argmax must sit on the labelled site --------------
+    L = 64
+    y = torch.zeros(1, 8, L)
+    y[0, S_DON_P, 20] = 1.0
+    tl = torch.zeros(1, 8, L)
+    tl_hit = tl.clone(); tl_hit[0, S_DON_P, 20] = 8.0
+    tl_off = tl.clone(); tl_off[0, S_DON_P, 17] = 8.0
+    l_hit = float(_peak_loss(tl_hit, y))
+    l_flat = float(_peak_loss(tl, y))
+    l_off = float(_peak_loss(tl_off, y))
+    check("peak loss ordering", l_hit < l_flat < l_off,
+          (l_hit, l_flat, l_off))
+    check("peakAcc on-site", _peak_acc(tl_hit, y) == 1.0)
+    check("peakAcc off-site", _peak_acc(tl_off, y) == 0.0)
 
 
 # --------------------------------------------- annotate end-to-end -------
@@ -1011,7 +1114,8 @@ def main():
            test_fuse_rev_frame_remap, test_fuse_impulse_placement,
            test_fuse_region_fallback, test_apply_ablate,
            test_decode_stop_rescue_multi_intron,
-           test_coarse_tracks, test_refiner, test_annotate_e2e]
+           test_coarse_tracks, test_refiner, test_refiner_v2,
+           test_annotate_e2e]
     for f in fns:
         f()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
@@ -1021,4 +1125,5 @@ def main():
 
 
 if __name__ == "__main__":
+    main()
     main()

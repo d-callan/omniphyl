@@ -24,13 +24,14 @@ from .annotate import (ContigResult, _coding_track, _fused_cscore,
                        _intron_prior, STOPS)
 from .encode import BASE2DIGIT
 from .io import revcomp
+from .model import RANKS
 
 # ------------------------------------------------------------- spec ----
 
 CHUNK = 8192
 CHUNK_STRIDE = 6144
 N_CHANNELS = 22
-N_COND = 12
+N_COND = 21
 N_STATES = 7
 N_SITES = 8
 
@@ -138,7 +139,7 @@ def build_refiner_inputs(seq: str, res: ContigResult, lo: int, hi: int,
 
 def build_contig_cond(res: ContigResult, seq: str,
                       gcode: int = 1) -> np.ndarray:
-    """(12,) float32 clade/contig-conditioning vector (FiLM input).
+    """(21,) float32 clade/contig-conditioning vector (FiLM input).
 
     0-3   domain one-hot (Euk/Bact/Arch/Vir) scaled by call confidence
     4     mean coding mass      5  coding fraction >= 0.5
@@ -146,6 +147,12 @@ def build_contig_cond(res: ContigResult, seq: str,
     7     mean splice-impulse mass on coding bins
     8     contig GC             9  genetic code == 4
     10    evidence present      11 log10(length)/7
+    12-18 per-rank resolution confidence (Stage-1 path_conf over
+          domain..species) -- HOW DEEP the base model resolved, not
+          what it called (name identity would just memorize the
+          training genomes)
+    19    resolved depth: (deepest confident rank index + 1) / 7
+    20    p_ood mass at the deepest resolved rank
     """
     cond = np.zeros(N_COND, np.float32)
     tax = getattr(res, "taxon", None)
@@ -172,6 +179,13 @@ def build_contig_cond(res: ContigResult, seq: str,
     cond[10] = 1.0 if len(res.dtilde) and float(res.dtilde.max()) > 0 \
         else 0.0
     cond[11] = min(1.0, math.log10(max(res.length, 100)) / 7.0)
+    for i, r in enumerate(RANKS):
+        cond[12 + i] = float(conf.get(r, 0.0))
+    dr = getattr(tax, "deepest_rank", None)
+    if dr in RANKS:
+        cond[19] = (RANKS.index(dr) + 1) / len(RANKS)
+        cond[20] = float(
+            (getattr(tax, "p_ood", None) or {}).get(dr, 0.0))
     return cond
 
 
@@ -272,7 +286,10 @@ def refiner_tracks(refiner: OmniPhylRefiner, seq: str,
     (p_state [L,7], p_site [L,8]) float32."""
     L = len(seq)
     cond_np = build_contig_cond(res, seq, gcode)
-    cond = torch.from_numpy(cond_np)[None].to(device)
+    # older checkpoints carry a smaller cond_dim -- new dims are
+    # appended at the end, so a plain prefix slice stays compatible
+    exp = refiner.blocks[0].film.in_features
+    cond = torch.from_numpy(cond_np[:exp])[None].to(device)
     starts = _chunk_starts(L)
     p_state = np.zeros((L, N_STATES), np.float64)
     p_site = np.zeros((L, N_SITES), np.float64)
@@ -406,79 +423,235 @@ def _refiner_loci(p_cds, p_int, coding_threshold, L, pad=300):
 def _refiner_intron_candidates(s_seq, lo, hi, min_intron, max_intron,
                                p_don, p_acc, p_int, p_cds, hints,
                                site_threshold):
-    """Scored motif-validated intron candidates on the strand's
-    transcript coords inside [lo, hi), as (ll, d, acc) sorted by ll
-    desc. The junction likelihood is the sum of the donor/acceptor
-    site log-probs, the mean intron-state log-posterior over the
-    candidate, minus the mean CDS log-posterior (a false intron
-    inside an exon scores badly), plus +2.0 when a split-alignment
-    hint matches within 6 bp."""
+    """Scored motif-validated intron candidates inside [lo, hi), as
+    (ll, d, acc) sorted by ll desc.
+
+    Candidates are anchored on contiguous intronic runs of the state
+    posterior ((p_int >= 0.15) & (p_int >= 0.35 * p_cds), len >=
+    min_intron - 20, peak p_int >= 0.25) plus split-alignment hints,
+    rather than pairing every motif-valid donor with every acceptor
+    within max_intron: saturated site posteriors otherwise let shifted
+    GT..AG decoys inside the same intron outscore the true boundary
+    pair on interior intron mass and flood the locus-wide candidate
+    budget. Each run keeps at most its 6 best (d, a) pairs so one
+    noisy intron never crowds out other introns of the same locus.
+
+    The pair score adds a 4-bp CDS<->intron contrast step at each
+    boundary: a true donor sits at a falling CDS / rising intron edge
+    (and mirror-image at the acceptor), so the step breaks the
+    site-logit plateau tie in favor of the exact state transition."""
     hint_xy = list(hints)
-    dons = [d for d in range(lo + 3, hi - min_intron)
-            if s_seq[d:d + 2] in ("GT", "GC")
-            and (p_don[d] >= site_threshold
-                 or any(d - 6 <= hd <= d + 6 for hd, _ in hint_xy))]
-    accs = [a for a in range(lo + min_intron + 2, hi)
-            if s_seq[a - 2:a] == "AG"
-            and (p_acc[a - 1] >= site_threshold
-                 or any(a - 6 <= ha <= a + 6 for _, ha in hint_xy))]
-    out = []
-    for d in dons:
-        for a in accs:
-            if not (min_intron <= a - d <= max_intron):
-                continue
-            ll = (math.log(max(float(p_don[d]), 1e-6))
-                  + math.log(max(float(p_acc[a - 1]), 1e-6))
-                  + float(np.log(np.clip(p_int[d:a], 1e-6, 1)).mean())
-                  - float(np.log(np.clip(p_cds[d:a], 1e-6, 1)).mean()))
-            if any(abs(d - hd) <= 6 and abs(a - ha) <= 6
-                   for hd, ha in hint_xy):
-                ll += 2.0
-            if ll > -3.0:
-                out.append((ll, d, a))
-    return sorted(out, key=lambda x: -x[0])
+    mask = (p_int[lo:hi] >= 0.15) & (p_int[lo:hi] >= 0.35
+                                       * p_cds[lo:hi])
+    raw = []
+    i, n = 0, hi - lo
+    while i < n:
+        if not mask[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and mask[j + 1]:
+            j += 1
+        if (j + 1 - i >= min_intron - 20
+                and p_int[lo + i:lo + j + 1].max() >= 0.25):
+            raw.append((lo + i, lo + j + 1))
+        i = j + 1
+    # merge runs separated by less than min_intron: a dip shorter
+    # than a legal exon cannot separate two introns (the state
+    # posterior often dips for a few bp inside one intron). A merged
+    # run may span several true introns -- interior donors/acceptors
+    # are searched and the chain DP arbitrates which non-overlapping
+    # subset to excise.
+    runs = []
+    for i0, i1 in raw:
+        if runs and i0 - runs[-1][1] < min_intron:
+            runs[-1] = (runs[-1][0], i1, runs[-1][2])
+        else:
+            runs.append((i0, i1, 20))
+    for hd, ha in hint_xy:
+        if lo < hd < ha < hi:
+            runs.append((hd, ha, 12))
+    if not runs:
+        # fallback: no intronic run detected but splice sites may
+        # still exist (very short or weak introns) -- scan local
+        # site maxima instead of anchoring on state runs
+        runs = []
+        for x in range(lo + min_intron, hi - min_intron):
+            if (p_don[x] >= site_threshold
+                    and p_don[x] >= p_don[x - 1]
+                    and p_don[x] >= p_don[x + 1]):
+                runs.append((x, x + min_intron, 15))
+
+    cands = {}
+    for i0, i1, rad in runs:
+        # donors: anywhere from rad before the run to min_intron
+        # before its end (the run may bleed into the flanking exon or
+        # cover several introns, so the true boundary need not sit at
+        # the run edge); acceptors mirror-symmetric
+        d_lo = max(lo + 3, i0 - rad)
+        d_hi = min(hi - min_intron, i1 - min_intron + 1)
+        a_lo = max(lo + min_intron + 2, i0 + min_intron)
+        a_hi = min(hi, i1 + rad)
+        dons = [d for d in range(d_lo, d_hi)
+                if s_seq[d:d + 2] in ("GT", "GC")
+                and (p_don[d] >= site_threshold
+                     or any(abs(d - hd) <= 6 for hd, _ in hint_xy))]
+        accs = [a for a in range(a_lo, a_hi)
+                if s_seq[a - 2:a] == "AG"
+                and (p_acc[a - 1] >= site_threshold
+                     or any(abs(a - ha) <= 6 for _, ha in hint_xy))]
+        local_pairs = []
+        for d in dons:
+            # 4-bp CDS->intron state contrast across the donor edge
+            step_d = float(p_cds[max(lo, d - 4):d].mean()
+                           - p_int[max(lo, d - 4):d].mean()
+                           + p_int[d:min(hi, d + 4)].mean()
+                           - p_cds[d:min(hi, d + 4)].mean())
+            for a in accs:
+                if not (min_intron <= a - d <= max_intron):
+                    continue
+                # 4-bp intron->CDS state contrast across the acceptor
+                step_a = float(p_int[max(lo, a - 4):a].mean()
+                               - p_cds[max(lo, a - 4):a].mean()
+                               + p_cds[a:min(hi, a + 4)].mean()
+                               - p_int[a:min(hi, a + 4)].mean())
+                ll = (math.log(max(float(p_don[d]), 1e-6))
+                      + math.log(max(float(p_acc[a - 1]), 1e-6))
+                      + float(np.log(np.clip(p_int[d:a], 1e-6, 1)).mean())
+                      - float(np.log(np.clip(p_cds[d:a], 1e-6, 1)).mean())
+                      + 1.5 * (step_d + step_a)
+                      + (0.3 if s_seq[d:d + 2] == "GT" else 0.0))
+                if any(abs(d - hd) <= 6 and abs(a - ha) <= 6
+                       for hd, ha in hint_xy):
+                    ll += 2.0
+                if ll > -3.0:
+                    local_pairs.append((ll, d, a))
+        # keep the 8 best pairs per run: one intron can never starve
+        # the locus-wide candidate budget, but a merged run covering
+        # two adjacent introns still emits both true pairs
+        for ll, d, a in sorted(local_pairs, key=lambda x: -x[0])[:8]:
+            if (d, a) not in cands or ll > cands[(d, a)]:
+                cands[(d, a)] = ll
+    return sorted(((ll, d, a) for (d, a), ll in cands.items()),
+                  key=lambda x: -x[0])
 
 
-def _refiner_intron_chains(cands, iprior, top_k_cand=24, K=8):
+def _refiner_intron_chains(cands, iprior, s_seq=None, lo=0, hi=0,
+                           stops=STOPS, K=12):
     """Top-K non-overlapping intron subsets for ORF scanning.
 
-    Same keep/skip subset problem as annotate._intron_sets -- each
-    candidate's edge score is discounted by the taxon-conditioned
-    intron-length prior -- but with overlap handling: mutually
-    overlapping candidates are bucketed and a chain keeps at most the
-    two best members per bucket. The empty chain and every singleton
-    are always returned so unspliced and single-intron scans always
-    reach arbitration."""
+    Each candidate's edge score is discounted by the taxon-conditioned
+    intron-length prior; mutually overlapping candidates are then
+    bucketed so a chain keeps at most one member per bucket. All
+    candidates compete in the bucket DP -- no global top-N truncation
+    before bucketing (one intron with many shifted decoys must not
+    crowd out the downstream introns of a multi-exon gene) -- and each
+    bucket contributes its top-3 alternatives. The empty chain and
+    every singleton are always returned so unspliced and single-intron
+    scans always reach arbitration.
+
+    When s_seq/lo/hi/stops are given, a per-ATG beam stop-rescue walk
+    additionally emits chains for genes the keep/skip DP cannot
+    assemble: when an in-frame stop codon falls inside an un-excised
+    candidate's span, the walk branches over that bucket's top
+    candidates, preserving codon phase across each junction, so
+    transcripts with 4+ introns (or one mis-framed decoy) still emit
+    their complete excision set."""
     mu, sigma, alpha = iprior
-    cands = [(ll - alpha * abs((a - d) - mu) / sigma, d, a)
-             for ll, d, a in cands[:top_k_cand]]
-    if not cands:
+    cands_p = sorted(((ll - alpha * abs((a - d) - mu) / sigma, d, a)
+                      for ll, d, a in cands), key=lambda x: (x[1], x[2]))
+    if not cands_p:
         return [[]]
-    buckets, cur, cur_hi = [], [], -1
-    for ll, d, a in sorted(cands, key=lambda x: (x[1], x[2])):
-        if d >= cur_hi:
-            if cur:
-                buckets.append(cur)
-            cur, cur_hi = [], -1
-        cur.append((ll, d, a))
-        cur_hi = max(cur_hi, a)
-    if cur:
-        buckets.append(cur)
-    best = [(0.0, ())]
-    for bucket in buckets:
-        opts = [(0.0, None)]
-        opts += [(ll, (d, a))
-                 for ll, d, a in sorted(bucket, key=lambda x: -x[0])[:2]]
-        best = sorted((s + sc, st if iv is None else st + (iv,))
-                      for s, st in best for sc, iv in opts)[:K]
-        best = sorted(best, key=lambda x: -x[0])
-    chains = [list(st) for _s, st in best]
+    # weighted interval scheduling beam: candidates are processed in
+    # donor order and a chain may take one only when its donor clears
+    # the chain's max acceptor. No bucketing: a candidate that spans
+    # two true adjacent introns (state posterior bleeding over the
+    # internal exon) can coexist in the beam while the non-overlapping
+    # true pair still forms its own higher-scoring chain. Skipping is
+    # implicit -- states persist without taking a candidate.
+    beam = [(0.0, (), -1)]
+    for ll, d, a in cands_p:
+        beam += [(s + ll, st + ((d, a),), max(ma, a))
+                 for s, st, ma in beam if d >= ma]
+        beam.sort(key=lambda x: -x[0])
+        seen = set()
+        beam = [x for x in beam if not (x[1] in seen or seen.add(x[1]))]
+        beam = beam[:K]
+    chains = [list(st) for _s, st, _ma in beam]
     have = {tuple(st) for st in chains}
-    for _ll, d, a in cands:
+    if () not in have:
+        have.add(())
+        chains.append([])
+    for _ll, d, a in cands_p:
         if ((d, a),) not in have:
             have.add(((d, a),))
             chains.append([(d, a)])
+    if s_seq is not None and hi > lo:
+        for ch in _rescue_chains(s_seq, lo, hi, cands_p, stops, have):
+            chains.append(ch)
     return chains
+
+
+def _rescue_chains(s_seq, lo, hi, cands_p, stops, have):
+    """Per-ATG stop-rescue splice walks over the intron candidates.
+
+    For each in-locus ATG, walk codons in transcript order. An
+    in-frame stop overlapping an un-excised candidate's span cannot be
+    a real transcript stop -- branch over the top-3 such candidates,
+    splicing out each (d, a) that preserves phase (the junction codon
+    formed across the splice must not itself be a stop). A stop with
+    no overlapping candidate is a genuine terminal codon and yields
+    the accumulated excision set as a candidate chain. Beam width 4
+    caps combinatorial blow-up on decoy-rich loci."""
+    n = hi - lo
+    out = []
+    for t0 in range(0, n - 2):
+        if s_seq[lo + t0:lo + t0 + 3] != "ATG":
+            continue
+        beam = [(t0, [lo + t0], ())]
+        for _step in range(n):
+            new_beam = []
+            for p, tx, exc in beam:
+                nxt = p + 1
+                if nxt >= n:
+                    continue
+                tx2 = tx + [lo + nxt]
+                if len(tx2) % 3 != 0:
+                    new_beam.append((nxt, tx2, exc))
+                    continue
+                cod = s_seq[tx2[-3]] + s_seq[tx2[-2]] + s_seq[tx2[-1]]
+                if cod not in stops:
+                    new_beam.append((nxt, tx2, exc))
+                    continue
+                # candidates spanning this stop codon that are still
+                # free (not excised and not overlapping an excision)
+                hit = [c for c in cands_p
+                       if c[1] <= tx2[-1] and tx2[-3] < c[2]
+                       and not any(c[1] < ea and c[2] > ed
+                                   for ed, ea in exc)]
+                if not hit:
+                    if exc and exc not in have:
+                        have.add(exc)
+                        out.append(list(exc))
+                    continue
+                for _, d, a in hit[:3]:
+                    if d <= tx2[0] or d <= (exc[-1][1] if exc else -1):
+                        continue
+                    tx_trim = [x for x in tx2 if x < d]
+                    if not tx_trim:
+                        continue
+                    rem = len(tx_trim) % 3
+                    if rem and a + (3 - rem) <= hi:
+                        jcod = ("".join(s_seq[x] for x in tx_trim[-rem:])
+                                + s_seq[a:a + (3 - rem)])
+                        if jcod in stops:
+                            continue
+                    new_beam.append((a - lo - 1, tx_trim,
+                                     exc + ((d, a),)))
+            if not new_beam:
+                break
+            beam = new_beam[:4]
+    return out
 
 
 def _refiner_orfs(seq_s, pos, lo, hi, chain, strand, L, res, stops,
@@ -493,7 +666,7 @@ def _refiner_orfs(seq_s, pos, lo, hi, chain, strand, L, res, stops,
     Stage-1 frame-consistency term (each exon's implied global frame
     via annotate._exon_frames, so a mis-phased join loses support)."""
     n = len(seq_s)
-    out = []
+    by_stop = {}
     for t in range(n - 2):
         if seq_s[t:t + 3] != "ATG":
             continue
@@ -508,6 +681,23 @@ def _refiner_orfs(seq_s, pos, lo, hi, chain, strand, L, res, stops,
             continue
         ivs = [iv for iv in chain if a < iv[0] and iv[1] <= bnd]
         tex = np.array(pos[a_t:b_t])
+        # exon purity gate: an ORF whose exons read through predicted
+        # intron/intergenic mass is a readthrough artifact -- require
+        # mean CDS support over exons and per-exon support >= 0.35
+        if float(p_cds[tex].mean()) < 0.50:
+            continue
+        cur_e = a
+        pure = True
+        for d, ac in ivs:
+            if d > cur_e and float(p_cds[cur_e:d].mean()) < 0.35:
+                pure = False
+                break
+            cur_e = ac
+        if pure and (bnd > cur_e
+                     and float(p_cds[cur_e:bnd].mean()) < 0.35):
+            pure = False
+        if not pure:
+            continue
         cds_ll = float((np.log(np.clip(p_cds[tex], 1e-6, 1))
                         - np.log(np.clip(p_bg[tex], 1e-6, 1))).mean())
         share = float((p_cds[tex]
@@ -533,17 +723,31 @@ def _refiner_orfs(seq_s, pos, lo, hi, chain, strand, L, res, stops,
         else:
             frame_sup = 0.0
         cds_len = b_t - a_t
+        # boundary contrast steps: a true start sits at the rising CDS
+        # edge, a true stop at the falling edge -- this discriminates
+        # the exact boundary ATG/stop from shifted in-frame alternates
+        step_start = float(p_cds[a:min(L, a + 12)].mean()
+                           - p_cds[max(0, a - 12):a].mean())
+        step_stop = float(p_cds[max(0, bnd - 12):bnd].mean()
+                          - p_cds[bnd:min(L, bnd + 12)].mean())
         g["body"] = max(0.0, cds_ll + frame_sup)
         g["n_hint_introns"] = n_hint
         g["strand_share"] = share
         g["score"] = ((cds_ll + frame_sup) * math.log1p(cds_len)
                       + math.log(max(float(p_start[a]), 1e-6))
                       + math.log(max(float(p_stop[pos[b_t - 3]]), 1e-6))
+                      + 2.0 * (step_start + step_stop)
                       + sum(intron_ll.get(iv, 0.0) for iv in ivs)
                       + 0.4 * n_hint)
-        if g["score"] > 0:
-            out.append(g)
-    return out
+        if g["score"] <= 0:
+            continue
+        # collapse alternative starts sharing a stop + intron chain:
+        # the better-supported start wins the locus, not a flood of
+        # near-identical calls competing in nonoverlap arbitration
+        key = (bnd, tuple(ivs))
+        if key not in by_stop or g["score"] > by_stop[key]["score"]:
+            by_stop[key] = g
+    return list(by_stop.values())
 
 
 def _refiner_decode_locus(s_seq, lo, hi, strand, L, res, euk, stops,
@@ -552,12 +756,16 @@ def _refiner_decode_locus(s_seq, lo, hi, strand, L, res, euk, stops,
                           p_int, p_other, p_bg, p_start, p_stop,
                           p_don, p_acc, iprior):
     """All candidate gene calls inside one active locus on one
-    strand: candidate introns -> top-K excision chains -> spliced-
-    transcript ORF scans -> per-(start,end) best-score dict."""
+    strand: candidate introns -> excision chains (DP + stop-rescue
+    walks) -> spliced-transcript ORF scans -> per-stop-edge best
+    gene. Alternative starts sharing a stop are arbitrated here so
+    each stop emits its single best-supported gene model before the
+    contig-wide non-overlap pass."""
     cands = (_refiner_intron_candidates(
         s_seq, lo, hi, min_intron, max_intron, p_don, p_acc, p_int,
         p_cds, hints, site_threshold) if euk else [])
-    chains = _refiner_intron_chains(cands, iprior)
+    chains = _refiner_intron_chains(cands, iprior, s_seq=s_seq,
+                                    lo=lo, hi=hi, stops=stops)
     intron_ll = {(d, a): ll for ll, d, a in cands}
     hint_xy = list(hints)
     genes = {}
@@ -567,7 +775,8 @@ def _refiner_decode_locus(s_seq, lo, hi, strand, L, res, euk, stops,
                 seq_s, pos, lo, hi, chain, strand, L, res, stops,
                 min_cds_len, s_seq, p_cds, p_int, p_other, p_bg,
                 p_start, p_stop, hint_xy, intron_ll):
-            key = (g["start"], g["end"])
-            if key not in genes or g["score"] > genes[key]["score"]:
-                genes[key] = g
+            stop_edge = g["end"] if strand == "+" else g["start"]
+            if (stop_edge not in genes
+                    or g["score"] > genes[stop_edge]["score"]):
+                genes[stop_edge] = g
     return list(genes.values())

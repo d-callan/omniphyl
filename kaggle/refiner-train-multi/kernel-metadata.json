@@ -1,0 +1,25 @@
+{
+  "id": "daniellecallan/omniphyl-refiner-train-multi",
+  "title": "omniphyl-refiner-train-multi",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "daniellecallan/plasmodb71-pf3d7",
+    "daniellecallan/omniphyl-v6-ckpts",
+    "daniellecallan/pf3d7-stage1-cache",
+    "daniellecallan/refiner-ehistolytica",
+    "daniellecallan/refiner-cparvum",
+    "daniellecallan/refiner-anidulans",
+    "daniellecallan/refiner-tannulata",
+    "daniellecallan/refiner-tgondii",
+    "daniellecallan/refiner-lmajor",
+    "daniellecallan/refiner-ecoli-k12",
+    "daniellecallan/refiner-halobacterium"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

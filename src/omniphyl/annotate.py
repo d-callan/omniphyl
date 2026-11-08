@@ -161,7 +161,8 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
     # contig's windows, i.e. SUMS over exp(logp) and p_ood -- so we
     # accumulate O(n_class) sums per contig instead of the full
     # n_windows x n_class matrix (~98 GB at Pf3D7's 236k x ~52k).
-    # Skipped under tracks_only (no taxonomy/domain steps downstream).
+    # Kept running under tracks_only too: cached res.pkl files feed
+    # the refiner's clade-conditioning vector, which needs taxon.
     tax_by_contig: dict[int, dict] = {}
     dom_by_contig: list[list] = [[] for _ in contigs]
     wmeta_by_contig: list[list] = [[] for _ in contigs]
@@ -178,8 +179,8 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
                                evidence.get(cid), lexicmap_source)
             res.n_windows = len(wi)
             results.append(res)
-            if tracks_only:
-                continue
+            # taxonomy sums: cheap, and needed even for tracks-only
+            # caches (res.taxon feeds refiner conditioning)
             d = tax_by_contig.setdefault(
                 ci, {"logp": {}, "pood": {}, "n": 0})
             d["n"] += len(wi)
@@ -190,6 +191,8 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
                 d["pood"][t] = (d["pood"].get(t, 0.0) +
                                 bp.p_ood[t][wi].astype(
                                     np.float64).sum())
+            if tracks_only:
+                continue
             if bp.domains is not None:
                 dom_by_contig[ci].append(bp.domains[wi])
             wmeta_by_contig[ci].extend(g_meta[i][1:] for i in wi)
