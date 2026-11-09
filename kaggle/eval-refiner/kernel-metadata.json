@@ -1,0 +1,18 @@
+{
+  "id": "daniellecallan/omniphyl-eval-refiner",
+  "title": "omniphyl-eval-refiner",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "daniellecallan/plasmodb71-pf3d7",
+    "daniellecallan/refiner-pfhb3",
+    "daniellecallan/omniphyl-v6-ckpts",
+    "daniellecallan/omniphyl-refiner-multi"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}
