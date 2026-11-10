@@ -1,0 +1,17 @@
+{
+  "id": "daniellecallan/omniphyl-clade-bench",
+  "title": "omniphyl-clade-bench",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "daniellecallan/omniphyl-v6-ckpts",
+    "daniellecallan/omniphyl-refiner-multi",
+    "daniellecallan/refiner-pvivax"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}
