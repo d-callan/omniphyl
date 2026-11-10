@@ -155,7 +155,7 @@ def main():
             seqid = pick_contig(gff)
             rf, rg = slice_region(fna, gff, seqid, odir)
             if not (odir / f"{name}.res.pkl").exists():
-                spec = json.dumps({
+                anno_kw = json.dumps({
                     "model_path": str(a.model), "fasta_path": str(rf),
                     "out_prefix": str(odir / name),
                     "refiner_path": str(a.refiner), "verbose": True})
