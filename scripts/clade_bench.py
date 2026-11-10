@@ -139,7 +139,10 @@ def main():
     a = ap.parse_args()
     wd = a.workdir
     (wd / "data").mkdir(parents=True, exist_ok=True)
-    omniphyl = "/home/danielle/miniconda3/envs/omniphyl/bin/omniphyl"
+    src_dir = Path(__file__).resolve().parent.parent / "src"
+    env = dict(os.environ, OMNIPHYL_DUMP_RES="1",
+               PYTHONPATH=str(src_dir) + os.pathsep +
+               os.environ.get("PYTHONPATH", ""))
     results = {}
 
     only = set(a.only.split(",")) if a.only else None
