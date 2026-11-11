@@ -335,7 +335,12 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
                     min_cds_len=min_cds_len,
                     coding_threshold=coding_threshold,
                     min_intron=min_intron, max_intron=max_intron,
-                    intron_hints=hints, device=pred.device)
+                    intron_hints=hints,
+                    # prokaryotic contigs legitimately initiate at
+                    # GTG/TTG; the site head fires on them (labels are
+                    # GFF boundaries), only the ORF scan gated them out
+                    starts=STARTS if prok else ("ATG",),
+                    device=pred.device)
             else:
                 res.genes = _decode_genes(
                     seq, res, stops=stops, euk=euk and not prok,

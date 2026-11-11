@@ -54,12 +54,24 @@ os.environ.setdefault("OMP_NUM_THREADS", "4")
 # substring of a dataset dir name -> that genome goes to --val-data
 # (whole-genome holdout; decode benchmark below evaluates it)
 HELDOUT = os.environ.get("HELDOUT", "")
+# substring of a dataset dir name -> drop that genome ENTIRELY (not
+# even validation). Used for data-regime ablations, e.g. EXCLUDE=
+# pfalciparum for the no-Plasmodium trial.
+EXCLUDE = os.environ.get("EXCLUDE", "")
 # seqids held out of --data pairs (chromosome-level holdout for a
 # genome that otherwise stays in training). Pf3D7 chr1 is the
 # default early-stopping metric; the honest generalization eval is
 # the post-run decode on the unmounted refiner-pfhb3 genome.
 VAL_SEQIDS = (os.environ.get("VAL_SEQIDS", "Pf3D7_01_v3").split()
               or [])
+# ablation switches, passed through to train_refiner.py:
+#   COND_MODE         full | reduced | none | regularize
+#   BALANCE_GENOMES   "1" -> --balance-genomes (per-genome equal
+#                     chunk sampling via WeightedRandomSampler)
+#   EPOCHS            override the default 20 (trial runs use 10)
+COND_MODE = os.environ.get("COND_MODE", "full")
+BALANCE_GENOMES = os.environ.get("BALANCE_GENOMES", "") == "1"
+EPOCHS = os.environ.get("EPOCHS", "20")
 
 FASTA_GLOBS = ("*_Genome.fasta", "*.fna", "*.fasta")
 GFF_GLOBS = ("*.gff", "*.gff3")
@@ -100,6 +112,11 @@ for fa in sorted(set(fas)):
                       Path(fa), gffs[0]))
 if not pairs:
     raise SystemExit("no fasta+gff dataset pairs under /kaggle/input")
+pairs = [p for p in pairs if not EXCLUDE or EXCLUDE not in p[0]]
+if EXCLUDE:
+    print(f"EXCLUDE={EXCLUDE!r}: removed "
+          f"{len([p for p in pairs if EXCLUDE in p[0]])} pair(s)",
+          flush=True)
 tr_pairs = [p for p in pairs if not HELDOUT or HELDOUT not in p[0]]
 val_pairs = [p for p in pairs if HELDOUT and HELDOUT in p[0]]
 print("data pairs:")
@@ -130,7 +147,13 @@ cmd = [sys.executable,
        "--model", str(CKPT),
        "--cache-dir", str(CACHE),
        "--out", str(OUT_PT),
-       "--epochs", "20", "--batch-size", "16", "--num-workers", "4"]
+       "--epochs", EPOCHS, "--batch-size", "16", "--num-workers", "4",
+       "--cond-mode", COND_MODE]
+if BALANCE_GENOMES:
+    cmd += ["--balance-genomes"]
+print(f"trial config: COND_MODE={COND_MODE} "
+      f"BALANCE_GENOMES={BALANCE_GENOMES} EPOCHS={EPOCHS} "
+      f"EXCLUDE={EXCLUDE!r} HELDOUT={HELDOUT!r}", flush=True)
 for _name, fa, gff in tr_pairs:
     cmd += ["--data", str(fa), str(gff)]
 for _name, fa, gff in val_pairs:
@@ -228,6 +251,38 @@ try:
 except Exception as e:  # decode eval is best-effort; don't fail the run
     out["decode"]["error"] = str(e)
     print(f"decode eval failed: {e}", flush=True)
+
+# ---------------- Step 3: intron/class panel on eval genomes ---------
+# Whole-contig intron recall + posterior-signal + gene-class summary
+# for every genome that went through decode eval. This is the metric
+# that exposed the pvivax intron-state suppression; run it whenever
+# eval_refiner_panel.py is in the cloned repo (older refs skip it).
+
+PANEL_PY = WORK / "omniphyl/scripts/eval_refiner_panel.py"
+try:
+    eval_pairs
+    dev
+except NameError:
+    eval_pairs, dev = val_pairs or tr_pairs[:1], "cpu"
+if PANEL_PY.exists():
+    for name, fa, gff in eval_pairs:
+        pkl_path = CACHE / f"{fa.stem}.res.pkl"
+        if not pkl_path.exists():
+            continue
+        p = subprocess.run(
+            [sys.executable, str(PANEL_PY),
+             "--ckpt", str(OUT_PT),
+             "--panel", f"{name},{pkl_path},{gff}",
+             "--device", dev, "--out", "/tmp/_panel.json"],
+            capture_output=True, text=True, timeout=7200)
+        print(p.stdout[-2000:], flush=True)
+        try:
+            out.setdefault("panel", {}).update(
+                json.loads(Path("/tmp/_panel.json").read_text())
+                ["panels"])
+        except Exception:
+            out.setdefault("panel", {})[name] = {
+                "error": (p.stderr or "panel eval failed")[-500:]}
 
 RESULT.write_text(json.dumps(out, indent=2))
 print("wrote results.json", flush=True)

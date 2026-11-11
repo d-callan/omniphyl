@@ -22,12 +22,18 @@ Strata for wrong/missed genes: intron count (0 / 1 / 2+), ref CDS length
 quartiles, local gene density (bp to nearest ref CDS on the contig).
 
 Usage:
-  python scripts/eval_errors.py res.pkl ref.gff refiner.pt [--out errors.json]
-"""
+  python scripts/eval_errors.py res.pkl ref.gff [--out errors.json]
+  python scripts/eval_errors.py res.pkl ref.gff --redecode refiner.pt
+
+By default the cached r.genes (decoded during the original annotate
+run, with the run's own euk/prok mode) are scored -- this matches what
+went into the GFF3. --redecode re-runs decode_with_refiner, deriving
+euk from the cached taxon call (domain == Eukaryota)."""
 import argparse
 import json
 import pickle
 import sys
+from bisect import bisect_right
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -35,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from eval_genes import parse_cds, _merge, _overlap_len
 from omniphyl.annotate import _exon_bounds, STOPS
+from omniphyl.io import revcomp
 from omniphyl.refiner import load_refiner, decode_with_refiner
 
 
@@ -53,31 +60,43 @@ def _spans(rows):
 
 def _iv_overlap(a, b):
     """Overlap bp between two sorted interval lists."""
-    return _overlap_len(_merge(a), _merge(b))
+    return _overlap_len(a, b)
 
 
 def classify_contig(seqid, ref_rows, genes, seq):
     ref = _spans(ref_rows.get(seqid, []))
+    for t in ref.values():
+        t["merged"] = _merge(t["exons"])
+        t["pred_hits"] = []
     preds = []
     for i, g in enumerate(genes):
-        exons = [(s, e) for s, e in _exon_bounds(g)]
-        preds.append({"gid": f"g{i}", "strand": g["strand"], "exons": exons,
-                      "span": (min(s for s, _ in exons), max(e for _, e in exons))})
+        # _exon_bounds returns inclusive ends; refs are 0-based
+        # half-open, so convert predicted ends with +1
+        exons = [(s, e + 1) for s, e in _exon_bounds(g)]
+        preds.append({"gid": f"g{i}", "strand": g["strand"],
+                      "exons": exons, "merged": _merge(exons),
+                      "span": (min(s for s, _ in exons),
+                               max(e for _, e in exons))})
 
-    # pred -> overlapping ref txs (same strand only for structure match)
+    # pred -> overlapping ref txs, windowed by ref span start so each
+    # pred only inspects refs whose span could intersect its exons
+    order = sorted(ref, key=lambda t: ref[t]["span"][0])
+    starts = [ref[t]["span"][0] for t in order]
     for p in preds:
-        p["ref_hits"] = [tid for tid, t in ref.items()
-                         if t["strand"] == p["strand"]
-                         and _iv_overlap(p["exons"], t["exons"]) > 0]
-        p["anti_hits"] = [tid for tid, t in ref.items()
-                          if t["strand"] != p["strand"]
-                          and _iv_overlap(p["exons"], t["exons"]) > 0]
+        p["ref_hits"], p["anti_hits"] = [], []
+        for tid in order[:bisect_right(starts, p["span"][1])]:
+            t = ref[tid]
+            if t["span"][1] <= p["span"][0]:
+                continue
+            if _overlap_len(p["merged"], t["merged"]) <= 0:
+                continue
+            if t["strand"] == p["strand"]:
+                p["ref_hits"].append(tid)
+                t["pred_hits"].append(p)
+            else:
+                p["anti_hits"].append(tid)
 
-    # ref -> overlapping preds
     for tid, t in ref.items():
-        t["pred_hits"] = [p for p in preds
-                          if p["strand"] == t["strand"]
-                          and _iv_overlap(p["exons"], t["exons"]) > 0]
         t["exact"] = any(sorted(p["exons"]) == sorted(t["exons"])
                          for p in t["pred_hits"])
 
@@ -118,6 +137,10 @@ def classify_contig(seqid, ref_rows, genes, seq):
         ) if len(tids) > 1 else None
         if seq:
             t["gc"] = (seq[s0:e0].count("G") + seq[s0:e0].count("C")) / max(1, e0 - s0)
+            ex = t["exons"]  # sorted in _spans
+            t["start_codon"] = (
+                seq[ex[0][0]:ex[0][0] + 3].upper() if t["strand"] == "+"
+                else revcomp(seq[ex[-1][1] - 3:ex[-1][1]].upper()))
 
     return {"preds": preds, "ref": ref}
 
@@ -139,7 +162,13 @@ def summarize(per_contig):
     missed_ref = {"n_intron": {"0": 0, "1": 0, "2+": 0},
                   "cds_len": {}, "gap": {}, "gc_bin": {}}
     totals = {"ref": 0, "ref_intron0": 0, "pred": 0}
-    boundary_bp_err, exon_delta = [], []
+    # boundary errors split by which junction moved: start (ATG side),
+    # stop (stop-codon side) or splice (interior junctions)
+    shift = {"start": [], "stop": [], "splice": []}
+    exon_delta = []
+    # start-codon identity per ref class -- a GTG/TTG enrichment among
+    # wrong_struct/missed implicates the ATG-only ORF scan
+    start_codons = {}
 
     for c in per_contig.values():
         ref, preds = c["ref"], c["preds"]
@@ -150,14 +179,27 @@ def summarize(per_contig):
             pred_classes[p["class"]] = pred_classes.get(p["class"], 0) + 1
             if p["class"] == "boundary":
                 t = ref[p["ref_hits"][0]]
-                errs = sorted(abs(a - b) for a, b in
-                              zip([s for s, _ in sorted(p["exons"])],
-                                  [s for s, _ in sorted(t["exons"])]))
-                boundary_bp_err.extend(errs[:1])  # 5' boundary shift magnitude
+                plus = t["strand"] == "+"
+                pe, te = sorted(p["exons"]), sorted(t["exons"])
+                last = len(pe) - 1
+                for i, ((ps, pe_), (ts, te_)) in enumerate(zip(pe, te)):
+                    for end_name, d in (("lo", ps - ts),
+                                        ("hi", pe_ - te_)):
+                        if i == 0 and end_name == "lo":
+                            cat = "start" if plus else "stop"
+                        elif i == last and end_name == "hi":
+                            cat = "stop" if plus else "start"
+                        else:
+                            cat = "splice"
+                        shift[cat].append(abs(d))
             if p["class"] == "exon_count":
                 exon_delta.append(len(p["exons"]) - len(ref[p["ref_hits"][0]]["exons"]))
         for t in ref.values():
             ref_classes[t["class"]] = ref_classes.get(t["class"], 0) + 1
+            codon = t.get("start_codon")
+            if codon:
+                sc = start_codons.setdefault(t["class"], {})
+                sc[codon] = sc.get(codon, 0) + 1
             if t["class"] in ("wrong_struct", "missed"):
                 d = missed_ref if t["class"] == "missed" else wrong_ref
                 k = "0" if t["n_intron"] == 0 else ("1" if t["n_intron"] == 1 else "2+")
@@ -173,7 +215,8 @@ def summarize(per_contig):
     return {"totals": totals, "pred_classes": pred_classes,
             "ref_classes": ref_classes, "wrong_struct_strata": wrong_ref,
             "missed_strata": missed_ref,
-            "boundary_shift_bp": sorted(boundary_bp_err),
+            "boundary_shift_bp": {k: sorted(v) for k, v in shift.items()},
+            "ref_start_codons": start_codons,
             "exon_count_deltas": exon_delta}
 
 
@@ -181,7 +224,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("res_pkl")
     ap.add_argument("ref_gff")
-    ap.add_argument("refiner_pt")
+    ap.add_argument("--redecode", metavar="REFINER_PT", default=None,
+                    help="re-run decode_with_refiner instead of using "
+                         "cached r.genes")
     ap.add_argument("--out", default=None)
     ap.add_argument("--device", default="cpu")
     a = ap.parse_args()
@@ -189,15 +234,23 @@ def main():
     pkl = pickle.load(open(a.res_pkl, "rb"))
     ref_rows_all = parse_cds(a.ref_gff)
     gcode = pkl.get("gcode", 1)
-    ref = load_refiner(a.refiner_pt, device=a.device)
+    stops = pkl.get("stops", STOPS)
+    ref = (load_refiner(a.redecode, device=a.device)
+           if a.redecode else None)
     seqs = pkl["contig_seqs"]
 
     per_contig = {}
     for r in pkl["results"]:
         if r.contig not in ref_rows_all:
             continue
-        genes = decode_with_refiner(ref, seqs[r.contig], r, stops=STOPS,
-                                    euk=True, gcode=gcode, device=a.device)
+        if ref is not None:
+            dom = (r.taxon.names.get("domain") if r.taxon else None)
+            genes = decode_with_refiner(ref, seqs[r.contig], r,
+                                        stops=stops,
+                                        euk=(dom == "Eukaryota"),
+                                        gcode=gcode, device=a.device)
+        else:
+            genes = r.genes
         per_contig[r.contig] = classify_contig(r.contig, ref_rows_all, genes,
                                                seqs[r.contig])
 
@@ -217,10 +270,17 @@ def main():
         for k, d in strata.items():
             if d:
                 print(f"  {k}: {d}")
-    if s["boundary_shift_bp"]:
-        b = s["boundary_shift_bp"]
-        print(f"\nboundary 5' shift bp: median={b[len(b)//2]} "
-              f"p90={b[int(len(b)*0.9)]} n={len(b)}")
+    for cat, b in s["boundary_shift_bp"].items():
+        if b:
+            print(f"boundary {cat:6s} shift bp: median={b[len(b)//2]} "
+                  f"p90={b[int(len(b)*0.9)]} n={len(b)}")
+    if s["ref_start_codons"]:
+        print("\nref start codons by class:")
+        for cls, dist in sorted(s["ref_start_codons"].items()):
+            n = sum(dist.values())
+            top = sorted(dist.items(), key=lambda x: -x[1])[:4]
+            print(f"  {cls:12s} n={n:5d} "
+                  + "  ".join(f"{c}:{v}" for c, v in top))
     if s["exon_count_deltas"]:
         d = s["exon_count_deltas"]
         print(f"exon-count delta (pred-ref): mean={sum(d)/len(d):+.2f} "

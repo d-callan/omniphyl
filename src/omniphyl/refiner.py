@@ -139,6 +139,40 @@ def build_refiner_inputs(seq: str, res: ContigResult, lo: int, hi: int,
     return x
 
 
+# Conditioning modes -- which parts of the 21-dim cond vector the
+# FiLM blocks actually see, stored in the ckpt config and applied
+# consistently at train AND inference time:
+#   full       all 21 dims (original behaviour)
+#   reduced    dims 8 (contig GC) and 12:21 (per-rank confidence,
+#              resolved depth, OOD) zeroed. On the 8-genome v5 corpus
+#              these leaked genome identity: only pf3d7 and lmajor had
+#              depth >= 0.86, so FiLM routed unseen high-depth +
+#              moderate-GC contigs (e.g. P. vivax) onto the
+#              near-intronless L. major behaviour and suppressed the
+#              intron-state head contig-wide. Local GC/composition is
+#              already visible in the ACGT channels; the model does
+#              not need a contig-level copy.
+#   none       all zeros -- ablation: refiner without contig-level
+#              conditioning (film bias is still learned globally).
+#   regularize full vector at build time; RefinerChunks applies
+#              dropout/jitter during training only, so inference sees
+#              the untouched full vector. Treated as full here.
+COND_MODES = ("full", "reduced", "none", "regularize")
+
+
+def apply_cond_mode(cond: np.ndarray, mode: str = "full") -> np.ndarray:
+    """Return the cond vector as the FiLM blocks should see it for
+    ``mode``. Always returns a new array; unknown modes fall back to
+    the full vector so older checkpoints stay compatible."""
+    c = cond.copy()
+    if mode == "none":
+        c[:] = 0.0
+    elif mode == "reduced":
+        c[8] = 0.0
+        c[12:] = 0.0
+    return c
+
+
 def build_contig_cond(res: ContigResult, seq: str,
                       gcode: int = 1) -> np.ndarray:
     """(21,) float32 clade/contig-conditioning vector (FiLM input).
@@ -259,7 +293,9 @@ def save_refiner(refiner: OmniPhylRefiner, path, extra: dict = None):
                 "model": refiner.state_dict(),
                 "config": {"c_in": N_CHANNELS, "cond_dim": N_COND,
                            "hidden": 96, "n_states": N_STATES,
-                           "n_sites": N_SITES},
+                           "n_sites": N_SITES,
+                           "cond_mode": getattr(refiner, "cond_mode",
+                                                "full")},
                 **(extra or {})}, path)
 
 
@@ -275,6 +311,7 @@ def load_refiner(source, device: str = "cpu") -> OmniPhylRefiner:
                              ("c_in", "cond_dim", "hidden", "n_states",
                               "n_sites") if k in cfg})
     ref.load_state_dict(ck["model"])
+    ref.cond_mode = cfg.get("cond_mode", "full")
     return ref.to(device).eval()
 
 
@@ -287,7 +324,8 @@ def refiner_tracks(refiner: OmniPhylRefiner, seq: str,
     blending overlaps with a raised-cosine taper. Returns
     (p_state [L,7], p_site [L,8]) float32."""
     L = len(seq)
-    cond_np = build_contig_cond(res, seq, gcode)
+    cond_np = apply_cond_mode(build_contig_cond(res, seq, gcode),
+                              getattr(refiner, "cond_mode", "full"))
     # older checkpoints carry a smaller cond_dim -- new dims are
     # appended at the end, so a plain prefix slice stays compatible
     exp = refiner.blocks[0].film.in_features
@@ -325,13 +363,18 @@ def decode_with_refiner(refiner, seq: str, res: ContigResult,
                         coding_threshold: float = 0.45,
                         min_intron: int = 35, max_intron: int = 5000,
                         intron_hints=(), site_threshold: float = 0.05,
+                        starts=("ATG",),
                         device: str = "cpu", p_state=None, p_site=None):
     """Decode a contig with the neural refiner -> gene dicts.
 
     Same return schema as annotate._decode_genes so downstream GFF3 /
     domain / report code paths are unchanged. ``refiner`` may be None
     when precomputed ``p_state``/``p_site`` are supplied (tests,
-    res.pkl replays).
+    res.pkl replays). ``starts`` is the set of initiation codons the
+    ORF scan accepts -- pass e.g. STARTS (ATG/GTG/TTG) for bacterial
+    or archaeal contigs, where the model's start-site head still fires
+    on annotated non-ATG starts (labels come from GFF boundaries, not
+    the codon identity). The splice-rescue walk stays ATG-only.
     """
     seq_u = seq.upper()
     L = len(seq_u)
@@ -343,7 +386,7 @@ def decode_with_refiner(refiner, seq: str, res: ContigResult,
         genes += _refiner_decode_strand(
             seq_u, L, p_state, p_site, res, strand, euk, stops,
             min_cds_len, coding_threshold, min_intron, max_intron,
-            intron_hints, site_threshold)
+            intron_hints, site_threshold, starts)
     seen, uniq = set(), []
     for g in sorted(genes, key=lambda x: -x.get("score", 0.0)):
         key = (g["start"], g["end"], g["strand"])
@@ -357,7 +400,7 @@ def decode_with_refiner(refiner, seq: str, res: ContigResult,
 def _refiner_decode_strand(seq_u, L, p_state, p_site, res, strand,
                            euk, stops, min_cds_len, coding_threshold,
                            min_intron, max_intron, intron_hints,
-                           site_threshold):
+                           site_threshold, starts=("ATG",)):
     """One strand, all in the strand's reading direction.
 
     For '-' the sequence is revcomp'd and every posterior row is
@@ -391,8 +434,8 @@ def _refiner_decode_strand(seq_u, L, p_state, p_site, res, strand,
         out += _refiner_decode_locus(
             s_seq, lo, hi, strand, L, res, euk, stops, min_cds_len,
             coding_threshold, min_intron, max_intron, hints,
-            site_threshold, p_cds, p_int, p_other, p_bg, p_start,
-            p_stop, p_don, p_acc, iprior)
+            site_threshold, starts, p_cds, p_int, p_other, p_bg,
+            p_start, p_stop, p_don, p_acc, iprior)
     return out
 
 
@@ -610,26 +653,44 @@ def _rescue_chains(s_seq, lo, hi, cands_p, stops, have):
     for t0 in range(0, n - 2):
         if s_seq[lo + t0:lo + t0 + 3] != "ATG":
             continue
-        beam = [(t0, [lo + t0], ())]
+        # Transcript coords between excisions are contiguous, so tx is
+        # run-length encoded as a list of half-open (start, end) ranges
+        # plus its decoded length. A flat per-base list made each step
+        # an O(len) copy -> O(n^2) per walk, which dominated runtime on
+        # long ORFs; appends below are amortized O(1).
+        beam = [(t0, [(lo + t0, lo + t0 + 1)], 1, ())]
         for _step in range(n):
             new_beam = []
-            for p, tx, exc in beam:
+            for p, runs, tlen, exc in beam:
                 nxt = p + 1
                 if nxt >= n:
                     continue
-                tx2 = tx + [lo + nxt]
-                if len(tx2) % 3 != 0:
-                    new_beam.append((nxt, tx2, exc))
+                c = lo + nxt
+                if runs[-1][1] == c:
+                    runs[-1] = (runs[-1][0], c + 1)
+                else:
+                    runs.append((c, c + 1))  # post-excision jump
+                tlen += 1
+                if tlen % 3 != 0:
+                    new_beam.append((nxt, runs, tlen, exc))
                     continue
-                cod = s_seq[tx2[-3]] + s_seq[tx2[-2]] + s_seq[tx2[-1]]
+                # last 3 transcript coords (codon just completed),
+                # collected back-to-front across run boundaries
+                tail = []
+                for rs_, re_ in reversed(runs):
+                    k = min(3 - len(tail), re_ - rs_)
+                    tail.extend(range(re_ - 1, re_ - 1 - k, -1))
+                    if len(tail) == 3:
+                        break
+                cod = s_seq[tail[2]] + s_seq[tail[1]] + s_seq[tail[0]]
                 if cod not in stops:
-                    new_beam.append((nxt, tx2, exc))
+                    new_beam.append((nxt, runs, tlen, exc))
                     continue
                 # candidates spanning this stop codon that are still
                 # free (not excised and not overlapping an excision)
-                hit = [c for c in cands_p
-                       if c[1] <= tx2[-1] and tx2[-3] < c[2]
-                       and not any(c[1] < ea and c[2] > ed
+                hit = [cand for cand in cands_p
+                       if cand[1] <= tail[0] and tail[2] < cand[2]
+                       and not any(cand[1] < ea and cand[2] > ed
                                    for ed, ea in exc)]
                 if not hit:
                     if exc and exc not in have:
@@ -637,18 +698,32 @@ def _rescue_chains(s_seq, lo, hi, cands_p, stops, have):
                         out.append(list(exc))
                     continue
                 for _, d, a in hit[:3]:
-                    if d <= tx2[0] or d <= (exc[-1][1] if exc else -1):
+                    if d <= runs[0][0] or d <= (exc[-1][1]
+                                                if exc else -1):
                         continue
-                    tx_trim = [x for x in tx2 if x < d]
-                    if not tx_trim:
+                    # tx_trim = coords < d, still run-encoded
+                    trim, tlen_t = [], 0
+                    for rs_, re_ in runs:
+                        if rs_ >= d:
+                            break
+                        re_c = min(re_, d)
+                        trim.append((rs_, re_c))
+                        tlen_t += re_c - rs_
+                    if not tlen_t:
                         continue
-                    rem = len(tx_trim) % 3
+                    rem = tlen_t % 3
                     if rem and a + (3 - rem) <= hi:
-                        jcod = ("".join(s_seq[x] for x in tx_trim[-rem:])
+                        jc = []
+                        for rs_, re_ in reversed(trim):
+                            k = min(rem - len(jc), re_ - rs_)
+                            jc.extend(range(re_ - 1, re_ - 1 - k, -1))
+                            if len(jc) == rem:
+                                break
+                        jcod = ("".join(s_seq[x] for x in reversed(jc))
                                 + s_seq[a:a + (3 - rem)])
                         if jcod in stops:
                             continue
-                    new_beam.append((a - lo - 1, tx_trim,
+                    new_beam.append((a - lo - 1, trim, tlen_t,
                                      exc + ((d, a),)))
             if not new_beam:
                 break
@@ -658,7 +733,8 @@ def _rescue_chains(s_seq, lo, hi, cands_p, stops, have):
 
 def _refiner_orfs(seq_s, pos, lo, hi, chain, strand, L, res, stops,
                   min_cds_len, s_seq, p_cds, p_int, p_other, p_bg,
-                  p_start, p_stop, hint_xy, intron_ll):
+                  p_start, p_stop, hint_xy, intron_ll,
+                  starts=("ATG",)):
     """ATG->stop ORFs on the (possibly spliced) forward transcript.
 
     ``pos`` maps transcript index -> strand-local genomic coord
@@ -670,7 +746,7 @@ def _refiner_orfs(seq_s, pos, lo, hi, chain, strand, L, res, stops,
     n = len(seq_s)
     by_stop = {}
     for t in range(n - 2):
-        if seq_s[t:t + 3] != "ATG":
+        if seq_s[t:t + 3] not in starts:
             continue
         u = t + 3
         while u + 3 <= n and seq_s[u:u + 3] not in stops:
@@ -754,8 +830,8 @@ def _refiner_orfs(seq_s, pos, lo, hi, chain, strand, L, res, stops,
 
 def _refiner_decode_locus(s_seq, lo, hi, strand, L, res, euk, stops,
                           min_cds_len, coding_threshold, min_intron,
-                          max_intron, hints, site_threshold, p_cds,
-                          p_int, p_other, p_bg, p_start, p_stop,
+                          max_intron, hints, site_threshold, starts,
+                          p_cds, p_int, p_other, p_bg, p_start, p_stop,
                           p_don, p_acc, iprior):
     """All candidate gene calls inside one active locus on one
     strand: candidate introns -> excision chains (DP + stop-rescue
@@ -776,7 +852,7 @@ def _refiner_decode_locus(s_seq, lo, hi, strand, L, res, euk, stops,
         for g in _refiner_orfs(
                 seq_s, pos, lo, hi, chain, strand, L, res, stops,
                 min_cds_len, s_seq, p_cds, p_int, p_other, p_bg,
-                p_start, p_stop, hint_xy, intron_ll):
+                p_start, p_stop, hint_xy, intron_ll, starts):
             stop_edge = g["end"] if strand == "+" else g["start"]
             if (stop_edge not in genes
                     or g["score"] > genes[stop_edge]["score"]):

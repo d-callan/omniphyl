@@ -40,13 +40,15 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import (DataLoader, Dataset,
+                              WeightedRandomSampler)
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from omniphyl.refiner import (OmniPhylRefiner, build_refiner_inputs,
-                              build_contig_cond, save_refiner,
+                              build_contig_cond, apply_cond_mode,
+                              save_refiner, COND_MODES,
                               _stage1_tracks,
                               _chunk_starts, N_STATES, N_SITES, CHUNK,
                               CHUNK_STRIDE, ST_INTERGENIC, ST_CDS_P,
@@ -175,22 +177,31 @@ class RefinerChunks(Dataset):
     as uint8 -- the full bitmap/int64 forms cost ~40 B/bp/item and
     OOM multi-genome corpora; this form is ~9 B/bp."""
 
-    def __init__(self, items, w_ev=0.25, p_no_ev=0.25, seed=0):
+    def __init__(self, items, w_ev=0.25, p_no_ev=0.25, seed=0,
+                 cond_aug=False):
         self.items = items
         self.w_ev = w_ev
         self.p_no_ev = p_no_ev
         self.seed = seed
+        # cond_aug: training-only cond regularization ("regularize"
+        # cond_mode). Inference/val items see the unmodified vector.
+        self.cond_aug = cond_aug
         self.chunks = []
+        # item[6] is the genome id used by --balance-genomes; items
+        # without one fall back to their own index (never mixed).
+        self.chunk_gid = []
         for i, it in enumerate(items):
+            gid = it[6] if len(it) > 6 else i
             for a in _chunk_starts(len(it[0]), CHUNK, CHUNK_STRIDE):
                 self.chunks.append((i, a, min(a + CHUNK, len(it[0]))))
+                self.chunk_gid.append(gid)
 
     def __len__(self):
         return len(self.chunks)
 
     def __getitem__(self, i):
         it, lo, hi = self.chunks[i]
-        seq, bw, state, sites, cond, tr = self.items[it]
+        seq, bw, state, sites, cond, tr = self.items[it][:6]
         x = build_refiner_inputs(seq, None, lo, hi, self.w_ev,
                                  tracks=tr, bin_width=bw)
         # per-index RNG: identical evidence-dropout decisions regardless
@@ -198,6 +209,20 @@ class RefinerChunks(Dataset):
         # identical to interpolating a zeroed track
         if np.random.default_rng(self.seed + i).random() < self.p_no_ev:
             x[20:22] = 0.0
+        if self.cond_aug:
+            # regularize mode: prevent FiLM from keying on the exact
+            # cond vectors of the small training corpus. p=0.3 fully
+            # unconditioned; otherwise independently mask the
+            # rank-confidence block (dims 12:20, the genome-identity
+            # leak) and jitter the continuous track-stat dims.
+            rng = np.random.default_rng(self.seed * 7919 + i + 31)
+            cond = np.array(cond, dtype=np.float32, copy=True)
+            if rng.random() < 0.30:
+                cond[:] = 0.0
+            else:
+                cond[12:20] *= rng.random(8) >= 0.5
+                cond[4:12] += rng.normal(0.0, 0.08, 8)
+                cond[20] += rng.normal(0.0, 0.08)
         ys = state[lo:hi].astype(np.int64)
         yt = np.zeros((N_SITES, hi - lo), np.float32)
         for c, (pos, val) in enumerate(sites):
@@ -227,13 +252,17 @@ def _chunk_collate(batch):
 
 
 def _make_items(res_pkl: dict, labels_by_seqid: dict, gcode: int,
-                w_ev: float = 0.25, include_rc=True):
+                w_ev: float = 0.25, include_rc=True,
+                cond_mode: str = "full", gid: int = 0):
     """Per-annotated-contig training items: (items, groups).
 
-    items: (seq, bin_width, state_u8, site_coords, cond, tracks)
+    items: (seq, bin_width, state_u8, site_coords, cond, tracks, gid)
     groups: parallel base-contig seqid for each item -- a contig and
     its reverse-complement partner share a group so a grouped split
-    can never leak one strand into train and the other into val."""
+    can never leak one strand into train and the other into val.
+    gid is the genome id used by --balance-genomes. cond is stored
+    with apply_cond_mode already applied; "regularize" stores the
+    full vector because its jitter is stochastic per chunk."""
     results = {r.contig: r for r in res_pkl["results"]}
     seqs = res_pkl["contig_seqs"]
     items, groups = [], []
@@ -242,18 +271,19 @@ def _make_items(res_pkl: dict, labels_by_seqid: dict, gcode: int,
             continue
         res, seq = results[cid], seqs[cid].upper()
         state, site = build_refiner_labels(rows, len(seq))
-        cond = build_contig_cond(res, seq, gcode)
+        cond = apply_cond_mode(build_contig_cond(res, seq, gcode),
+                               cond_mode)
         bw = res.bin_width
         items.append((seq, bw, state.astype(np.uint8),
                       _site_coords(site), cond,
-                      _stage1_tracks(res, w_ev)))
+                      _stage1_tracks(res, w_ev), gid))
         groups.append(cid)
         if include_rc:
             res_rc = revcomp_result(res)
             st_rc, si_rc = rc_labels(state, site)
             items.append((revcomp(seq), bw, st_rc.astype(np.uint8),
                           _site_coords(si_rc), cond,
-                          _stage1_tracks(res_rc, w_ev)))
+                          _stage1_tracks(res_rc, w_ev), gid))
             groups.append(cid)
     return items, groups
 
@@ -395,6 +425,12 @@ def _split_items(tr_pairs, val_pairs, val_seqids, val_frac, seed):
 
 # ------------------------------------------------------------- main ----
 
+# Genomes whose total bases exceed this are annotated in contig-group
+# subprocesses (see _stage1_cache). ~30 Mb per group keeps each child
+# below the ~33 Mb run that passed on Kaggle (tgondii's 65 Mb OOM'd).
+STAGE1_SPLIT_BP = 30_000_000
+
+
 def _stage1_cache(fasta: Path, model, cache_dir: Path, args):
     """ContigResult dict for a fasta: cached .res.pkl else a tracks-only
     annotate run with OMNIPHYL_DUMP_RES.
@@ -406,41 +442,94 @@ def _stage1_cache(fasta: Path, model, cache_dir: Path, args):
     fires; the parent only ever touches the pickled cache.
 
     Returns the loaded res dict, or None if stage-1 failed (caller
-    skips the genome; main() gates on how many failures to tolerate)."""
+    skips the genome; main() gates on how many failures to tolerate).
+
+    Genomes over _SPLIT_BP total bases are annotated in contig-group
+    subprocesses and merged: Stage-1 keeps every contig's tracks in
+    RAM at once, and a ~65 Mb genome (tgondii ME49) was OOM-killed
+    (rc=-9) on Kaggle while the ~33 Mb lmajor passed. Each ~30 Mb
+    group's peak RSS stays below that bound."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     pk = cache_dir / (fasta.stem + ".res.pkl")
-    if not pk.exists():
-        if model is None:
-            sys.exit(f"no Stage-1 cache {pk} and no --model given")
-        spec = json.dumps({
-            "model_path": str(model), "fasta_path": str(fasta),
-            "out_prefix": str(cache_dir / fasta.stem),
-            "window": args.window, "stride": args.stride,
-            "bin_width": args.bin_width,
-            "batch_size": args.stage1_batch, "device": args.device,
-            "tracks_only": True, "verbose": False})
-        print(f"{fasta.name}: stage-1 annotate (subprocess)",
-              flush=True)
-        r = subprocess.run(
-            [sys.executable, "-c",
-             "import sys, json\n"
-             "from pathlib import Path\n"
-             "from omniphyl.annotate import run_annotate\n"
-             "kw = json.loads(sys.argv[1])\n"
-             "kw['out_prefix'] = Path(kw['out_prefix'])\n"
-             "run_annotate(**kw)\n",
-             spec],
-            env={**os.environ, "OMNIPHYL_DUMP_RES": "1",
-                 # child needs the repo's src on path; sys.path edits
-                 # in this process don't propagate to subprocesses
-                 "PYTHONPATH": str(ROOT / "src") + os.pathsep
-                 + os.environ.get("PYTHONPATH", "")})
-        if r.returncode != 0 or not pk.exists():
-            print(f"{fasta.name}: stage-1 FAILED rc={r.returncode} "
-                  "-- skipping this genome", flush=True)
-            return None
-    with open(pk, "rb") as fh:
-        return pickle.load(fh)
+    if pk.exists():
+        with open(pk, "rb") as fh:
+            return pickle.load(fh)
+    if model is None:
+        sys.exit(f"no Stage-1 cache {pk} and no --model given")
+
+    # partition contigs into ~30 Mb groups (record_id is the first
+    # header token, matching the GFF seqid either way)
+    groups, cur, cur_bp = [], [], 0
+    for cid, s, _cov in iter_sequences(fasta):
+        if cur and cur_bp + len(s) > STAGE1_SPLIT_BP:
+            groups.append(cur)
+            cur, cur_bp = [], 0
+        cur.append((cid, s))
+        cur_bp += len(s)
+    if cur:
+        groups.append(cur)
+
+    merged = {"results": [], "contig_seqs": {}, "stops": None,
+              "gcode": 1}
+    for gi, grp in enumerate(groups):
+        if len(groups) == 1:
+            fa_g, pk_g = fasta, pk
+        else:
+            fa_g = cache_dir / f"{fasta.stem}._p{gi}.fasta"
+            pk_g = cache_dir / f"{fasta.stem}._p{gi}.res.pkl"
+            if not pk_g.exists():
+                with open(fa_g, "w") as out:
+                    for cid, s in grp:
+                        out.write(f">{cid}\n" + "\n".join(
+                            s[i:i + 60]
+                            for i in range(0, len(s), 60)) + "\n")
+        if not pk_g.exists():
+            spec = json.dumps({
+                "model_path": str(model), "fasta_path": str(fa_g),
+                "out_prefix": str(cache_dir / fa_g.stem),
+                "window": args.window, "stride": args.stride,
+                "bin_width": args.bin_width,
+                "batch_size": args.stage1_batch,
+                "device": args.device,
+                "tracks_only": True, "verbose": False})
+            print(f"{fa_g.name}: stage-1 annotate (subprocess)",
+                  flush=True)
+            r = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys, json\n"
+                 "from pathlib import Path\n"
+                 "from omniphyl.annotate import run_annotate\n"
+                 "kw = json.loads(sys.argv[1])\n"
+                 "kw['out_prefix'] = Path(kw['out_prefix'])\n"
+                 "run_annotate(**kw)\n",
+                 spec],
+                env={**os.environ, "OMNIPHYL_DUMP_RES": "1",
+                     # child needs the repo's src on path; sys.path
+                     # edits in this process don't propagate to
+                     # subprocesses
+                     "PYTHONPATH": str(ROOT / "src") + os.pathsep
+                     + os.environ.get("PYTHONPATH", "")})
+            if r.returncode != 0 or not pk_g.exists():
+                print(f"{fa_g.name}: stage-1 FAILED "
+                      f"rc={r.returncode} -- skipping this genome",
+                      flush=True)
+                return None
+        with open(pk_g, "rb") as fh:
+            part = pickle.load(fh)
+        merged["results"] += part["results"]
+        merged["contig_seqs"].update(part["contig_seqs"])
+        if merged["stops"] is None:
+            merged["stops"] = part.get("stops")
+            merged["gcode"] = part.get("gcode", 1)
+    if len(groups) > 1:
+        with open(pk, "wb") as fh:
+            pickle.dump(merged, fh)
+        for gi in range(len(groups)):
+            for suf in (".fasta", ".res.pkl"):
+                p = cache_dir / f"{fasta.stem}._p{gi}{suf}"
+                if p.exists():
+                    p.unlink()
+    return merged
 
 
 def main():
@@ -480,6 +569,15 @@ def main():
     ap.add_argument("--bin-width", type=int, default=0)
     ap.add_argument("--stage1-batch", type=int, default=256)
     ap.add_argument("--evidence-weight", type=float, default=0.25)
+    ap.add_argument("--cond-mode", choices=COND_MODES, default="full",
+                    help="which cond dims FiLM sees: full (21 dims), "
+                         "reduced (drop GC + rank-conf/depth/OOD leak "
+                         "dims), none (no contig conditioning), "
+                         "regularize (full + train-time dropout/jitter)")
+    ap.add_argument("--balance-genomes", action="store_true",
+                    help="WeightedRandomSampler so every genome "
+                         "contributes equally per epoch regardless of "
+                         "assembly size (default: flat chunk pool)")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -495,7 +593,9 @@ def main():
     # can't leak the opposite strand across the train/val boundary.
     tr_pairs, val_pairs, failed = [], [], []
 
-    def _load_pair(pi, fa_s, gff_s, is_val):
+    def _load_pair(pi, fa_s, gff_s, is_val, gid=None):
+        if gid is None:
+            gid = pi + (1000 if is_val else 0)
         fasta, gff = Path(fa_s), Path(gff_s)
         if pi == 0 and args.res_pkl and not is_val:
             with open(args.res_pkl, "rb") as fh:
@@ -512,7 +612,8 @@ def main():
         labels = parse_cds(str(gff))
         gcode = res_pkl.get("gcode", 1)
         items, groups = _make_items(res_pkl, labels, gcode,
-                                    w_ev=args.evidence_weight)
+                                    w_ev=args.evidence_weight,
+                                    cond_mode=args.cond_mode, gid=gid)
         print(f"{fasta.name}: {len(items)} contig items "
               f"({'val' if is_val else 'train-pool'})", flush=True)
         return list(zip(items, groups))
@@ -544,11 +645,27 @@ def main():
     trn_items, val_items = _split_items(
         tr_pairs, val_pairs, args.val_seqids, args.val_frac,
         args.seed)
-    trn = DataLoader(RefinerChunks(trn_items, args.evidence_weight,
-                                   seed=args.seed),
-                     batch_size=args.batch_size, shuffle=True,
-                     num_workers=args.num_workers,
-                     collate_fn=_chunk_collate)
+    trn_ds = RefinerChunks(trn_items, args.evidence_weight,
+                           seed=args.seed,
+                           cond_aug=(args.cond_mode == "regularize"))
+    trn_kw = dict(batch_size=args.batch_size,
+                  num_workers=args.num_workers,
+                  collate_fn=_chunk_collate)
+    if args.balance_genomes:
+        # inverse-chunk-count weighting per genome: an 11k-chunk
+        # L. major can no longer supply 25% of gradient steps while a
+        # 0.8k-chunk Halobacterium supplies ~2%
+        from collections import Counter
+        cnt = Counter(trn_ds.chunk_gid)
+        w = torch.tensor([1.0 / cnt[g] for g in trn_ds.chunk_gid],
+                         dtype=torch.double)
+        trn = DataLoader(trn_ds,
+                         sampler=WeightedRandomSampler(
+                             w, num_samples=len(trn_ds),
+                             replacement=True),
+                         **trn_kw)
+    else:
+        trn = DataLoader(trn_ds, shuffle=True, **trn_kw)
     val = DataLoader(RefinerChunks(val_items, args.evidence_weight,
                                    p_no_ev=0.0, seed=args.seed),
                      batch_size=args.batch_size,
@@ -557,6 +674,7 @@ def main():
           f"({len(trn_items)} / {len(val_items)} contigs)", flush=True)
 
     refiner = OmniPhylRefiner().to(device)
+    refiner.cond_mode = args.cond_mode
     opt = torch.optim.AdamW(refiner.parameters(), lr=args.lr,
                             weight_decay=0.01)
     best_f1, best_sd = -1.0, None
@@ -600,6 +718,8 @@ def main():
         refiner.load_state_dict(best_sd)
     save_refiner(refiner, args.out,
                  extra={"nuc_f1": best_f1, "epochs": args.epochs,
+                        "cond_mode": args.cond_mode,
+                        "balance_genomes": args.balance_genomes,
                         "data": [f"{a} {b}" for a, b in args.data]})
     print(f"wrote {args.out} (val nucF1 {best_f1:.3f})")
 
@@ -609,9 +729,12 @@ def main():
         ck = torch.load(args.bundle_model, map_location="cpu",
                         weights_only=False)
         ck["refiner"] = {"model": refiner.state_dict(),
-                         "config": {"c_in": 22, "cond_dim": 12,
+                         "config": {"c_in": 22, "cond_dim": N_COND,
                                     "hidden": 96, "n_states": N_STATES,
-                                    "n_sites": N_SITES}}
+                                    "n_sites": N_SITES,
+                                    "cond_mode": getattr(
+                                        refiner, "cond_mode",
+                                        "full")}}
         torch.save(ck, args.bundle_out)
         print(f"bundled -> {args.bundle_out}")
 
