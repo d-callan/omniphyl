@@ -426,9 +426,11 @@ def _split_items(tr_pairs, val_pairs, val_seqids, val_frac, seed):
 # ------------------------------------------------------------- main ----
 
 # Genomes whose total bases exceed this are annotated in contig-group
-# subprocesses (see _stage1_cache). ~30 Mb per group keeps each child
-# below the ~33 Mb run that passed on Kaggle (tgondii's 65 Mb OOM'd).
-STAGE1_SPLIT_BP = 30_000_000
+# subprocesses (see _stage1_cache). 20 Mb per group: a 30 Mb part
+# passed once then a sibling part OOM'd (rc=-9) on Kaggle, so 30 Mb
+# sits right at the kill boundary; lmajor's 33 Mb whole-genome run
+# also passed only marginally. ~2x headroom.
+STAGE1_SPLIT_BP = 20_000_000
 
 
 def _stage1_cache(fasta: Path, model, cache_dir: Path, args):
