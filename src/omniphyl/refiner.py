@@ -48,6 +48,18 @@ ST_DUAL = 6
 S_START_P, S_STOP_P, S_DON_P, S_ACC_P = 0, 1, 2, 3
 S_START_M, S_STOP_M, S_DON_M, S_ACC_M = 4, 5, 6, 7
 
+# Decoder tuning gates, kept as module constants so held-out-genome
+# calibration sweeps can monkeypatch them without forking the code.
+# Defaults reproduce production behaviour.
+DEC_RUN_PINT = 0.15      # p_int floor anchoring an intronic state run
+DEC_RUN_RATIO = 0.35     # run positions also need p_int >= ratio*p_cds
+DEC_RUN_PEAK = 0.25      # a run must reach this p_int to seed candidates
+DEC_PAIR_LL = -3.0       # minimum (donor,acceptor) pair score
+DEC_FALLBACK_LEN = 0     # extra acceptor horizon for the site-maxima
+                         # fallback when no state run exists; 0 = legacy
+                         # (only introns of ~min_intron..min_intron+15
+                         # are reachable through the fallback)
+
 
 def _chunk_starts(L: int, chunk: int = CHUNK,
                   stride: int = CHUNK_STRIDE) -> list[int]:
@@ -486,8 +498,9 @@ def _refiner_intron_candidates(s_seq, lo, hi, min_intron, max_intron,
     (and mirror-image at the acceptor), so the step breaks the
     site-logit plateau tie in favor of the exact state transition."""
     hint_xy = list(hints)
-    mask = (p_int[lo:hi] >= 0.15) & (p_int[lo:hi] >= 0.35
-                                       * p_cds[lo:hi])
+    mask = (p_int[lo:hi] >= DEC_RUN_PINT) & (p_int[lo:hi] >=
+                                           DEC_RUN_RATIO
+                                           * p_cds[lo:hi])
     raw = []
     i, n = 0, hi - lo
     while i < n:
@@ -498,7 +511,7 @@ def _refiner_intron_candidates(s_seq, lo, hi, min_intron, max_intron,
         while j + 1 < n and mask[j + 1]:
             j += 1
         if (j + 1 - i >= min_intron - 20
-                and p_int[lo + i:lo + j + 1].max() >= 0.25):
+                and p_int[lo + i:lo + j + 1].max() >= DEC_RUN_PEAK):
             raw.append((lo + i, lo + j + 1))
         i = j + 1
     # merge runs separated by less than min_intron: a dip shorter
@@ -525,7 +538,8 @@ def _refiner_intron_candidates(s_seq, lo, hi, min_intron, max_intron,
             if (p_don[x] >= site_threshold
                     and p_don[x] >= p_don[x - 1]
                     and p_don[x] >= p_don[x + 1]):
-                runs.append((x, x + min_intron, 15))
+                runs.append((x, x + min_intron + DEC_FALLBACK_LEN,
+                             15))
 
     cands = {}
     for i0, i1, rad in runs:
@@ -569,7 +583,7 @@ def _refiner_intron_candidates(s_seq, lo, hi, min_intron, max_intron,
                 if any(abs(d - hd) <= 6 and abs(a - ha) <= 6
                        for hd, ha in hint_xy):
                     ll += 2.0
-                if ll > -3.0:
+                if ll > DEC_PAIR_LL:
                     local_pairs.append((ll, d, a))
         # keep the 8 best pairs per run: one intron can never starve
         # the locus-wide candidate budget, but a merged run covering
