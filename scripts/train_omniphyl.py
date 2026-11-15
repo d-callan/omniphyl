@@ -18,6 +18,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -27,9 +28,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import (DataLoader, Dataset, DistributedSampler)
 
 # Single source of truth for encoders + model classes: the installable
 # package in src/omniphyl/. The path insert keeps `python3
@@ -41,9 +44,9 @@ from omniphyl.encode import (  # noqa: E402
     AA_LETTERS, AA_ALPHA, AA_DIM, AA_EXTRA_DIM, AA_FRAME_DIM, _AA_LUT,
     build_cell_lut, rc_index_map,
     fcgr_encode, fcgr_encode_ms, hash_encode, aa_encode,
-    aa_frame_encode, seq_encode)
+    aa_frame_encode, seq_encode, dna_stats_encode)
 from omniphyl.model import (  # noqa: E402
-    RANKS, CODING_TARGETS, CONT_TARGETS,
+    RANKS, CODING_TARGETS, CONT_TARGETS, REPLICON_CLASSES,
     Block, ResNetEncoder, SeqEncoder, ViTEncoder,
     TreeRankHead, OmniPhyl,
     build_tree, build_flat_priors)
@@ -130,8 +133,12 @@ class FragmentDataset(Dataset):
                  eval_paired: int = 0,
                  aa_frame: bool = False,
                  annot: dict | None = None,
-                 cache_seqs: bool = False):
-        self.fasta = Path(fasta)
+                 cache_seqs: bool = False,
+                 packed: Path | None = None,
+                 dna_stats: bool = False,
+                 aa_extra_v2: bool = False,
+                 replicon: dict | None = None):
+        self.fasta = Path(fasta) if fasta else None
         self.k = k
         self.lut = lut
         self.augment = augment
@@ -154,24 +161,45 @@ class FragmentDataset(Dataset):
             (-1.0,) * (ANNOT_BASE + annot["_k"]
                        + (1 if annot["_k"] else 0))
             if annot is not None else ())
+        self.dna_stats = dna_stats     # ToL: window repeat/CpG scalars
+        self.aa_extra_v2 = aa_extra_v2  # ToL: 30-d aa_extra features
+        self.replicon = replicon       # frag_id -> replicon class id or -1
         self.labels = labels  # frag_id -> {target: int}
         self.cont = cont or {}  # frag_id -> (coding_frac, boundary_offset)
         self.ids = list(labels.keys())
         self.targets = targets if targets is not None else RANKS
-        idx_path = fasta.with_suffix(fasta.suffix + ".idx.json")
-        if idx_path.exists():
-            self.offsets = json.loads(idx_path.read_text())
+        self._packed_mm = self._packed_off = None
+        self._packed_row: dict[str, int] = {}
+        if packed is not None:
+            # Zero-copy mmap corpus (scripts/pack_corpus.py): sequences
+            # are served straight from the OS page cache -- shared
+            # across DataLoader workers AND DDP ranks, no per-process
+            # RAM duplication.
+            packed = Path(packed)
+            self._packed_row = {
+                fid: i for i, fid in enumerate(
+                    (packed / "seq_ids.txt").read_text().splitlines())}
+            self._packed_off = np.load(packed / "seq_offsets.npy",
+                                       mmap_mode="r")
+            self._packed_mm = np.memmap(packed / "seqs.u8",
+                                        dtype=np.uint8, mode="r")
+            self.offsets = {}
         else:
-            self.offsets = self._build_index(idx_path)
+            idx_path = self.fasta.with_suffix(
+                self.fasta.suffix + ".idx.json")
+            if idx_path.exists():
+                self.offsets = json.loads(idx_path.read_text())
+            else:
+                self.offsets = self._build_index(idx_path)
         # Optional in-RAM sequence store: one concatenated bytes blob plus
         # per-fid (start, len) offsets. Replaces per-sample open()+seek()
         # reads -- on 2-core VMs the syscall+decode overhead dominates the
         # dataloader (~6ms/frag) and starves the GPU. A single sequential
         # pass loads 900k x ~500bp fragments in <1GB; worker processes
-        # share the blob copy-on-write.
+        # share the blob copy-on-write. --packed supersedes it entirely.
         self._seq_blob: bytes | None = None
         self._seq_pos: dict[str, tuple[int, int]] = {}
-        if cache_seqs:
+        if cache_seqs and packed is None:
             self._load_seqs()
 
     def _build_index(self, idx_path: Path):
@@ -232,6 +260,10 @@ class FragmentDataset(Dataset):
               f"({len(self._seq_blob) / 2**20:.0f} MiB)")
 
     def _read_seq(self, fid: str) -> str:
+        if self._packed_mm is not None:
+            i = self._packed_row[fid]
+            return bytes(self._packed_mm[
+                self._packed_off[i]:self._packed_off[i + 1]]).decode("ascii")
         if self._seq_blob is not None:
             st, ln = self._seq_pos[fid]
             return self._seq_blob[st:st + ln].decode("ascii")
@@ -288,11 +320,16 @@ class FragmentDataset(Dataset):
             if "hash" in self.aux:
                 x["hash"] = torch.from_numpy(hash_encode(s, self.hash_canon))
             if "aa" in self.aux:
-                x["aa"] = torch.from_numpy(aa_encode(s, self.aa_extra))
+                x["aa"] = torch.from_numpy(
+                    aa_encode(s, self.aa_extra, v2=self.aa_extra_v2))
         if self.aa_frame:
             if not isinstance(x, dict):
                 x = {"x": x}
             x["aa_frame"] = torch.from_numpy(aa_frame_encode(s))
+        if self.dna_stats:
+            if not isinstance(x, dict):
+                x = {"x": x}
+            x["dna_stats"] = torch.from_numpy(dna_stats_encode(s))
         if self.annot is not None:
             c = c + self.annot.get(fid, self._annot_default)
         if cropped:
@@ -303,6 +340,10 @@ class FragmentDataset(Dataset):
             # domains) is wrong for the cropped read. Mask them all to
             # the -1 unlabeled sentinel the losses already respect.
             c = (-1.0,) * len(c)
+        if self.replicon is not None:
+            # replicon is a contig-level property, NOT window-derived:
+            # appended AFTER the crop-mask so it survives cropping.
+            c = c + (self.replicon.get(fid, -1.0),)
         return (x, torch.from_numpy(lab),
                 torch.tensor(c, dtype=torch.float32))
 
@@ -339,6 +380,20 @@ def encode_cont_labels(rows: dict[str, dict]) -> dict[str, tuple]:
 
 
 ANNOT_BASE = 9   # region_fracs(4) + active_frame(1) + struct_flags(4)
+
+
+def encode_replicon_labels(rows: dict[str, dict]) -> dict[str, float]:
+    """frag_id -> replicon class id (float for the yc channel) or -1.0.
+
+    Labels come from the labels.tsv ``replicon`` column emitted by
+    fetch_refseq_corpus.py (GFF genome= attributes / seqid provenance).
+    """
+    out = {}
+    for fid, m in rows.items():
+        v = m.get("replicon", "")
+        out[fid] = (float(REPLICON_CLASSES.index(v))
+                    if v in REPLICON_CLASSES else -1.0)
+    return out
 
 
 def encode_annot_labels(rows: dict[str, dict],
@@ -453,10 +508,18 @@ def build_split(meta: dict[str, dict], val_frac: float, genus_holdout: float,
         rng.shuffle(single_g)
         g_rem = {g: len(s) for g, s in genus_accs.items()}
         s_rem = {s: len(ac) for s, ac in species_accs.items()}
+        # Two validation strata get separate quotas: multi-assembly
+        # species (val_within_species — an unseen assembly of a trained
+        # species) and single-assembly species (val_novel_species — the
+        # species is entirely absent from train). A single shared queue
+        # lets multi-assembly candidates starve the species-novelty
+        # stratum on species-rich corpora (Plan 2 corpus contract), so
+        # multi_sp is capped at half the val budget here.
+        n_multi = min(len(multi_sp), max(1, n_val // 2))
         picked: list[str] = []
         deferred: list[str] = []
-        for a in multi_sp + single_sp_multi_g:
-            if len(picked) >= n_val:
+        for a in multi_sp:
+            if len(picked) >= n_multi:
                 break
             g, s = acc_genus[a], acc_species[a]
             if g and g_rem.get(g, 0) <= 1:
@@ -470,6 +533,15 @@ def build_split(meta: dict[str, dict], val_frac: float, genus_holdout: float,
                 g_rem[g] -= 1
             if s:
                 s_rem[s] -= 1
+        for a in single_sp_multi_g:
+            if len(picked) >= n_val:
+                break
+            g = acc_genus[a]
+            if g and g_rem.get(g, 0) <= 1:
+                continue
+            picked.append(a)
+            if g:
+                g_rem[g] -= 1
         for a in deferred + single_g:
             if len(picked) >= n_val:
                 break
@@ -511,8 +583,14 @@ def build_split(meta: dict[str, dict], val_frac: float, genus_holdout: float,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--fragments", required=True, type=Path)
-    ap.add_argument("--labels", required=True, type=Path)
+    ap.add_argument("--fragments", type=Path, default=None,
+                    help="fragments.fna (required unless --packed)")
+    ap.add_argument("--labels", type=Path, default=None,
+                    help="labels.tsv (default <packed>/labels.tsv)")
+    ap.add_argument("--packed", type=Path, default=None,
+                    help="packed corpus dir from pack_corpus.py "
+                         "(seqs.u8 + seq_offsets.npy + seq_ids.txt); "
+                         "zero-copy mmap, supersedes --cache-seqs")
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--k", type=int, default=7)
     ap.add_argument("--width", type=int, default=64)
@@ -619,26 +697,97 @@ def main():
                          "open()+seek() per sample per epoch; ~1GB per "
                          "900k x 500bp fragments, removes the dataloader "
                          "bottleneck on low-core remote VMs")
+    ap.add_argument("--head-bottleneck", type=int, default=0,
+                    help="ToL: bottleneck flat rank heads whose class "
+                         "count exceeds --bottleneck-min-classes to "
+                         "Linear->LN->GELU->Linear(latent->B->C). "
+                         "Recommended 256 when species > 8192")
+    ap.add_argument("--bottleneck-min-classes", type=int, default=8192,
+                    help="minimum class count before --head-bottleneck "
+                         "applies to a rank head")
+    ap.add_argument("--replicon-head", action="store_true",
+                    help="4-way replicon head {nuclear_or_chrom, "
+                         "mitochondrion, plastid, plasmid_or_viral} "
+                         "from the labels.tsv replicon column")
+    ap.add_argument("--dna-stats", action="store_true",
+                    help="fuse 8 window-level repeat/CpG complexity "
+                         "scalars into the latent (ToL repeat-rich "
+                         "vertebrate/plant windows)")
+    ap.add_argument("--aa-extra-v2", action="store_true",
+                    help="widen the gated aa frame-summary tail from "
+                         "18 to 30 dims (TGA-only ORF frac + AGA/AGG "
+                         "density per frame; ciliate/mito code signal)")
+    ap.add_argument("--amp", choices=["none", "fp16", "bf16", "auto"],
+                    default="auto",
+                    help="mixed precision: auto = bf16 on capability "
+                         ">=8.0, fp16 on older GPUs, none on CPU")
+    ap.add_argument("--resume", type=Path, default=None,
+                    help="checkpoint to resume training from "
+                         "(restores optimizer/scheduler/epoch/best)")
+    ap.add_argument("--resume-auto", action="store_true",
+                    help="resume <out>/last.pt when it exists, else "
+                         "no-op (idempotent SLURM/Kaggle retries)")
+    ap.add_argument("--arch-config", type=Path, default=None,
+                    help="locked arch JSON (e.g. docs/tol-arch-locked.json); "
+                         "its stage1 block becomes the defaults for the "
+                         "matching CLI flags (explicit flags still win)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cpu", action="store_true")
+    # --arch-config defaults must resolve BEFORE parse_args so explicit
+    # CLI flags still override the locked defaults.
+    pre_args, _ = ap.parse_known_args()
+    if pre_args.arch_config:
+        blk = json.loads(pre_args.arch_config.read_text()).get("stage1", {})
+        defaults = {}
+        for k, v in blk.items():
+            k = {"dna_complexity_stats": "dna_stats"}.get(k, k)
+            if isinstance(v, list):
+                v = ",".join(v) if k == "aux" else None
+            if v is not None:
+                defaults[k] = v
+        ap.set_defaults(**defaults)
     args = ap.parse_args()
     if args.region_head:
         print("WARNING: --region-head is retired (intron-vs-intergenic "
               "is resolved in the decoder, not per-window); ignoring.",
               file=sys.stderr)
         args.region_head = False
+    if args.packed is None and args.fragments is None:
+        ap.error("--fragments is required unless --packed DIR is given")
+    labels_path = (args.labels
+                   or (args.packed / "labels.tsv" if args.packed else None))
+    if labels_path is None:
+        ap.error("--labels is required when the packed dir lacks labels.tsv")
 
-    device = "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
-    torch.manual_seed(args.seed)
+    # --- DDP setup: torchrun/SLURM env vars; single-process when absent -
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    ddp = world > 1
+    if ddp:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend)
+        if backend == "nccl":
+            torch.cuda.set_device(local_rank)
+    is_main = rank == 0
+
+    def log(*a, **k):
+        if is_main:
+            print(*a, **k)
+
+    cuda_ok = torch.cuda.is_available() and not args.cpu
+    device = (torch.device("cuda", local_rank) if cuda_ok and ddp
+              else "cuda" if cuda_ok else "cpu")
+    torch.manual_seed(args.seed + rank)
     args.out.mkdir(parents=True, exist_ok=True)
 
-    meta = load_labels(args.labels)
+    meta = load_labels(labels_path)
     val_accs, holdout_genera, val_frags = build_split(
         meta, args.val_frac, args.holdout_genus_frac, args.seed,
         frag_val=args.frag_val)
-    print(f"{len(val_accs)} val genomes, "
-          f"{len(holdout_genera)} holdout genera, "
-          f"{len(val_frags)} frag-val windows")
+    log(f"{len(val_accs)} val genomes, "
+        f"{len(holdout_genera)} holdout genera, "
+        f"{len(val_frags)} frag-val windows")
 
     def is_val(fid, m):
         return (m["accession"] in val_accs
@@ -647,7 +796,7 @@ def main():
 
     train_meta = {k: v for k, v in meta.items() if not is_val(k, v)}
     val_meta = {k: v for k, v in meta.items() if is_val(k, v)}
-    print(f"frags: {len(train_meta)} train / {len(val_meta)} val")
+    log(f"frags: {len(train_meta)} train / {len(val_meta)} val")
 
     # vocab from TRAIN rows only; val rows outside vocab -> -1 (unknown)
     vocab = {r: {} for r in RANKS}
@@ -703,6 +852,15 @@ def main():
                   f"{args.domain_head_k} slots filled")
         annot_train = encode_annot_labels(train_meta, domain_vocab)
         annot_val = encode_annot_labels(val_meta, domain_vocab)
+    annot_w = (ANNOT_BASE + len(domain_vocab)
+               + (1 if domain_vocab else 0))
+    rep_train = rep_val = None
+    if args.replicon_head:
+        rep_train = encode_replicon_labels(train_meta)
+        rep_val = encode_replicon_labels(val_meta)
+        n_rep = sum(1 for v in rep_train.values() if v >= 0)
+        log(f"replicon head: {n_rep} labeled windows "
+            f"({len(REPLICON_CLASSES)} classes)")
 
     use_seq = args.backbone == "seq"
     ms_maps = ({k: build_cell_lut(k) for k in MS_KS},
@@ -724,7 +882,11 @@ def main():
                                min_train_len=args.min_train_len,
                                aa_frame=args.struct_head,
                                annot=annot_train,
-                               cache_seqs=args.cache_seqs)
+                               cache_seqs=args.cache_seqs,
+                               packed=args.packed,
+                               dna_stats=args.dna_stats,
+                               aa_extra_v2=args.aa_extra_v2,
+                               replicon=rep_train)
     val_ds = FragmentDataset(args.fragments, encode_labels(val_meta),
                              args.k, lut, pos=args.pos_channels,
                              targets=cls_targets, cont=cont_val,
@@ -734,13 +896,26 @@ def main():
                              aa_extra=aa_extra,
                              aa_frame=args.struct_head,
                              annot=annot_val,
-                             cache_seqs=args.cache_seqs)
-    pin = device == "cuda"
-    train_ld = DataLoader(train_ds, args.batch_size, shuffle=True,
+                             cache_seqs=args.cache_seqs,
+                             packed=args.packed,
+                             dna_stats=args.dna_stats,
+                             aa_extra_v2=args.aa_extra_v2,
+                             replicon=rep_val)
+    pin = cuda_ok
+    train_sampler = (DistributedSampler(
+        train_ds, num_replicas=world, rank=rank, shuffle=True,
+        seed=args.seed, drop_last=True) if ddp else None)
+    val_sampler = (DistributedSampler(
+        val_ds, num_replicas=world, rank=rank, shuffle=False)
+        if ddp else None)
+    train_ld = DataLoader(train_ds, args.batch_size,
+                          shuffle=train_sampler is None,
+                          sampler=train_sampler,
                           num_workers=args.num_workers, drop_last=True,
                           pin_memory=pin,
                           persistent_workers=args.num_workers > 0)
     val_ld = DataLoader(val_ds, args.batch_size, shuffle=False,
+                        sampler=val_sampler,
                         num_workers=args.num_workers, pin_memory=pin,
                         persistent_workers=args.num_workers > 0)
 
@@ -756,13 +931,64 @@ def main():
                      region_head=args.region_head,
                      struct_head=args.struct_head,
                      domain_k=len(domain_vocab),
-                     annot_ctx=args.annot_ctx).to(device)
+                     annot_ctx=args.annot_ctx,
+                     head_bottleneck=args.head_bottleneck,
+                     bottleneck_min_classes=args.bottleneck_min_classes,
+                     replicon_head=args.replicon_head,
+                     dna_stats=args.dna_stats,
+                     aa_extra_v2=args.aa_extra_v2).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.wd)
     steps = len(train_ld) * args.epochs
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / steps)))
-    amp = device == "cuda"
+    # selective-CE heads: flat heads above the bottleneck threshold
+    # compute logits on labeled rows only (sel_mask in forward)
+    sel_heads = ({t for t in cls_targets
+                  if n_classes[t] > args.bottleneck_min_classes}
+                 if args.head == "flat" and args.head_bottleneck else set())
+    amp_mode = args.amp
+    if amp_mode == "auto":
+        amp_mode = ("bf16" if cuda_ok
+                    and torch.cuda.get_device_capability() >= (8, 0)
+                    else "fp16" if cuda_ok else "none")
+    amp_dtype = {"fp16": torch.float16,
+                 "bf16": torch.bfloat16}.get(amp_mode, torch.bfloat16)
+    amp_on = cuda_ok and amp_mode != "none"
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp_on
+                                                   and amp_mode == "fp16"))
+    if ddp:
+        model = (DDP(model, device_ids=[local_rank])
+                 if cuda_ok else DDP(model))
+    raw_model = model.module if hasattr(model, "module") else model
+
+    # --- resume ---------------------------------------------------------
+    start_ep = 0
+    best = 0.0
+    resume_path = None
+    if args.resume:
+        resume_path = Path(args.resume)
+    elif args.resume_auto and (args.out / "last.pt").exists():
+        resume_path = args.out / "last.pt"
+    if resume_path:
+        ck = torch.load(resume_path, map_location="cpu",
+                        weights_only=False)
+        raw_model.load_state_dict(ck["model"])
+        if ck.get("optimizer"):
+            opt.load_state_dict(ck["optimizer"])
+            for st in opt.state.values():
+                for kk, v in st.items():
+                    if isinstance(v, torch.Tensor):
+                        st[kk] = v.to(device)
+        if ck.get("scheduler"):
+            sched.load_state_dict(ck["scheduler"])
+        if ck.get("scaler"):
+            scaler.load_state_dict(ck["scaler"])
+        start_ep = int(ck.get("epoch", 0))
+        best = float(ck.get("best_metric")
+                     or ck.get("val_mean_acc") or 0.0)
+        log(f"resumed {resume_path} at epoch {start_ep} "
+            f"(best {best:.3f})")
 
     # Device-resident tensors reused across all batches — hoisting them
     # out of the loop avoids a host->device transfer (and implicit sync)
@@ -802,9 +1028,14 @@ def main():
             else:
                 x = x.to(device)
             y, yc = y.to(device), yc.to(device)
-            with torch.autocast("cuda", dtype=torch.bfloat16,
-                                enabled=amp):
-                z, logits = model(x)
+            # selective CE: bottlenecked heads only compute logits for
+            # rows whose labels are present — a 120k-class species head
+            # never materializes [B, C] on fully-masked rows
+            sel_mask = ({t: (y[:, i] != 0)
+                         for i, t in enumerate(cls_targets)
+                         if t in sel_heads} if sel_heads else None)
+            with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
+                z, logits = model(x, sel_mask=sel_mask)
                 # optional P3 annotation-head losses are collected
                 # separately so they can be scaled by --annot-weight
                 # without diluting the taxonomy/cont group
@@ -841,11 +1072,18 @@ def main():
                     # batches whose rank labels are entirely out-of-vocab)
                     terms = []
                     for i, t in enumerate(cls_targets):
-                        if not (y[:, i] != 0).any():
+                        m = y[:, i] != 0
+                        if not m.any():
                             continue
-                        terms.append(F.cross_entropy(
-                            logits[t], y[:, i], ignore_index=0,
-                            label_smoothing=args.label_smoothing))
+                        if sel_mask and t in sel_mask:
+                            # logits[t] holds only the masked rows
+                            terms.append(F.cross_entropy(
+                                logits[t], y[m, i], ignore_index=0,
+                                label_smoothing=args.label_smoothing))
+                        else:
+                            terms.append(F.cross_entropy(
+                                logits[t], y[:, i], ignore_index=0,
+                                label_smoothing=args.label_smoothing))
                 fm = yc[:, 0] >= 0          # coding_frac label present
                 btgt = ((yc[:, 0] > 0) & (yc[:, 0] < 1)).float()
                 if fm.any():
@@ -857,8 +1095,14 @@ def main():
                 if om.any():
                     terms.append(F.mse_loss(torch.sigmoid(
                         logits["offset"][:, 0][om]), yc[om, 1]))
-                if yc.size(1) > 2:          # P3 annotation columns
-                    ya = yc[:, 2:]
+                if "replicon" in logits and yc.size(1) > 2:
+                    rm2 = yc[:, -1] >= 0
+                    if rm2.any():
+                        annot_terms.append(F.cross_entropy(
+                            logits["replicon"][rm2],
+                            yc[rm2, -1].long()))
+                if annot_any:               # P3 annotation columns
+                    ya = yc[:, 2:2 + annot_w]
                     if "region_fracs" in logits:
                         rm = ya[:, 0] >= 0
                         if rm.any():
@@ -908,8 +1152,9 @@ def main():
                         annot_terms).mean()
             if train:
                 opt.zero_grad(set_to_none=True)
-                loss.backward()
-                opt.step()
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
                 sched.step()
             # Batch size from y: x may be a dict (len() would count
             # keys, not samples).
@@ -925,8 +1170,13 @@ def main():
                 for i, t in enumerate(cls_targets):
                     m = y[:, i] != 0  # unknown/NA labels excluded
                     total[t] += m.sum()
-                    correct[t] += (logits[t].argmax(1)[m]
-                                   == y[:, i][m]).sum()
+                    if sel_mask and t in sel_mask:
+                        # logits[t] rows are already the masked rows
+                        correct[t] += (logits[t].argmax(1)
+                                       == y[:, i][m]).sum()
+                    else:
+                        correct[t] += (logits[t].argmax(1)[m]
+                                       == y[:, i][m]).sum()
                 if fm.any():
                     p_frac = torch.sigmoid(logits["coding_frac"][:, 0][fm])
                     frac_err += (p_frac - yc[fm, 0]).detach().abs().sum()
@@ -968,19 +1218,34 @@ def main():
         }
         return float(tot_loss_t) / max(tot_n, 1), accs, extras
 
-    best = 0.0
-    for ep in range(1, args.epochs + 1):
+    for ep in range(start_ep + 1, args.epochs + 1):
         t0 = time.time()
+        if train_sampler is not None:
+            train_sampler.set_epoch(ep)
         tr_loss, _, _ = run(train_ld, train=True)
         va_loss, accs, extras = run(val_ld, train=False)
         msg = "  ".join(f"{t}:{a:.3f}" for t, a in accs.items())
         xmsg = "  ".join(f"{t}:{v:.3f}" for t, v in extras.items())
-        print(f"ep {ep:03d} train {tr_loss:.4f} val {va_loss:.4f} | "
-              f"{msg} | {xmsg} | {time.time()-t0:.0f}s")
+        log(f"ep {ep:03d} train {tr_loss:.4f} val {va_loss:.4f} | "
+            f"{msg} | {xmsg} | {time.time()-t0:.0f}s")
         mean_acc = float(np.mean(list(accs.values())))
-        ckpt = {"model": model.state_dict(), "vocab": vocab,
+        if not is_main:
+            best = max(best, mean_acc)
+            continue
+        # portability contract: unwrap DDP, strip "_orig_mod."/"module."
+        # prefixes, and store fp32 CPU weights so checkpoints load
+        # identically on x86_64, aarch64, CUDA, ROCm and MPS
+        sd = {k: (v.detach().to("cpu", torch.float32)
+                  if v.is_floating_point() else v.detach().cpu())
+              for k, v in raw_model.state_dict().items()}
+        ckpt = {"model": sd, "vocab": vocab,
                 "k": args.k, "targets": all_targets, "epoch": ep,
                 "val_mean_acc": mean_acc,
+                "optimizer": opt.state_dict(),
+                "scheduler": sched.state_dict(),
+                "scaler": (scaler.state_dict() if amp_mode == "fp16"
+                           else None),
+                "best_metric": max(best, mean_acc),
                 "args": {k: str(v) if isinstance(v, Path) else v
                          for k, v in vars(args).items()}}
         # parent_of + flat priors are saved for every head so
@@ -990,7 +1255,9 @@ def main():
             "parent_of": {r: tree["parent_of"][r].tolist()
                           for r in cls_targets},
             "log_prior": {r: tree["log_prior"][r].tolist()
-                          for r in cls_targets}}
+                          for r in cls_targets},
+            "ancestor_of": {r: tree["ancestor_of"][r].tolist()
+                            for r in cls_targets}}
         ckpt["flat_log_prior"] = {
             r: flat_priors[r].tolist() for r in cls_targets}
         if domain_vocab:
@@ -1006,8 +1273,11 @@ def main():
             tmp_ck = args.out / "best.pt.tmp"
             torch.save(ckpt, tmp_ck)
             tmp_ck.replace(args.out / "best.pt")
-    (args.out / "vocab.json").write_text(json.dumps(vocab, indent=1))
-    print(f"done. best mean val acc {best:.3f} -> {args.out}/best.pt")
+    if is_main:
+        (args.out / "vocab.json").write_text(json.dumps(vocab, indent=1))
+        log(f"done. best mean val acc {best:.3f} -> {args.out}/best.pt")
+    if ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

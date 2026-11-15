@@ -64,7 +64,7 @@ import sys
 import tarfile
 import time
 import urllib.request
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -461,7 +461,7 @@ def load_gff_features(gff_path: Path) -> dict[str, dict]:
     """
     feats: dict[str, dict] = defaultdict(
         lambda: {"cds": [], "exon": [], "mrna": [], "rna": [],
-                 "cds_recs": []})
+                 "cds_recs": [], "gcodes": Counter()})
     opener = gzip.open if str(gff_path).endswith(".gz") else open
     with opener(gff_path, "rt", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -486,6 +486,15 @@ def load_gff_features(gff_path: Path) -> dict[str, dict]:
                         parent = tok.split("=", 1)[1]
                     elif tok.startswith("protein_id="):
                         protein = tok.split("=", 1)[1]
+                    elif tok.startswith("transl_table="):
+                        # NCBI genetic-code id on each CDS record; the
+                        # per-seqid majority vote below is the contig's
+                        # declared code (alt-code mito/ciliate contigs)
+                        try:
+                            feats[seqid]["gcodes"][
+                                int(tok.split("=", 1)[1])] += 1
+                        except ValueError:
+                            pass
                 domains = DOMAIN_RE.findall(attrs)
                 try:
                     phase = int(phase)
@@ -870,19 +879,72 @@ def coding_label(seqid: str, frag_start: int, frag_end: int,
 
 
 def iter_fasta_gz(path: Path):
-    name, seq = None, []
+    """Yield (seqid, sequence, full_header) triples from a gzipped FASTA.
+
+    The full header is retained because it carries the replicon
+    description ('plasmid pX', 'mitochondrion, complete genome') used to
+    label each contig's replicon class.
+    """
+    name, hdr, seq = None, "", []
     with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if line.startswith(">"):
                 if name:
-                    yield name, "".join(seq)
-                name = line[1:].split()[0]
+                    yield name, "".join(seq), hdr
+                hdr = line[1:]
+                name = hdr.split()[0]
                 seq = []
             else:
                 seq.append(line)
     if name:
-        yield name, "".join(seq)
+        yield name, "".join(seq), hdr
+
+
+REPLICON_CLASSES = ["nuclear_or_chrom", "mitochondrion", "plastid",
+                    "plasmid_or_viral"]
+
+
+def replicon_of(header: str, group: str) -> str:
+    """Classify a contig's replicon from its FASTA header + NCBI group.
+
+    The 4-way head is intentionally coarse: plasmids and linear/circular
+    viral genomes share one class because both are non-chromosomal
+    replicons with mobile-Genetic-element sequence signatures, and the
+    downstream consumer (per-contig genetic-code priors + contig-level
+    taxonomy) only needs organelle-vs-extra-chromosomal separation.
+    """
+    h = header.lower()
+    if "mitochondr" in h:
+        return "mitochondrion"
+    if "chloroplast" in h or "plastid" in h:
+        return "plastid"
+    if "plasmid" in h:
+        return "plasmid_or_viral"
+    if group == "viral":
+        return "plasmid_or_viral"
+    return "nuclear_or_chrom"
+
+
+# rankedlineage.dmp has no 'realm' column: NCBI viral kingdoms live at
+# realm rank, so viral taxids arrive with empty superkingdom/kingdom and
+# eukaryotic groups can arrive with empty kingdom. Backfill DOMAIN only
+# (the model's top rank) from the NCBI group so gap-bridging
+# ancestor_of chains can still project phylum->domain; kingdom stays
+# empty -- it is not a model rank and protist kingdoms are genuinely
+# polyphyletic, so inventing one would corrupt lineages.
+GROUP_DOMAIN = {"archaea": "Archaea", "bacteria": "Bacteria",
+                "viral": "Viruses"}
+
+
+def tax_domain_fallback(tax: dict, group: str) -> dict:
+    """Return a copy of the lineage with an empty domain backfilled
+    from the NCBI group (viral realm fix + euk kingdom-gap anchor)."""
+    if tax.get("domain"):
+        return tax
+    rec = dict(tax)
+    rec["domain"] = GROUP_DOMAIN.get(group, "Eukaryota")
+    return rec
 
 
 def slice_fragments(seq: str, lo: int, hi: int,
@@ -1255,11 +1317,17 @@ def slice_assembly(row: dict, gdir: Path, args, cache: Path):
         # --nt-budget is per ACCESSION; each seqid draws a
         # length-proportional share so every nucleotide position is
         # equally likely to be sampled regardless of contig count.
-        seq_lens = {s: len(q) for s, q in iter_fasta_gz(fna)}
+        seq_lens = {s: len(q) for s, q, _h in iter_fasta_gz(fna)}
         total_len = sum(seq_lens.values())
         frags = []
+        seq_meta: dict[str, tuple] = {}
         n_veu_unmatched = 0
-        for seqid, seq in iter_fasta_gz(fna):
+        for seqid, seq, hdr in iter_fasta_gz(fna):
+            # per-contig genetic code: majority transl_table across CDS
+            # records (default 1 when the GFF lacks CDS or declares none)
+            gc_votes = feats.get(seqid, {}).get("gcodes")
+            gcode = (gc_votes.most_common(1)[0][0] if gc_votes else 1)
+            seq_meta[seqid] = (replicon_of(hdr, row["group"]), gcode)
             seq_budget = round(acc_budget * len(seq) / total_len)
             if veu:
                 iv = veupath_intervals(veu, alias_groups, seqid)
@@ -1295,7 +1363,7 @@ def slice_assembly(row: dict, gdir: Path, args, cache: Path):
                 cands = rng.sample(mixed, n_b) + rng.sample(pure, n_nb)
             frags.extend((seqid, s, e, frag, stats)
                          for s, e, frag, stats in cands)
-        return row, label_source, frags, n_veu_unmatched
+        return row, label_source, frags, n_veu_unmatched, seq_meta
     finally:
         for name in (f"{acc}.fna.gz", f"{acc}.fna.gz.part",
                      f"{acc}.gff.gz", f"{acc}.gff.gz.part"):
@@ -1579,11 +1647,15 @@ def main():
                         "boundary", "n_boundaries", "boundary_offset"] +
                        RANKS +
                        ["intron_frac", "rna_frac", "active_frame",
-                        "struct_flags", "domain_ids"])
+                        "struct_flags", "domain_ids",
+                        "replicon", "gcode"])
         for i in sorted(results):
-            row, label_source, frags, n_veu_unmatched = results[i]
-            tax = (row.get("_gtdb_lin")
-                   or tax_map.get(row.get("species_taxid", ""), {}))
+            row, label_source, frags, n_veu_unmatched, seq_meta = \
+                results[i]
+            tax = tax_domain_fallback(
+                row.get("_gtdb_lin")
+                or tax_map.get(row.get("species_taxid", ""), {}),
+                row["group"])
             for seqid, s, e, frag, stats in frags:
                 fid = f"{row['assembly_accession']}|{seqid}|{s}-{e}"
                 new_fids.add(fid)
@@ -1616,6 +1688,8 @@ def main():
                     intr_s = rna_s = frame_s = flag_s = dom_s = "NA"
                 cod = ("NA" if stats is None else
                        "coding" if frac >= 0.5 else "non-coding")
+                rep_s, gcode_i = seq_meta.get(
+                    seqid, ("nuclear_or_chrom", 1))
                 w.writerow([fid, row["assembly_accession"], seqid, s, e,
                             len(frag), row.get("species_taxid", ""),
                             row["group"], row.get("_rank_unresolved", "0"),
@@ -1623,7 +1697,8 @@ def main():
                             cod, label_source,
                             frac_s, bnd_s, nb_s, boff_s] +
                            [tax.get(r, "") or "" for r in RANKS] +
-                           [intr_s, rna_s, frame_s, flag_s, dom_s])
+                           [intr_s, rna_s, frame_s, flag_s, dom_s,
+                            rep_s, str(gcode_i)])
                 n_frags += 1
             if n_veu_unmatched:
                 print(f"  {row['assembly_accession']}: "

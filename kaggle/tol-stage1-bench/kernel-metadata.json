@@ -1,0 +1,15 @@
+{
+  "id": "daniellecallan/omniphyl-tol-stage1-bench",
+  "title": "omniphyl-tol-stage1-bench",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "daniellecallan/omniphyl-tol-mini"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

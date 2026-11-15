@@ -12,15 +12,17 @@ import json
 import math
 import os
 import pickle
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
-from .encode import STOPS, STARTS
+from .encode import STOPS, STARTS, GCODE_STOPS, GCODE_STARTS
 from .io import (ContigEvidence, iter_sequences, load_lexicmap_evidence,
                  revcomp, write_gff3)
-from .model import BatchPredictions, OmniPhylPredictor, RANKS
+from .model import (BatchPredictions, OmniPhylPredictor, RANKS,
+                    REPLICON_CLASSES)
 
 REGION_NAMES = ("coding", "intron", "rna", "intergenic")
 FLAG_NAMES = ("start", "stop", "donor", "acceptor")
@@ -39,7 +41,12 @@ WINDOW_GROUP_MAX = 8192
 # OOM). 4096 rows x ~52k classes x 4B ~= 0.85 GB per rank.
 PRED_SUBBATCH = 4096
 
-_CODE4_STOPS = {"TAA", "TAG"}  # TGA->Trp in genetic code 4
+# Genetic-code inference: stop-reassigned codes are scored by LLR over
+# in-frame codons pooled from confident coding bins; codes that keep the
+# standard stops are stop-indistinguishable and come from a
+# taxon/replicon lookup. See infer_gcode below.
+STOP_REASSIGNED = (2, 4, 5, 6, 25)
+STANDARD_STOP_LOOKUP = (11, 12)
 
 # Evidence streams that --ablate can disable to audit each head's
 # contribution to decoded output. Track streams are zeroed on the fused
@@ -73,6 +80,8 @@ class ContigResult:
     taxon: object = None          # TaxonCall
     n_windows: int = 0
     genes: list = field(default_factory=list)
+    replicon: str = "nuclear_or_chrom"
+    gcode: int = 1
 
 
 def _window_starts(L: int, W: int, S: int) -> list[int]:
@@ -85,7 +94,130 @@ def _window_starts(L: int, W: int, S: int) -> list[int]:
 
 
 def _gcode_stops(gcode: int) -> set:
-    return _CODE4_STOPS if gcode == 4 else STOPS
+    return GCODE_STOPS.get(gcode, GCODE_STOPS[1])
+
+
+def _scan_codon_counts(seq: str, res: ContigResult) -> tuple:
+    """(Counter of in-frame ACGT triplets, total) over bins where the
+    fused tracks are confidently coding (p_coding > 0.8).
+
+    The terminal stop of every gene lives INSIDE its last coding bin,
+    so a standard-code contig shows roughly equal counts of TAA/TAG/TGA
+    at terminal-stop rate -- under the LLR below that cancels out; only
+    a genuinely reassigned codon (present at sense-codon rate) can push
+    a candidate code positive.
+    """
+    B = res.bin_width
+    counts: Counter = Counter()
+    total = 0
+    gstar = res.p_frame[:, :6].argmax(1)
+    for b in range(res.n_bins):
+        if res.p_coding[b] <= 0.8:
+            continue
+        g = int(gstar[b])
+        off = g if g < 3 else g - 3
+        for x in range(b * B + off,
+                       min((b + 1) * B, res.length) - 2, 3):
+            # minus frame: codon occupies genomic [x, x+3) with
+            # (x+3) == (g-3) mod 3; read the triplet on the
+            # transcript strand
+            tri = (seq[x:x + 3] if g < 3
+                   else revcomp(seq[x:x + 3])).upper()
+            if len(tri) == 3 and set(tri) <= set("ACGT"):
+                counts[tri] += 1
+                total += 1
+    return counts, total
+
+
+def _gcode_llr(counts: Counter, g: int) -> float:
+    """LLR of genetic code g vs code 1 from stop-codon evidence.
+
+    Model: an in-frame triplet inside confident coding material is a
+    sense codon at ~1/61 under 'sense' and eps=1e-4 under 'stop'. For
+    every codon the candidate reassigns (stop in 1, sense in g) each
+    observation adds log((1/61)/eps); for every codon that is a stop
+    ONLY under g, each observation subtracts the same. Codons identical
+    under both codes cancel. Driven entirely by GCODE_STOPS so new
+    codes need no bespoke logic.
+    """
+    gain = math.log((1.0 / 61) / 1e-4)
+    s1, sg = GCODE_STOPS[1], GCODE_STOPS[g]
+    reassigned = s1 - sg          # stop in 1, sense in g -> +gain each
+    extra = sg - s1               # sense in 1, stop in g -> -gain each
+    return gain * (sum(counts.get(c, 0) for c in reassigned)
+                   - sum(counts.get(c, 0) for c in extra))
+
+
+def _gcode_prior(taxon_names: dict, replicon: str) -> dict:
+    """log-priors over LLR-scored codes from taxon + replicon context.
+
+    Stop evidence alone cannot separate codes with identical stop sets
+    (4 vs 25 both reassign only TGA; both bacterial). Priors break the
+    tie toward the biologically attested host lineage; a strong LLR
+    still overrides them.
+    """
+    names = " ".join(n.lower() for n in taxon_names.values())
+    p = {g: -3.0 for g in STOP_REASSIGNED}
+    if replicon == "mitochondrion":
+        # metazoan mt codes: chordates -> 2, other metazoa -> 5;
+        # protist/algal mito occasionally use 4, never 6/25 here
+        p[2] = p[5] = -0.5
+        p[2 if ("chordata" in names or "vertebrata" in names)
+          else 5] = 0.0
+        p[4] = -2.0
+    elif replicon == "plasmid_or_viral":
+        p[4] = p[25] = -1.0
+    elif "bacteria" in names or "archaea" in names:
+        # Mollicutes -> 4, SR1/Gracilibacteria -> 25; absent lineage
+        # detail, 25 is the generic bacterial TGA code
+        p[4] = (-0.5 if any(k in names for k in
+                            ("mollicutes", "mycoplasma", "spiroplasma"))
+                else -1.5)
+        p[25] = -1.0
+    else:
+        # eukaryotic nuclear (and unknown-taxonomy contigs): ciliate
+        # nuclear code 4 / 6 are the only attested reassignments
+        p[4] = p[6] = -0.5
+    return p
+
+
+def _gcode_lookup(taxon_names: dict, replicon: str) -> int:
+    """Standard-stop code from taxon/replicon when LLR cannot run.
+
+    Codes 11 (Bacteria/Archaea/plastid incl. plasmid & phage contigs)
+    and 12 (CUG->Ser yeasts) share the standard stop set, so codon
+    counts cannot detect them -- they are assigned by lineage.
+    """
+    names = " ".join(n.lower() for n in taxon_names.values())
+    if replicon == "plastid":
+        return 11
+    if "saccharomyc" in names:
+        return 12
+    if (replicon == "plasmid_or_viral"
+            or "bacteria" in names or "archaea" in names):
+        return 11
+    return 1
+
+
+def infer_gcode(taxon_names: dict, replicon: str,
+                counts: Counter, total: int) -> int:
+    """Pick the genetic code for one contig.
+
+    With >=1000 scorable in-frame codons the LLR over stop-reassigned
+    candidates decides (code-1 baseline wins ties); below that the
+    taxon/replicon lookup provides a prior-only call.
+    """
+    if total < 1000:
+        return _gcode_lookup(taxon_names, replicon)
+    prior = _gcode_prior(taxon_names, replicon)
+    best, best_v = 1, 0.0
+    for g in STOP_REASSIGNED:
+        v = _gcode_llr(counts, g) + prior.get(g, -3.0)
+        if v > best_v:
+            best, best_v = g, v
+    if best != 1:
+        return best
+    return _gcode_lookup(taxon_names, replicon)
 
 
 def _n_frac(seq: str) -> float:
@@ -114,7 +246,8 @@ def _merge_preds(parts: list) -> BatchPredictions:
         region_fracs=cat("region_fracs"),
         active_frame=cat("active_frame"),
         struct_flags=cat("struct_flags"),
-        domains=None)
+        domains=None,
+        replicon=cat("replicon"))
 
 
 def run_annotate(model_path, fasta_path, out_prefix: Path,
@@ -236,6 +369,12 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
                     d["pood"][t] = (d["pood"].get(t, 0.0) +
                                     bp_i.p_ood[t][wi].astype(
                                         np.float64).sum())
+                if bp_i.replicon is not None:
+                    # 4-way replicon head: pooled per contig alongside
+                    # the taxonomy sums (feeds the gcode prior below)
+                    d["rep"] = (d.get("rep", 0.0) +
+                                bp_i.replicon[wi].sum(
+                                    0, dtype=np.float64))
                 if not tracks_only:
                     if bp_i.domains is not None:
                         dom_by_contig[ci].append(bp_i.domains[wi])
@@ -316,47 +455,50 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
     for ci, res in enumerate(results):
         d = tax_by_contig.get(ci)
         res.taxon = _pooled_call(d, d["n"]) if d else None
+        if d is not None and d.get("rep") is not None:
+            res.replicon = REPLICON_CLASSES[int(np.argmax(d["rep"]))]
 
-    # ---------------- Step 4b: genetic-code inference -----------------------
+    # ---------------- Step 4b: per-contig genetic-code inference ----------
+    # LLR over stop-reassigned codes {2,4,5,6,25} on the fused coding
+    # tracks (see infer_gcode); standard-stop codes {11,12} come from a
+    # taxon/replicon lookup. Contigs without an active-frame track or
+    # with <1000 scorable codons use the lookup / pooled call. `gcode`
+    # stays the genome-level pooled code for reports and res.pkl dumps.
     gcode = 1
     if genetic_code not in ("auto", "1"):
         gcode = int(genetic_code)
+        for res in results:
+            res.gcode = gcode
     else:
-        n_cod = {"TAA": 0, "TAG": 0, "TGA": 0}
-        total = 0
+        tot_counts: Counter = Counter()
+        tot_n = 0
+        pooled_names = genome_call.names if genome_call else {}
+        gcode = None
         for ci, res in enumerate(results):
-            if not has_af[0]:
-                break
-            seq = contig_seqs[res.contig]
-            gstar = res.p_frame[:, :6].argmax(1)
-            for b in range(res.n_bins):
-                if res.p_coding[b] <= 0.8:
-                    continue
-                g = int(gstar[b])
-                off = g if g < 3 else g - 3
-                for x in range(b * B + off,
-                               min((b + 1) * B, res.length) - 2, 3):
-                    # minus frame: codon occupies genomic [x, x+3) with
-                    # (x+3) ≡ (g-3) mod 3 → x ≡ off; read the triplet on
-                    # the transcript strand
-                    tri = (seq[x:x + 3] if g < 3
-                           else revcomp(seq[x:x + 3])).upper()
-                    if tri in STOPS:
-                        n_cod[tri] += 1
-                        total += 1
-                    elif set(tri) <= set("ACGT"):
-                        total += 1
-        if total >= 1000 and (n_cod["TAA"] + n_cod["TAG"]) / total < 0.002 \
-                and n_cod["TGA"] / total > 0.02:
-            gcode = 4
+            names = res.taxon.names if res.taxon else pooled_names
+            if has_af[0]:
+                counts, total = _scan_codon_counts(
+                    contig_seqs[res.contig], res)
+                res.gcode = infer_gcode(names, res.replicon,
+                                        counts, total)
+                tot_counts.update(counts)
+                tot_n += total
+            else:
+                res.gcode = _gcode_lookup(names, res.replicon)
+        gcode = (infer_gcode(pooled_names, "nuclear_or_chrom",
+                             tot_counts, tot_n)
+                 if results else 1)
     if verbose:
-        print(f"omniphyl annotate: genetic code = {gcode}")
+        seen = Counter(r.gcode for r in results)
+        print(f"omniphyl annotate: genetic code = {gcode} "
+              f"(per-contig: {dict(sorted(seen.items()))})")
+
+    stops = _gcode_stops(gcode)
 
     # ---------------- Step 4c: Stage-2 gene decoding -------------------------
     # tracks_only skips ORF/splice decoding entirely: the bin-grid
     # tracks (coding_regions.bed, frame/coding/boundary bedGraphs) are
     # written from the fused Stage-1 signals alone.
-    stops = _gcode_stops(gcode)
     refiner = None
     if not tracks_only and not no_refiner:
         # a bundled "refiner" key in the Stage-1 ckpt, or an explicit
@@ -380,23 +522,29 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
                         ("Bacteria", "Archaea", "Viruses")))
             hints = (evidence.get(res.contig).intron_candidates
                      if res.contig in evidence else [])
+            # per-contig code: the replicon-aware stops/starts for THIS
+            # contig (a mitochondrion inside a euk assembly decodes
+            # under its own code, not the nuclear majority)
+            c_stops = _gcode_stops(res.gcode)
+            mt = res.replicon == "mitochondrion"
             if refiner is not None:
                 from .refiner import decode_with_refiner
                 res.genes = decode_with_refiner(
-                    refiner, seq, res, stops=stops,
-                    euk=euk and not prok, gcode=gcode, w_ev=w_ev,
+                    refiner, seq, res, stops=c_stops,
+                    euk=euk and not prok, gcode=res.gcode, w_ev=w_ev,
                     min_cds_len=min_cds_len,
                     coding_threshold=coding_threshold,
                     min_intron=min_intron, max_intron=max_intron,
                     intron_hints=hints,
                     # prokaryotic contigs legitimately initiate at
-                    # GTG/TTG; the site head fires on them (labels are
-                    # GFF boundaries), only the ORF scan gated them out
-                    starts=STARTS if prok else ("ATG",),
+                    # GTG/TTG; mitochondria also use expanded start
+                    # sets (ATA/ATT/ATC/GTG under codes 2/5)
+                    starts=(GCODE_STARTS.get(res.gcode, STARTS)
+                            if prok or mt else ("ATG",)),
                     device=pred.device)
             else:
                 res.genes = _decode_genes(
-                    seq, res, stops=stops, euk=euk and not prok,
+                    seq, res, stops=c_stops, euk=euk and not prok,
                     w_ev=w_ev, min_cds_len=min_cds_len,
                     coding_threshold=coding_threshold,
                     boundary_threshold=boundary_threshold,

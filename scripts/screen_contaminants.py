@@ -12,6 +12,10 @@ Two layers (no external dependencies — pure Python + stdlib):
      UniVec core (vector/adapter).  Sketches are built on first run and cached.
      The human sketch is large (~1 GB of 21-mers for the full genome); use
      --human-fasta to point at a local GRCh38 FASTA, or omit to skip this layer.
+     The human screen is clade-aware: chordate fragments (phylum Chordata,
+     or the vertebrate_* RefSeq groups when the rank columns are empty)
+     are exempt — shared vertebrate genes would otherwise false-reject
+     legitimate corpus members.  UniVec/phiX apply to every clade.
      Accessions that are themselves a contaminant species (most fragments hit)
      are exempted rather than deleted — see --contam-acc-frac.
 
@@ -204,6 +208,25 @@ def load_contaminant_sketches(cache_dir: Path,
 
 
 # ---------------------------------------------------------------------------
+# Clade gating for the human screen
+# ---------------------------------------------------------------------------
+
+# RefSeq groups that are entirely chordate -- used only when the rank
+# columns in labels.tsv are empty (unresolved taxonomy).
+_CHORDATE_GROUPS = {"vertebrate_mammalian", "vertebrate_other"}
+
+
+def is_chordate(meta: dict) -> bool:
+    """True when the fragment's labelled lineage is Chordata: the
+    GRCh38 containment screen must not reject genuine vertebrate
+    sequence — conserved protein-coding k-mers legitimately share
+    21-mers with human."""
+    if meta.get("phylum"):
+        return meta["phylum"] == "Chordata"
+    return meta.get("group") in _CHORDATE_GROUPS
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -271,11 +294,15 @@ def main():
 
         frag_k = kmers(seq_upper)
 
-        # Layer 2: known contaminants
+        # Layer 2: known contaminants (human sketch skipped for
+        # chordate fragments — see is_chordate)
         if not args.skip_contaminant_check:
+            chordate = is_chordate(meta)
             hit = None
             hit_score = 0.0
             for cname, csk in cont_sketches.items():
+                if cname == "human_GRCh38" and chordate:
+                    continue
                 sc = containment(frag_k, csk)
                 if sc > args.max_cont_hit and sc > hit_score:
                     hit, hit_score = cname, sc

@@ -847,16 +847,17 @@ def test_refiner():
     n_par = sum(p.numel() for p in ref.parameters())
     check("refiner param count", 5e5 <= n_par <= 3e6, n_par)
     rng = np.random.default_rng(0)
-    sl, tl = ref(torch.from_numpy(
+    sl, tl, pl = ref(torch.from_numpy(
         rng.standard_normal((2, 22, 1024)).astype(np.float32)),
         torch.zeros(2, N_COND))
+    check("v1 forward phase is None", pl is None)
     check("refiner out shapes", sl.shape == (2, 7, 1024)
           and tl.shape == (2, 8, 1024), (sl.shape, tl.shape))
 
     # ---- label conventions + RC flip
     rows = [("t1", "+", (300, 600)), ("t1", "+", (700, 1000)),
             ("t2", "-", (1101, 1200)), ("t2", "-", (1300, 1600))]
-    st, si = build_refiner_labels(rows, 2000)
+    st, si, ph = build_refiner_labels(rows, 2000)
     check("cds+ state", st[350] == 1 and st[750] == 1)
     check("int+ state", st[650] == 2)
     check("cds- state", st[1150] == 3 and st[1400] == 3)

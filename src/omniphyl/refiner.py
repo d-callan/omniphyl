@@ -28,12 +28,16 @@ from .model import RANKS
 
 # ------------------------------------------------------------- spec ----
 
-CHUNK = 8192
-CHUNK_STRIDE = 6144
+CHUNK = 32768
+CHUNK_STRIDE = 24576
 N_CHANNELS = 22
 N_COND = 21
 N_STATES = 7
 N_SITES = 8
+N_PHASE = 6                   # codon phase 0/1/2 x strand
+# v1 checkpoints predate chunked-track config; they are always
+# replayed at their original geometry
+V1_CHUNK, V1_CHUNK_STRIDE = 8192, 6144
 
 # state posteriors (strand-normalized on -)
 ST_INTERGENIC = 0
@@ -59,6 +63,38 @@ DEC_FALLBACK_LEN = 0     # extra acceptor horizon for the site-maxima
                          # fallback when no state run exists; 0 = legacy
                          # (only introns of ~min_intron..min_intron+15
                          # are reachable through the fallback)
+DEC_MIN_EXON = 9         # micro-exon floor: an intron-run dip shorter
+                         # than this cannot be a real exon separating
+                         # two introns (was implicitly min_intron=35,
+                         # which fused runs across micro-exons)
+DEC_BRIDGE_PINT = 0.15   # mean intron posterior over a locus gap that
+                         # bridges two adjacent loci (long introns
+                         # whose state signal decays mid-span split a
+                         # gene into two loci otherwise)
+
+METAZOAN_PHYLA = frozenset({
+    "chordata", "arthropoda", "nematoda", "mollusca", "annelida",
+    "platyhelminthes", "cnidaria", "echinodermata", "porifera",
+    "nemertea", "rotifera", "bryozoa", "brachiopoda", "ctenophora",
+    "tardigrada", "onychophora", "priapulida", "kinorhyncha"})
+
+
+def clade_max_intron(res) -> int:
+    """Clade-conditioned intron length cap.
+
+    Metazoan genes carry introns well past 10 kb (Drosophila/human
+    extremes reach ~100 kb); protist/fungal genomes rarely exceed a
+    few kb; bacteria/archaea/viruses essentially never splice beyond
+    operon gaps. A single global cap either truncates real metazoan
+    introns or floods prokaryotic loci with absurd candidates.
+    """
+    names = getattr(getattr(res, "taxon", None), "names", {}) or {}
+    dom = names.get("domain", "")
+    if dom in ("Bacteria", "Archaea", "Viruses"):
+        return 5_000
+    if names.get("phylum", "").lower() in METAZOAN_PHYLA:
+        return 50_000
+    return 15_000
 
 
 def _chunk_starts(L: int, chunk: int = CHUNK,
@@ -193,7 +229,7 @@ def build_contig_cond(res: ContigResult, seq: str,
     4     mean coding mass      5  coding fraction >= 0.5
     6     max-frame share on coding bins
     7     mean splice-impulse mass on coding bins
-    8     contig GC             9  genetic code == 4
+    8     contig GC             9  non-standard genetic code
     10    evidence present      11 log10(length)/7
     12-18 per-rank resolution confidence (Stage-1 path_conf over
           domain..species) -- HOW DEEP the base model resolved, not
@@ -223,7 +259,7 @@ def build_contig_cond(res: ContigResult, seq: str,
             res.b_tracks[cod_bins, 2:4].sum(1)).mean())
     su = seq.upper()
     cond[8] = (su.count("G") + su.count("C")) / max(len(su), 1)
-    cond[9] = 1.0 if gcode == 4 else 0.0
+    cond[9] = 0.0 if gcode in (1, 11) else 1.0
     cond[10] = 1.0 if len(res.dtilde) and float(res.dtilde.max()) > 0 \
         else 0.0
     cond[11] = min(1.0, math.log10(max(res.length, 100)) / 7.0)
@@ -263,51 +299,104 @@ class RefinerResBlock(nn.Module):
 class OmniPhylRefiner(nn.Module):
     """Per-nucleotide Stage-2 refiner.
 
-    stem(22->96) -> 6 FiLM-conditioned dilated res blocks
-    (d=1..32, receptive field ~1.3 kb) -> 4x-downsampled BiGRU
-    (context ~4 kb both directions) -> linear upsample -> per-base
-    heads: state softmax [7], boundary-site logits [8] (start, stop,
-    donor, acceptor x strand).
+    stem(22->96) -> FiLM-conditioned dilated res blocks -> two-scale
+    pyramid: BiGRU at ``rnn_pool``x downsample + Transformer encoder at
+    ``tfm_pool``x downsample -> linear upsample + residual add ->
+    per-base heads: state softmax [7], boundary-site logits [8],
+    codon-phase logits [6] (when ``n_phase`` > 0).
+
+    Constructor defaults reproduce the v1 graph (6 blocks d=1..32, 4x
+    BiGRU, no transformer, no phase head) so older checkpoints rebuild
+    exactly; v2 geometry arrives through the checkpoint config
+    (``dilations=(1..128)``, ``rnn_pool=8``, ``tfm_pool=64``,
+    ``tfm_layers=2``, ``n_phase=6``).
     """
 
     def __init__(self, c_in: int = N_CHANNELS, cond_dim: int = N_COND,
                  hidden: int = 96, n_states: int = N_STATES,
-                 n_sites: int = N_SITES):
+                 n_sites: int = N_SITES, n_phase: int = 0,
+                 dilations=(1, 2, 4, 8, 16, 32), rnn_pool: int = 4,
+                 tfm_pool: int = 64, tfm_layers: int = 0,
+                 nhead: int = 4):
         super().__init__()
+        self.dilations = tuple(dilations)
+        self.rnn_pool = int(rnn_pool)
+        self.tfm_pool = int(tfm_pool)
+        self.tfm_layers = int(tfm_layers)
+        self.nhead = int(nhead)
+        self.n_phase = int(n_phase)
         self.stem = nn.Sequential(
             nn.Conv1d(c_in, hidden, 7, padding=3),
             nn.GroupNorm(8, hidden), nn.GELU())
         self.blocks = nn.ModuleList(
             RefinerResBlock(hidden, d, cond_dim)
-            for d in (1, 2, 4, 8, 16, 32))
+            for d in self.dilations)
         self.rnn = nn.GRU(hidden, hidden, batch_first=True,
                           bidirectional=True)
         self.rnn_proj = nn.Linear(2 * hidden, hidden)
+        self.tfm = None
+        if self.tfm_layers:
+            layer = nn.TransformerEncoderLayer(
+                d_model=hidden, nhead=self.nhead,
+                dim_feedforward=4 * hidden, batch_first=True,
+                norm_first=True, activation="gelu")
+            self.tfm = nn.TransformerEncoder(
+                layer, num_layers=self.tfm_layers)
         self.head_state = nn.Conv1d(hidden, n_states, 1)
         self.head_site = nn.Conv1d(hidden, n_sites, 3, padding=1)
+        self.head_phase = (nn.Conv1d(hidden, n_phase, 1)
+                           if n_phase else None)
 
     def forward(self, x, cond):
         h = self.stem(x)                              # [B, C, L]
         for blk in self.blocks:
             h = blk(h, cond)
         L = h.shape[-1]
-        z = F.avg_pool1d(h, 4, 4)                     # [B, C, L/4]
-        z, _ = self.rnn(z.transpose(1, 2))            # [B, L/4, 2C]
-        z = self.rnn_proj(z).transpose(1, 2)          # [B, C, L/4]
-        z = F.interpolate(z, size=L, mode="linear",
-                          align_corners=False)
-        h = h + z
-        return self.head_state(h), self.head_site(h)
+        # two-scale context pyramid: mid-scale BiGRU captures
+        # exon/intron-length context; the coarse transformer scale
+        # spans gene-length context a 32k chunk's conv stack cannot
+        z = F.avg_pool1d(h, self.rnn_pool, self.rnn_pool)
+        z, _ = self.rnn(z.transpose(1, 2))
+        z = self.rnn_proj(z).transpose(1, 2)
+        h = h + F.interpolate(z, size=L, mode="linear",
+                              align_corners=False)
+        if self.tfm is not None:
+            t = F.avg_pool1d(h, self.tfm_pool, self.tfm_pool)
+            t = self.tfm(t.transpose(1, 2)).transpose(1, 2)
+            h = h + F.interpolate(t, size=L, mode="linear",
+                                  align_corners=False)
+        pl = (self.head_phase(h) if self.head_phase is not None
+              else None)
+        return self.head_state(h), self.head_site(h), pl
+
+
+def refiner_config(refiner: OmniPhylRefiner) -> dict:
+    """Checkpoint config describing this instance's full geometry.
+    Shared by save_refiner and train_refiner's Stage-1 bundle path so
+    the two serialization formats can never drift apart."""
+    return {"c_in": N_CHANNELS, "cond_dim": N_COND,
+            "hidden": refiner.head_state.in_channels,
+            "n_states": refiner.head_state.out_channels,
+            "n_sites": refiner.head_site.out_channels,
+            "n_phase": refiner.n_phase,
+            "dilations": list(refiner.dilations),
+            "rnn_pool": refiner.rnn_pool,
+            "tfm_pool": refiner.tfm_pool,
+            "tfm_layers": refiner.tfm_layers,
+            "nhead": refiner.nhead,
+            "chunk": getattr(refiner, "chunk", CHUNK),
+            "chunk_stride": getattr(refiner, "chunk_stride",
+                                    CHUNK_STRIDE),
+            "cond_mode": getattr(refiner, "cond_mode", "full")}
 
 
 def save_refiner(refiner: OmniPhylRefiner, path, extra: dict = None):
-    torch.save({"format": "omniphyl-refiner-v1",
-                "model": refiner.state_dict(),
-                "config": {"c_in": N_CHANNELS, "cond_dim": N_COND,
-                           "hidden": 96, "n_states": N_STATES,
-                           "n_sites": N_SITES,
-                           "cond_mode": getattr(refiner, "cond_mode",
-                                                "full")},
+    """Serialize with full geometry so the checkpoint replays on any
+    hardware: unwrapped float32 weights + JSON-primitive config only."""
+    torch.save({"format": "omniphyl-refiner-v2",
+                "model": {k: v.detach().cpu().float()
+                          for k, v in refiner.state_dict().items()},
+                "config": refiner_config(refiner),
                 **(extra or {})}, path)
 
 
@@ -319,11 +408,18 @@ def load_refiner(source, device: str = "cpu") -> OmniPhylRefiner:
     if "refiner" in ck:
         ck = ck["refiner"]
     cfg = ck.get("config", {})
+    v1 = ck.get("format", "omniphyl-refiner-v1") == \
+        "omniphyl-refiner-v1"
     ref = OmniPhylRefiner(**{k: cfg[k] for k in
                              ("c_in", "cond_dim", "hidden", "n_states",
-                              "n_sites") if k in cfg})
+                              "n_sites", "n_phase", "dilations",
+                              "rnn_pool", "tfm_pool", "tfm_layers",
+                              "nhead") if k in cfg})
     ref.load_state_dict(ck["model"])
     ref.cond_mode = cfg.get("cond_mode", "full")
+    ref.chunk = int(cfg.get("chunk", V1_CHUNK if v1 else CHUNK))
+    ref.chunk_stride = int(cfg.get(
+        "chunk_stride", V1_CHUNK_STRIDE if v1 else CHUNK_STRIDE))
     return ref.to(device).eval()
 
 
@@ -332,9 +428,10 @@ def refiner_tracks(refiner: OmniPhylRefiner, seq: str,
                    res: ContigResult, w_ev: float = 0.25,
                    gcode: int = 1, device: str = "cpu",
                    batch_size: int = 8):
-    """Slide the refiner over a contig in 8192-bp chunks (stride 6144),
-    blending overlaps with a raised-cosine taper. Returns
-    (p_state [L,7], p_site [L,8]) float32."""
+    """Slide the refiner over a contig in checkpoint-configured
+    chunks (v2: 32768 bp / stride 24576; v1 ckpts replay at
+    8192/6144), blending overlaps with a raised-cosine taper.
+    Returns (p_state [L,7], p_site [L,8], p_phase [L,6] or None)."""
     L = len(seq)
     cond_np = apply_cond_mode(build_contig_cond(res, seq, gcode),
                               getattr(refiner, "cond_mode", "full"))
@@ -342,29 +439,39 @@ def refiner_tracks(refiner: OmniPhylRefiner, seq: str,
     # appended at the end, so a plain prefix slice stays compatible
     exp = refiner.blocks[0].film.in_features
     cond = torch.from_numpy(cond_np[:exp])[None].to(device)
-    starts = _chunk_starts(L)
+    chunk = getattr(refiner, "chunk", CHUNK)
+    stride = getattr(refiner, "chunk_stride", CHUNK_STRIDE)
+    starts = _chunk_starts(L, chunk, stride)
+    has_phase = getattr(refiner, "head_phase", None) is not None
     p_state = np.zeros((L, N_STATES), np.float64)
     p_site = np.zeros((L, N_SITES), np.float64)
+    p_phase = np.zeros((L, N_PHASE), np.float64) if has_phase else None
     wsum = np.zeros(L, np.float64)
     tr = _stage1_tracks(res, w_ev)
     for i in range(0, len(starts), batch_size):
         batch = starts[i:i + batch_size]
         xs = np.stack([build_refiner_inputs(
-            seq, res, a, min(a + CHUNK, L), w_ev,
+            seq, res, a, min(a + chunk, L), w_ev,
             tracks=tr) for a in batch])
-        sl, tl = refiner(torch.from_numpy(xs).to(device),
-                         cond.repeat(len(batch), 1))
+        sl, tl, pl = refiner(torch.from_numpy(xs).to(device),
+                             cond.repeat(len(batch), 1))
         ps = torch.softmax(sl.float(), 1).cpu().numpy()
         pt = torch.sigmoid(tl.float()).cpu().numpy()
-        for a, p_s, p_t in zip(batch, ps, pt):
+        pp = (torch.softmax(pl.float(), 1).cpu().numpy()
+              if pl is not None else None)
+        for k, (a, p_s, p_t) in enumerate(zip(batch, ps, pt)):
             n = p_s.shape[-1]
             w = np.clip(np.sin(np.pi * np.arange(n)
                                / max(n - 1, 1)), 1e-3, 1.0) ** 2
             p_state[a:a + n] += w[:, None] * p_s.T
             p_site[a:a + n] += w[:, None] * p_t.T
+            if pp is not None:
+                p_phase[a:a + n] += w[:, None] * pp[k].T
             wsum[a:a + n] += w
+    if p_phase is not None:
+        p_phase = (p_phase / wsum[:, None]).astype(np.float32)
     return (p_state / wsum[:, None]).astype(np.float32), \
-           (p_site / wsum[:, None]).astype(np.float32)
+           (p_site / wsum[:, None]).astype(np.float32), p_phase
 
 
 # ----------------------------------------------------------- decoder ---
@@ -373,10 +480,11 @@ def decode_with_refiner(refiner, seq: str, res: ContigResult,
                         stops=STOPS, euk: bool = True, gcode: int = 1,
                         w_ev: float = 0.25, min_cds_len: int = 90,
                         coding_threshold: float = 0.45,
-                        min_intron: int = 35, max_intron: int = 5000,
+                        min_intron: int = 35, max_intron=None,
                         intron_hints=(), site_threshold: float = 0.05,
                         starts=("ATG",),
-                        device: str = "cpu", p_state=None, p_site=None):
+                        device: str = "cpu", p_state=None, p_site=None,
+                        p_phase=None):
     """Decode a contig with the neural refiner -> gene dicts.
 
     Same return schema as annotate._decode_genes so downstream GFF3 /
@@ -387,18 +495,25 @@ def decode_with_refiner(refiner, seq: str, res: ContigResult,
     or archaeal contigs, where the model's start-site head still fires
     on annotated non-ATG starts (labels come from GFF boundaries, not
     the codon identity). The splice-rescue walk stays ATG-only.
+    ``max_intron=None`` resolves the clade-conditioned cap (see
+    clade_max_intron); an explicit value overrides it.
     """
     seq_u = seq.upper()
     L = len(seq_u)
     if p_state is None or p_site is None:
-        p_state, p_site = refiner_tracks(refiner, seq_u, res, w_ev,
-                                         gcode, device)
+        p_state, p_site, p_phase2 = refiner_tracks(
+            refiner, seq_u, res, w_ev, gcode, device)
+        if p_phase is None:
+            p_phase = p_phase2
+    if max_intron is None:
+        max_intron = clade_max_intron(res)
     genes = []
     for strand in ("+", "-"):
         genes += _refiner_decode_strand(
             seq_u, L, p_state, p_site, res, strand, euk, stops,
             min_cds_len, coding_threshold, min_intron, max_intron,
-            intron_hints, site_threshold, starts)
+            intron_hints, site_threshold, starts,
+            p_phase=p_phase)
     seen, uniq = set(), []
     for g in sorted(genes, key=lambda x: -x.get("score", 0.0)):
         key = (g["start"], g["end"], g["strand"])
@@ -412,7 +527,8 @@ def decode_with_refiner(refiner, seq: str, res: ContigResult,
 def _refiner_decode_strand(seq_u, L, p_state, p_site, res, strand,
                            euk, stops, min_cds_len, coding_threshold,
                            min_intron, max_intron, intron_hints,
-                           site_threshold, starts=("ATG",)):
+                           site_threshold, starts=("ATG",),
+                           p_phase=None):
     """One strand, all in the strand's reading direction.
 
     For '-' the sequence is revcomp'd and every posterior row is
@@ -427,6 +543,7 @@ def _refiner_decode_strand(seq_u, L, p_state, p_site, res, strand,
         p_start, p_stop = p_site[:, S_START_P], p_site[:, S_STOP_P]
         p_don, p_acc = p_site[:, S_DON_P], p_site[:, S_ACC_P]
         hints = [iv[:2] for iv in intron_hints]
+        pp = p_phase[:, :3] if p_phase is not None else None
     else:
         s_seq = revcomp(seq_u)
         p_cds = p_state[::-1, ST_CDS_M]
@@ -438,8 +555,13 @@ def _refiner_decode_strand(seq_u, L, p_state, p_site, res, strand,
         p_acc = p_site[::-1, S_ACC_M]
         hints = [(L - a, L - d) for d, a in
                  (iv[:2] for iv in intron_hints)]
+        pp = p_phase[::-1, 3:] if p_phase is not None else None
     p_bg = 1.0 - p_cds
-    loci = _refiner_loci(p_cds, p_int, coding_threshold, L)
+    # bridge adjacent loci across intron-deep valleys: a long intron
+    # whose posterior decays mid-span splits one gene into two loci,
+    # and the (d, a) candidate spanning the gap is then never proposed
+    loci = _refiner_loci(p_cds, p_int, coding_threshold, L,
+                         bridge=max_intron)
     iprior = _intron_prior(res)
     out = []
     for lo, hi in loci:
@@ -447,14 +569,18 @@ def _refiner_decode_strand(seq_u, L, p_state, p_site, res, strand,
             s_seq, lo, hi, strand, L, res, euk, stops, min_cds_len,
             coding_threshold, min_intron, max_intron, hints,
             site_threshold, starts, p_cds, p_int, p_other, p_bg,
-            p_start, p_stop, p_don, p_acc, iprior)
+            p_start, p_stop, p_don, p_acc, iprior, pp)
     return out
 
 
-def _refiner_loci(p_cds, p_int, coding_threshold, L, pad=300):
+def _refiner_loci(p_cds, p_int, coding_threshold, L, pad=300,
+                  bridge=0):
     """Active gene loci: contiguous regions where the 100 bp-smoothed
     exon+intron posterior reaches 0.20 and the run's max CDS posterior
-    passes coding_threshold. Padded +-300 bp and merged."""
+    passes coding_threshold. Padded +-300 bp and merged. Loci closer
+    than ``bridge`` are additionally merged when the gap carries
+    intron-posterior mass -- long-intron bridging (a weak mid-intron
+    valley must not split one gene into two loci)."""
     sig = np.convolve(p_cds + p_int, np.ones(100) / 100.0, mode="same")
     mask = sig >= 0.20
     loci, i = [], 0
@@ -470,7 +596,10 @@ def _refiner_loci(p_cds, p_int, coding_threshold, L, pad=300):
         i = j + 1
     merged = []
     for lo, hi in loci:
-        if merged and lo <= merged[-1][1]:
+        if merged and (lo <= merged[-1][1] or
+                       (bridge and lo - merged[-1][1] <= bridge
+                        and p_int[merged[-1][1]:lo].mean()
+                        >= DEC_BRIDGE_PINT)):
             merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
         else:
             merged.append((lo, hi))
@@ -514,15 +643,15 @@ def _refiner_intron_candidates(s_seq, lo, hi, min_intron, max_intron,
                 and p_int[lo + i:lo + j + 1].max() >= DEC_RUN_PEAK):
             raw.append((lo + i, lo + j + 1))
         i = j + 1
-    # merge runs separated by less than min_intron: a dip shorter
-    # than a legal exon cannot separate two introns (the state
-    # posterior often dips for a few bp inside one intron). A merged
-    # run may span several true introns -- interior donors/acceptors
-    # are searched and the chain DP arbitrates which non-overlapping
-    # subset to excise.
+    # merge runs separated by less than DEC_MIN_EXON: a dip shorter
+    # than the shortest legal exon (9 bp micro-exon) cannot separate
+    # two introns (the state posterior often dips for a few bp inside
+    # one intron). A merged run may span several true introns --
+    # interior donors/acceptors are searched and the chain DP
+    # arbitrates which non-overlapping subset to excise.
     runs = []
     for i0, i1 in raw:
-        if runs and i0 - runs[-1][1] < min_intron:
+        if runs and i0 - runs[-1][1] < DEC_MIN_EXON:
             runs[-1] = (runs[-1][0], i1, runs[-1][2])
         else:
             runs.append((i0, i1, 20))
@@ -551,23 +680,30 @@ def _refiner_intron_candidates(s_seq, lo, hi, min_intron, max_intron,
         d_hi = min(hi - min_intron, i1 - min_intron + 1)
         a_lo = max(lo + min_intron + 2, i0 + min_intron)
         a_hi = min(hi, i1 + rad)
-        dons = [d for d in range(d_lo, d_hi)
-                if s_seq[d:d + 2] in ("GT", "GC")
+        # U2 (GT..AG, GC..AG) and U12 (AT..AC) splice classes; the
+        # AT..AC pair is validated jointly below so a lone AT donor or
+        # AC acceptor cannot form a candidate
+        dons = [(d, s_seq[d:d + 2]) for d in range(d_lo, d_hi)
+                if s_seq[d:d + 2] in ("GT", "GC", "AT")
                 and (p_don[d] >= site_threshold
                      or any(abs(d - hd) <= 6 for hd, _ in hint_xy))]
-        accs = [a for a in range(a_lo, a_hi)
-                if s_seq[a - 2:a] == "AG"
+        accs = [(a, s_seq[a - 2:a]) for a in range(a_lo, a_hi)
+                if s_seq[a - 2:a] in ("AG", "AC")
                 and (p_acc[a - 1] >= site_threshold
                      or any(abs(a - ha) <= 6 for _, ha in hint_xy))]
         local_pairs = []
-        for d in dons:
+        for d, dm in dons:
             # 4-bp CDS->intron state contrast across the donor edge
             step_d = float(p_cds[max(lo, d - 4):d].mean()
                            - p_int[max(lo, d - 4):d].mean()
                            + p_int[d:min(hi, d + 4)].mean()
                            - p_cds[d:min(hi, d + 4)].mean())
-            for a in accs:
+            for a, am in accs:
                 if not (min_intron <= a - d <= max_intron):
+                    continue
+                # splice-class consistency: U2 donors need AG, the
+                # U12 AT donor needs AC
+                if (dm == "AT") != (am == "AC"):
                     continue
                 # 4-bp intron->CDS state contrast across the acceptor
                 step_a = float(p_int[max(lo, a - 4):a].mean()
@@ -579,7 +715,7 @@ def _refiner_intron_candidates(s_seq, lo, hi, min_intron, max_intron,
                       + float(np.log(np.clip(p_int[d:a], 1e-6, 1)).mean())
                       - float(np.log(np.clip(p_cds[d:a], 1e-6, 1)).mean())
                       + 1.5 * (step_d + step_a)
-                      + (0.3 if s_seq[d:d + 2] == "GT" else 0.0))
+                      + (0.3 if dm == "GT" else 0.0))
                 if any(abs(d - hd) <= 6 and abs(a - ha) <= 6
                        for hd, ha in hint_xy):
                     ll += 2.0
@@ -748,7 +884,7 @@ def _rescue_chains(s_seq, lo, hi, cands_p, stops, have):
 def _refiner_orfs(seq_s, pos, lo, hi, chain, strand, L, res, stops,
                   min_cds_len, s_seq, p_cds, p_int, p_other, p_bg,
                   p_start, p_stop, hint_xy, intron_ll,
-                  starts=("ATG",)):
+                  starts=("ATG",), pp=None):
     """ATG->stop ORFs on the (possibly spliced) forward transcript.
 
     ``pos`` maps transcript index -> strand-local genomic coord
@@ -815,6 +951,12 @@ def _refiner_orfs(seq_s, pos, lo, hi, chain, strand, L, res, stops,
         else:
             frame_sup = 0.0
         cds_len = b_t - a_t
+        # codon-phase support (v2 head): tx position t has expected
+        # phase (t - a_t) % 3; a mis-phased exon join drops the mean
+        phase_sup = 0.0
+        if pp is not None:
+            phase_sup = float(
+                pp[tex, np.arange(b_t - a_t) % 3].mean())
         # boundary contrast steps: a true start sits at the rising CDS
         # edge, a true stop at the falling edge -- this discriminates
         # the exact boundary ATG/stop from shifted in-frame alternates
@@ -822,7 +964,7 @@ def _refiner_orfs(seq_s, pos, lo, hi, chain, strand, L, res, stops,
                            - p_cds[max(0, a - 12):a].mean())
         step_stop = float(p_cds[max(0, bnd - 12):bnd].mean()
                           - p_cds[bnd:min(L, bnd + 12)].mean())
-        g["body"] = max(0.0, cds_ll + frame_sup)
+        g["body"] = max(0.0, cds_ll + frame_sup + 0.5 * phase_sup)
         g["n_hint_introns"] = n_hint
         g["strand_share"] = share
         g["score"] = ((cds_ll + frame_sup) * math.log1p(cds_len)
@@ -846,7 +988,7 @@ def _refiner_decode_locus(s_seq, lo, hi, strand, L, res, euk, stops,
                           min_cds_len, coding_threshold, min_intron,
                           max_intron, hints, site_threshold, starts,
                           p_cds, p_int, p_other, p_bg, p_start, p_stop,
-                          p_don, p_acc, iprior):
+                          p_don, p_acc, iprior, pp=None):
     """All candidate gene calls inside one active locus on one
     strand: candidate introns -> excision chains (DP + stop-rescue
     walks) -> spliced-transcript ORF scans -> per-stop-edge best
@@ -866,7 +1008,7 @@ def _refiner_decode_locus(s_seq, lo, hi, strand, L, res, euk, stops,
         for g in _refiner_orfs(
                 seq_s, pos, lo, hi, chain, strand, L, res, stops,
                 min_cds_len, s_seq, p_cds, p_int, p_other, p_bg,
-                p_start, p_stop, hint_xy, intron_ll, starts):
+                p_start, p_stop, hint_xy, intron_ll, starts, pp=pp):
             stop_edge = g["end"] if strand == "+" else g["start"]
             if (stop_edge not in genes
                     or g["score"] > genes[stop_edge]["score"]):

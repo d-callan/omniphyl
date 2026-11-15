@@ -1,0 +1,16 @@
+{
+  "id": "daniellecallan/omniphyl-tol-refiner-bench",
+  "title": "omniphyl-tol-refiner-bench",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "daniellecallan/omniphyl-tol-mini",
+    "daniellecallan/omniphyl-tol-stage1"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

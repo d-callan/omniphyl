@@ -11,9 +11,11 @@ Two halves per plan docs/neural-refiner-plan.md §5:
             CDS rows
 
 The Stage-1 model is FROZEN -- this script never touches its weights.
-Chunks are 8192 bp with 6144 stride; RC augmentation doubles each
-contig (labels and ContigResult tracks are strand-flipped, see
-revcomp_result / rc_labels); evidence-dropout augmentation zeros the
+v2 chunks are 32768 bp with 24576 stride (config-driven; --v1-arch
+reverts to 8192/6144); RC augmentation doubles each contig (labels
+are rebuilt on strand-flipped canonical transcripts so codon-phase
+targets stay exact, and ContigResult tracks are strand-flipped via
+revcomp_result); evidence-dropout augmentation zeros the
 dtilde/e_lex channels for 25% of chunks.
 
   python scripts/train_refiner.py \
@@ -48,16 +50,22 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from omniphyl.refiner import (OmniPhylRefiner, build_refiner_inputs,
                               build_contig_cond, apply_cond_mode,
-                              save_refiner, COND_MODES,
+                              save_refiner, refiner_config, COND_MODES,
                               _stage1_tracks,
-                              _chunk_starts, N_STATES, N_SITES, CHUNK,
-                              CHUNK_STRIDE, ST_INTERGENIC, ST_CDS_P,
-                              ST_INT_P, ST_CDS_M, ST_INT_M,
+                              _chunk_starts, N_STATES, N_SITES,
+                              N_COND, N_PHASE, CHUNK, CHUNK_STRIDE,
+                              V1_CHUNK, V1_CHUNK_STRIDE,
+                              ST_INTERGENIC, ST_CDS_P,
+                              ST_INT_P, ST_CDS_M, ST_INT_M, ST_RNA,
+                              ST_DUAL,
                               S_START_P, S_STOP_P, S_DON_P, S_ACC_P,
                               S_START_M, S_STOP_M, S_DON_M, S_ACC_M)
 from omniphyl.annotate import ContigResult
 from omniphyl.io import iter_sequences, revcomp
-from eval_genes import parse_cds
+from eval_genes import parse_cds, _attrs
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
 
 # Site-target smoothing width. sigma=3 saturated a ~13 bp plateau
 # around each boundary, which made shifted decoy sites score as well
@@ -72,8 +80,82 @@ STATE_W = torch.tensor([1.0, 1.5, 2.5, 1.5, 2.5, 1.0, 2.0])
 
 # ----------------------------------------------------------- labels ----
 
-def build_refiner_labels(rows, L):
-    """(state [L] int64, site [8,L] float32) from CDS rows of one seqid.
+# Transcript-level GFF feature types whose Parent links CDS rows to
+# genes (isoform grouping) and whose own intervals label ST_RNA.
+_TX_FEATURES = {"mRNA", "transcript", "lnc_RNA", "rRNA", "tRNA",
+                "ncRNA", "snRNA", "snoRNA", "miRNA", "scRNA",
+                "SRP_RNA", "RNase_P_RNA", "telomerase_RNA",
+                "vault_RNA", "antisense_RNA", "tmRNA"}
+_RNA_FEATURES = _TX_FEATURES - {"mRNA", "transcript"}
+
+
+def parse_training_gff(path: str) -> dict:
+    """{seqid: {"cds": {tx: {"strand": s, "ivs": [(s,e)]}},
+                "tx2gene": {tx: gene_id}, "mane": {tx},
+                "rna": [(s, e)]}}
+
+    Three facts per seqid beyond eval_genes.parse_cds: tx->gene
+    parents (isoform grouping), MANE tags (canonical-transcript
+    choice), and noncoding-RNA intervals (ST_RNA state labels)."""
+    out = defaultdict(lambda: {"cds": defaultdict(
+        lambda: {"strand": "+", "ivs": []}),
+        "tx2gene": {}, "mane": set(), "rna": []})
+    with open(path) as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            c = line.rstrip("\n").split("\t")
+            if len(c) < 9:
+                continue
+            seqid, ftype, strand = c[0], c[2], c[6]
+            s, e = int(c[3]) - 1, int(c[4])
+            if e <= s:
+                continue
+            a = _attrs(c[8])
+            if ftype == "CDS":
+                tx = (a.get("Parent") or "").split(",")[0]
+                if tx:
+                    rec = out[seqid]["cds"][tx]
+                    rec["strand"] = strand
+                    rec["ivs"].append((s, e))
+            elif ftype in _TX_FEATURES:
+                tid = a.get("ID")
+                if not tid:
+                    continue
+                par = (a.get("Parent") or "").split(",")[0]
+                if par:
+                    out[seqid]["tx2gene"][tid] = par
+                if "MANE" in (a.get("Dbxref", "")
+                              + a.get("db_xref", "")):
+                    out[seqid]["mane"].add(tid)
+                if ftype in _RNA_FEATURES:
+                    out[seqid]["rna"].append((s, e))
+    return out
+
+
+def canonical_txs(cds: dict, tx2gene: dict, mane: set) -> set:
+    """One representative transcript per gene: MANE_Select when the
+    annotation carries it, else the longest summed CDS length.
+    Transcripts with no resolvable gene parent form their own
+    singleton groups."""
+    genes = defaultdict(list)
+    for tx in cds:
+        genes[tx2gene.get(tx, tx)].append(tx)
+    keep = set()
+    for txs in genes.values():
+        mane_hits = [t for t in txs if t in mane]
+        if mane_hits:
+            keep.add(mane_hits[0])
+        else:
+            keep.add(max(
+                txs,
+                key=lambda t: sum(e - s for s, e in cds[t]["ivs"])))
+    return keep
+
+
+def build_refiner_labels(rows, L, rna_ivs=()):
+    """(state [L] int64, site [8,L] float32, phase [L] int64) from
+    canonical CDS rows of one seqid.
 
     rows: [(tx_id, strand, (s,e)), ...] 0-based half-open, grouped by
     transcript id so introns come from consecutive exon gaps.
@@ -82,23 +164,51 @@ def build_refiner_labels(rows, L):
          ACCEPTOR at intron_end-1
       -  START at cds_end-1; STOP at cds_start+2; DONOR at
          intron_end-1; ACCEPTOR at intron_start
-    Overlapping opposite-strand genes: last write wins on the state
-    map (BOTH_STRAND_CDS is a plan v2 refinement)."""
+    Opposite-strand CDS overlap is labelled ST_DUAL (v1's
+    last-write-wins hid antisense genes entirely); noncoding-RNA
+    intervals label ST_RNA only where no CDS covers them. phase
+    classes are codon phase 0/1/2 (+ strand) and 3/4/5 (- strand),
+    -1 off-CDS; minus-strand txs are written first so + wins on dual
+    coverage."""
     by_tx = defaultdict(list)
     for tx, strand, (s, e) in rows:
         by_tx[(tx, strand)].append((s, e))
-    state = np.zeros(L, np.int64)
-    site = np.zeros((N_SITES, L), np.float32)
+    cov = np.zeros((2, L), bool)
+    int_ivs = []
     for (_tx, strand), ivs in by_tx.items():
         ivs = sorted(ivs)
-        plus = strand == "+"
-        cds_i, int_i = (ST_CDS_P, ST_INT_P) if plus \
-            else (ST_CDS_M, ST_INT_M)
-        s0, e0 = ivs[0][0], ivs[-1][1]
+        c = cov[0] if strand == "+" else cov[1]
         for i, (s, e) in enumerate(ivs):
-            state[s:e] = cds_i
+            c[s:e] = True
             if i + 1 < len(ivs):
-                state[e:ivs[i + 1][0]] = int_i
+                int_ivs.append((e, ivs[i + 1][0], strand == "+"))
+    both = cov[0] & cov[1]
+    nocds = ~cov[0] & ~cov[1]
+    state = np.zeros(L, np.int64)
+    state[cov[0] & ~both] = ST_CDS_P
+    state[cov[1] & ~both] = ST_CDS_M
+    state[both] = ST_DUAL
+    for s, e, plus in int_ivs:
+        seg = state[s:e]
+        seg[nocds[s:e]] = ST_INT_P if plus else ST_INT_M
+    for s, e in rna_ivs:
+        seg = state[max(s, 0):min(e, L)]
+        seg[nocds[max(s, 0):min(e, L)]] = ST_RNA
+    site = np.zeros((N_SITES, L), np.float32)
+    phase = np.full(L, -1, np.int64)
+    for (_tx, strand), ivs in sorted(
+            by_tx.items(), key=lambda kv: kv[0][1] == "+"):
+        ivs = sorted(ivs)
+        plus = strand == "+"
+        s0, e0 = ivs[0][0], ivs[-1][1]
+        cum = 0
+        for s, e in (ivs if plus else ivs[::-1]):
+            if plus:
+                phase[s:e] = (cum + np.arange(s, e) - s) % 3
+            else:
+                phase[s:e] = 3 + (cum + e - 1
+                                  - np.arange(s, e)) % 3
+            cum += e - s
         if plus:
             site[S_START_P, s0] = 1.0
             site[S_STOP_P, max(e0 - 3, 0)] = 1.0
@@ -115,7 +225,7 @@ def build_refiner_labels(rows, L):
     k = np.exp(-0.5 * (np.arange(-9, 10) / SITE_SIGMA) ** 2)
     k /= k.max()
     site = np.stack([np.convolve(ch, k, mode="same") for ch in site])
-    return state, site.astype(np.float32)
+    return state, site.astype(np.float32), phase.astype(np.int8)
 
 
 def revcomp_result(res: ContigResult) -> ContigResult:
@@ -178,22 +288,25 @@ class RefinerChunks(Dataset):
     OOM multi-genome corpora; this form is ~9 B/bp."""
 
     def __init__(self, items, w_ev=0.25, p_no_ev=0.25, seed=0,
-                 cond_aug=False):
+                 cond_aug=False, chunk=CHUNK, chunk_stride=CHUNK_STRIDE):
         self.items = items
         self.w_ev = w_ev
         self.p_no_ev = p_no_ev
         self.seed = seed
+        self.chunk = int(chunk)
         # cond_aug: training-only cond regularization ("regularize"
         # cond_mode). Inference/val items see the unmodified vector.
         self.cond_aug = cond_aug
         self.chunks = []
-        # item[6] is the genome id used by --balance-genomes; items
+        # item[7] is the genome id used by --balance-genomes; items
         # without one fall back to their own index (never mixed).
         self.chunk_gid = []
         for i, it in enumerate(items):
-            gid = it[6] if len(it) > 6 else i
-            for a in _chunk_starts(len(it[0]), CHUNK, CHUNK_STRIDE):
-                self.chunks.append((i, a, min(a + CHUNK, len(it[0]))))
+            gid = it[7] if len(it) > 7 else i
+            for a in _chunk_starts(len(it[0]), self.chunk,
+                                   chunk_stride):
+                self.chunks.append(
+                    (i, a, min(a + self.chunk, len(it[0]))))
                 self.chunk_gid.append(gid)
 
     def __len__(self):
@@ -201,7 +314,7 @@ class RefinerChunks(Dataset):
 
     def __getitem__(self, i):
         it, lo, hi = self.chunks[i]
-        seq, bw, state, sites, cond, tr = self.items[it][:6]
+        seq, bw, state, sites, phase, cond, tr = self.items[it][:7]
         x = build_refiner_inputs(seq, None, lo, hi, self.w_ev,
                                  tracks=tr, bin_width=bw)
         # per-index RNG: identical evidence-dropout decisions regardless
@@ -229,26 +342,42 @@ class RefinerChunks(Dataset):
             m = (pos >= lo) & (pos < hi)
             if m.any():
                 yt[c, pos[m] - lo] = val[m]
-        if hi - lo < CHUNK:
-            # tail chunk at a contig end: pad to CHUNK so batch
+        # phase int8 with -1 off-CDS -> -100 (cross_entropy
+        # ignore_index)
+        yph = np.where(phase[lo:hi] < 0, -100,
+                       phase[lo:hi]).astype(np.int64)
+        if hi - lo < self.chunk:
+            # tail chunk at a contig end: pad to chunk so batch
             # tensors are uniform (default_collate's shared-storage
             # resize_ and torch.stack both require equal sizes).
             # state pad = intergenic so the site-loss mask stays off
             # the pad; site pad = no sites outside the contig.
-            pad = CHUNK - (hi - lo)
+            pad = self.chunk - (hi - lo)
             x = np.pad(x, ((0, 0), (0, pad)))
             ys = np.pad(ys, (0, pad), constant_values=ST_INTERGENIC)
             yt = np.pad(yt, ((0, 0), (0, pad)))
+            yph = np.pad(yph, (0, pad), constant_values=-100)
         return (torch.from_numpy(x), torch.from_numpy(cond),
-                torch.from_numpy(ys), torch.from_numpy(yt))
+                torch.from_numpy(ys), torch.from_numpy(yt),
+                torch.from_numpy(yph))
 
 
 def _chunk_collate(batch):
     """Uniform torch.stack collate (items are already fixed-size,
     but this avoids default_collate's shared-memory resize path)."""
-    x, cond, ys, yt = zip(*batch)
+    x, cond, ys, yt, yph = zip(*batch)
     return (torch.stack(x), torch.stack(cond),
-            torch.stack(ys), torch.stack(yt))
+            torch.stack(ys), torch.stack(yt), torch.stack(yph))
+
+
+def _rc_rows(rows, L):
+    """Strand-flipped canonical CDS rows for the RC-augmented contig:
+    rebuilding labels on flipped rows (rather than array-splicing
+    phase) keeps the codon-phase targets exact -- a reversed phase
+    value is not recoverable without the transcript length."""
+    flip = {"+": "-", "-": "+"}
+    return [(tx, flip.get(strand, strand), (L - e, L - s))
+            for tx, strand, (s, e) in rows]
 
 
 def _make_items(res_pkl: dict, labels_by_seqid: dict, gcode: int,
@@ -256,7 +385,8 @@ def _make_items(res_pkl: dict, labels_by_seqid: dict, gcode: int,
                 cond_mode: str = "full", gid: int = 0):
     """Per-annotated-contig training items: (items, groups).
 
-    items: (seq, bin_width, state_u8, site_coords, cond, tracks, gid)
+    items: (seq, bin_width, state_u8, site_coords, phase_i8, cond,
+            tracks, gid)
     groups: parallel base-contig seqid for each item -- a contig and
     its reverse-complement partner share a group so a grouped split
     can never leak one strand into train and the other into val.
@@ -266,23 +396,27 @@ def _make_items(res_pkl: dict, labels_by_seqid: dict, gcode: int,
     results = {r.contig: r for r in res_pkl["results"]}
     seqs = res_pkl["contig_seqs"]
     items, groups = [], []
-    for cid, rows in labels_by_seqid.items():
+    for cid, lab in labels_by_seqid.items():
         if cid not in results or cid not in seqs:
             continue
         res, seq = results[cid], seqs[cid].upper()
-        state, site = build_refiner_labels(rows, len(seq))
+        state, site, phase = build_refiner_labels(
+            lab["rows"], len(seq), lab.get("rna", ()))
         cond = apply_cond_mode(build_contig_cond(res, seq, gcode),
                                cond_mode)
         bw = res.bin_width
         items.append((seq, bw, state.astype(np.uint8),
-                      _site_coords(site), cond,
+                      _site_coords(site), phase, cond,
                       _stage1_tracks(res, w_ev), gid))
         groups.append(cid)
         if include_rc:
             res_rc = revcomp_result(res)
-            st_rc, si_rc = rc_labels(state, site)
+            st_rc, si_rc, ph_rc = build_refiner_labels(
+                _rc_rows(lab["rows"], len(seq)), len(seq),
+                [(len(seq) - e, len(seq) - s)
+                 for s, e in lab.get("rna", ())])
             items.append((revcomp(seq), bw, st_rc.astype(np.uint8),
-                          _site_coords(si_rc), cond,
+                          _site_coords(si_rc), ph_rc, cond,
                           _stage1_tracks(res_rc, w_ev), gid))
             groups.append(cid)
     return items, groups
@@ -290,9 +424,9 @@ def _make_items(res_pkl: dict, labels_by_seqid: dict, gcode: int,
 
 # ------------------------------------------------------------- loss ----
 
-def refiner_loss(sl, tl, y_state, y_site, min_intron=35,
-                 max_intron=5000):
-    """L = L_state + L_site + 0.5 * L_phase (plan §5)."""
+def refiner_loss(sl, tl, pl, y_state, y_site, y_phase,
+                 min_intron=35, max_intron=5000):
+    """L = L_state + L_site + 0.5*L_pair + L_peak + 0.5*L_phase_cls."""
     L_state = F.cross_entropy(sl, y_state,
                               weight=STATE_W.to(sl.device))
     # focal BCE on sites, masked to +-500 bp around annotated sequence
@@ -308,24 +442,39 @@ def refiner_loss(sl, tl, y_state, y_site, min_intron=35,
             12.0, device=tl.device))
     L_site = (bce * (1.0 - pt).clamp(min=0) ** 2
               * m).sum() / m.sum().clamp(min=1.0) / N_SITES
-    L_phase = _phase_loss(tl, y_site, min_intron, max_intron)
+    L_pair = _phase_loss(tl, y_site, min_intron, max_intron)
     L_peak = _peak_loss(tl, y_site)
-    return L_state + L_site + 0.5 * L_phase + L_peak
+    L = L_state + L_site + 0.5 * L_pair + L_peak
+    if pl is not None:
+        L = L + 0.5 * F.cross_entropy(
+            pl, y_phase, ignore_index=-100)
+    return L
 
 
 def _phase_loss(tl, y_site, min_intron, max_intron):
     """Donor-acceptor co-firing: for each true donor, the best
     acceptor site inside the legal intron-length window should fire
-    jointly (penalizes a lone confident donor with no partner)."""
+    jointly (penalizes a lone confident donor with no partner).
+
+    The window direction is strand-aware: a minus-strand donor sits
+    at the intron's RIGHT edge (transcript runs right-to-left), so
+    its partner acceptor is at SMALLER genomic coords. The v1 loop
+    applied the forward window to both strands, so the minus-strand
+    term never saw the true acceptor."""
     losses = []
-    for don_ch, acc_ch in ((S_DON_P, S_ACC_P), (S_DON_M, S_ACC_M)):
+    for don_ch, acc_ch, fwd in ((S_DON_P, S_ACC_P, True),
+                                (S_DON_M, S_ACC_M, False)):
         pd = torch.sigmoid(tl[:, don_ch])
         pa = torch.sigmoid(tl[:, acc_ch])
         for b in range(tl.shape[0]):
             for d in (y_site[b, don_ch] > 0.5).nonzero()[:, 0]:
                 d = int(d)
-                lo_w = d + min_intron
-                hi_w = min(d + max_intron + 1, pa.shape[-1])
+                if fwd:
+                    lo_w = d + min_intron
+                    hi_w = min(d + max_intron + 1, pa.shape[-1])
+                else:
+                    lo_w = max(0, d - max_intron)
+                    hi_w = d - min_intron + 1
                 pa_max = pa[b, lo_w:hi_w].max() if hi_w > lo_w \
                     else pa[b, d] * 0.0
                 losses.append(1.0 - pd[b, d] * pa_max)
@@ -582,12 +731,62 @@ def main():
                          "assembly size (default: flat chunk pool)")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--amp", choices=["none", "fp16", "bf16"],
+                    default="bf16",
+                    help="mixed precision autocast dtype (fp16 also "
+                         "enables GradScaler; bf16 needs no scaler)")
+    ap.add_argument("--arch-config", type=Path, default=None,
+                    help="JSON of OmniPhylRefiner geometry overrides "
+                         "(hidden, dilations, rnn_pool, tfm_pool, "
+                         "tfm_layers, nhead, n_phase, chunk, "
+                         "chunk_stride); merged over the v2 defaults")
+    ap.add_argument("--v1-arch", action="store_true",
+                    help="train the original v1 graph (6 blocks "
+                         "d<=32, 4x BiGRU, 8192 chunks, no tfm/phase)")
+    ap.add_argument("--resume", type=Path, default=None,
+                    help="resume-ckpt .pt (model+opt+scaler+epoch)")
+    ap.add_argument("--resume-auto", action="store_true",
+                    help="resume from <out>.resume.pt if present")
     args = ap.parse_args()
 
-    device = ("cuda" if args.device == "auto"
-              and torch.cuda.is_available() else
-              "cpu" if args.device == "auto" else args.device)
+    # ------------------------------------------------------------- ddp ---
+    rank, world, local = 0, 1, 0
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        rank = int(os.environ["RANK"])
+        world = int(os.environ["WORLD_SIZE"])
+        local = int(os.environ.get("LOCAL_RANK", 0))
+        dist.init_process_group("nccl" if torch.cuda.is_available()
+                                else "gloo")
+    is_main = rank == 0
+
+    dev = args.device
+    if dev == "auto":
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+    if world > 1 and dev == "cuda":
+        torch.cuda.set_device(local)
+        device = f"cuda:{local}"
+    else:
+        device = dev
     torch.manual_seed(args.seed)
+    amp_dtype = {"fp16": torch.float16,
+                 "bf16": torch.bfloat16}.get(args.amp)
+
+    # v2 geometry defaults; --v1-arch reproduces the original graph
+    arch = ({"hidden": 96,
+             "dilations": [1, 2, 4, 8, 16, 32],
+             "rnn_pool": 4, "tfm_pool": 64, "tfm_layers": 0,
+             "nhead": 4, "n_phase": 0,
+             "chunk": V1_CHUNK, "chunk_stride": V1_CHUNK_STRIDE}
+            if args.v1_arch else
+            {"hidden": 96,
+             "dilations": [1, 2, 4, 8, 16, 32, 64, 128],
+             "rnn_pool": 8, "tfm_pool": 64, "tfm_layers": 2,
+             "nhead": 4, "n_phase": N_PHASE,
+             "chunk": CHUNK, "chunk_stride": CHUNK_STRIDE})
+    if args.arch_config:
+        arch.update(json.loads(args.arch_config.read_text()))
+    chunk = int(arch["chunk"])
+    chunk_stride = int(arch["chunk_stride"])
 
     # ---- items per data pair -----------------------------------------
     # Each entry: (item, group) where group is the base contig seqid --
@@ -611,13 +810,21 @@ def main():
             res_pkl = _stage1_cache(fasta, args.model, cache, args)
             if res_pkl is None:
                 return None
-        labels = parse_cds(str(gff))
+        gff_d = parse_training_gff(str(gff))
         gcode = res_pkl.get("gcode", 1)
+        labels = {}
+        for sid, d in gff_d.items():
+            keep = canonical_txs(d["cds"], d["tx2gene"], d["mane"])
+            rows = [(tx, rec["strand"], iv)
+                    for tx, rec in d["cds"].items() if tx in keep
+                    for iv in rec["ivs"]]
+            labels[sid] = {"rows": rows, "rna": d["rna"]}
         items, groups = _make_items(res_pkl, labels, gcode,
                                     w_ev=args.evidence_weight,
                                     cond_mode=args.cond_mode, gid=gid)
-        print(f"{fasta.name}: {len(items)} contig items "
-              f"({'val' if is_val else 'train-pool'})", flush=True)
+        if is_main:
+            print(f"{fasta.name}: {len(items)} contig items "
+                  f"({'val' if is_val else 'train-pool'})", flush=True)
         return list(zip(items, groups))
 
     for pi, (fa_s, gff_s) in enumerate(args.data):
@@ -649,11 +856,17 @@ def main():
         args.seed)
     trn_ds = RefinerChunks(trn_items, args.evidence_weight,
                            seed=args.seed,
-                           cond_aug=(args.cond_mode == "regularize"))
+                           cond_aug=(args.cond_mode == "regularize"),
+                           chunk=chunk, chunk_stride=chunk_stride)
     trn_kw = dict(batch_size=args.batch_size,
                   num_workers=args.num_workers,
                   collate_fn=_chunk_collate)
-    if args.balance_genomes:
+    if world > 1:
+        trn_sampler = DistributedSampler(trn_ds, num_replicas=world,
+                                         rank=rank, shuffle=True,
+                                         seed=args.seed)
+        trn = DataLoader(trn_ds, sampler=trn_sampler, **trn_kw)
+    elif args.balance_genomes:
         # inverse-chunk-count weighting per genome: an 11k-chunk
         # L. major can no longer supply 25% of gradient steps while a
         # 0.8k-chunk Halobacterium supplies ~2%
@@ -669,59 +882,116 @@ def main():
     else:
         trn = DataLoader(trn_ds, shuffle=True, **trn_kw)
     val = DataLoader(RefinerChunks(val_items, args.evidence_weight,
-                                   p_no_ev=0.0, seed=args.seed),
+                                   p_no_ev=0.0, seed=args.seed,
+                                   chunk=chunk,
+                                   chunk_stride=chunk_stride),
                      batch_size=args.batch_size,
                      collate_fn=_chunk_collate)
-    print(f"chunks: {len(trn.dataset)} train / {len(val.dataset)} val "
-          f"({len(trn_items)} / {len(val_items)} contigs)", flush=True)
+    if is_main:
+        print(f"chunks: {len(trn.dataset)} train / "
+              f"{len(val.dataset)} val "
+              f"({len(trn_items)} / {len(val_items)} contigs) "
+              f"arch={arch}", flush=True)
 
-    refiner = OmniPhylRefiner().to(device)
+    refiner = OmniPhylRefiner(**{
+        k: arch[k] for k in ("hidden", "dilations", "rnn_pool",
+                             "tfm_pool", "tfm_layers", "nhead",
+                             "n_phase")}).to(device)
     refiner.cond_mode = args.cond_mode
+    refiner.chunk, refiner.chunk_stride = chunk, chunk_stride
+    if world > 1:
+        refiner = DistributedDataParallel(
+            refiner, device_ids=[local] if dev == "cuda" else None)
+    raw = refiner.module if world > 1 else refiner
     opt = torch.optim.AdamW(refiner.parameters(), lr=args.lr,
                             weight_decay=0.01)
-    best_f1, best_sd = -1.0, None
-    for ep in range(args.epochs):
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=(amp_dtype == torch.float16))
+    actx = (lambda: torch.autocast(
+        device_type="cuda" if dev == "cuda" else "cpu",
+        dtype=amp_dtype, enabled=amp_dtype is not None))
+
+    best_f1, best_sd, start_ep = -1.0, None, 0
+    resume_pt = args.out.parent / (args.out.stem + ".resume.pt")
+    rp = args.resume or (resume_pt if args.resume_auto
+                         and resume_pt.exists() else None)
+    if rp is not None:
+        ck_r = torch.load(rp, map_location="cpu", weights_only=False)
+        raw.load_state_dict(ck_r["model"])
+        opt.load_state_dict(ck_r["opt"])
+        scaler.load_state_dict(ck_r["scaler"])
+        start_ep = int(ck_r["epoch"])
+        best_f1 = float(ck_r.get("best_f1", -1.0))
+        best_sd = ck_r.get("best_sd")
+        if is_main:
+            print(f"resumed {rp} at epoch {start_ep} "
+                  f"(best nucF1 {best_f1:.3f})", flush=True)
+
+    for ep in range(start_ep, args.epochs):
+        if world > 1:
+            trn_sampler.set_epoch(ep)
         refiner.train()
         tot, nb = 0.0, 0
-        for x, cond, y_state, y_site in trn:
+        for x, cond, y_state, y_site, y_phase in trn:
             x, cond = x.to(device), cond.to(device)
             y_state, y_site = y_state.to(device), y_site.to(device)
-            sl, tl = refiner(x, cond)
-            loss = refiner_loss(sl, tl, y_state, y_site)
+            y_phase = y_phase.to(device)
             opt.zero_grad()
-            loss.backward()
-            opt.step()
+            with actx():
+                sl, tl, pl = refiner(x, cond)
+                loss = refiner_loss(sl, tl, pl, y_state, y_site,
+                                    y_phase)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             tot += float(loss.detach())
             nb += 1
         refiner.eval()
         f1s, vloss, pacc = [], [], []
         with torch.no_grad():
-            for x, cond, y_state, y_site in val:
+            for x, cond, y_state, y_site, y_phase in val:
                 x, cond = x.to(device), cond.to(device)
                 y_state, y_site = y_state.to(device), y_site.to(device)
-                sl, tl = refiner(x, cond)
-                vloss.append(float(refiner_loss(sl, tl, y_state,
-                                                y_site)))
-                f1s.append(_nuc_f1(sl.cpu(), y_state.cpu()))
-                pacc.append(_peak_acc(tl.cpu(), y_site.cpu()))
+                y_phase = y_phase.to(device)
+                with actx():
+                    sl, tl, pl = refiner(x, cond)
+                    vloss.append(float(refiner_loss(
+                        sl, tl, pl, y_state, y_site, y_phase)))
+                f1s.append(_nuc_f1(sl.float().cpu(), y_state.cpu()))
+                pacc.append(_peak_acc(tl.float().cpu(),
+                                      y_site.cpu()))
         f1 = float(np.mean([f[0] for f in f1s]))
         sn = float(np.mean([f[1] for f in f1s]))
         sp = float(np.mean([f[2] for f in f1s]))
         pk = float(np.mean(pacc)) if pacc else 0.0
-        print(f"ep {ep + 1}: train {tot / max(nb, 1):.4f} "
-              f"val {np.mean(vloss):.4f} nucF1 {f1:.3f} "
-              f"peakAcc {pk:.3f} (sn {sn:.3f} sp {sp:.3f})",
-              flush=True)
+        if is_main:
+            print(f"ep {ep + 1}: train {tot / max(nb, 1):.4f} "
+                  f"val {np.mean(vloss):.4f} nucF1 {f1:.3f} "
+                  f"peakAcc {pk:.3f} (sn {sn:.3f} sp {sp:.3f})",
+                  flush=True)
         if f1 > best_f1:
-            best_f1, best_sd = f1, {k: v.detach().clone()
+            best_f1, best_sd = f1, {k: v.detach().cpu().clone()
                                     for k, v in
-                                    refiner.state_dict().items()}
+                                    raw.state_dict().items()}
+        if is_main:
+            torch.save({"model": raw.state_dict(),
+                        "opt": opt.state_dict(),
+                        "scaler": scaler.state_dict(),
+                        "epoch": ep + 1, "best_f1": best_f1,
+                        "best_sd": best_sd, "arch": arch},
+                       resume_pt)
+        if world > 1:
+            dist.barrier()
+    if not is_main:
+        dist.destroy_process_group()
+        return
     if best_sd is not None:
-        refiner.load_state_dict(best_sd)
-    save_refiner(refiner, args.out,
+        raw.load_state_dict(best_sd)
+    save_refiner(raw, args.out,
                  extra={"nuc_f1": best_f1, "epochs": args.epochs,
                         "cond_mode": args.cond_mode,
                         "balance_genomes": args.balance_genomes,
+                        "arch": arch,
                         "data": [f"{a} {b}" for a, b in args.data]})
     print(f"wrote {args.out} (val nucF1 {best_f1:.3f})")
 
@@ -730,15 +1000,15 @@ def main():
             sys.exit("--bundle-out required with --bundle-model")
         ck = torch.load(args.bundle_model, map_location="cpu",
                         weights_only=False)
-        ck["refiner"] = {"model": refiner.state_dict(),
-                         "config": {"c_in": 22, "cond_dim": N_COND,
-                                    "hidden": 96, "n_states": N_STATES,
-                                    "n_sites": N_SITES,
-                                    "cond_mode": getattr(
-                                        refiner, "cond_mode",
-                                        "full")}}
+        ck["refiner"] = {
+            "format": "omniphyl-refiner-v2",
+            "model": {k: v.detach().cpu().float()
+                      for k, v in raw.state_dict().items()},
+            "config": refiner_config(raw)}
         torch.save(ck, args.bundle_out)
         print(f"bundled -> {args.bundle_out}")
+    if world > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

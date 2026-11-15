@@ -36,7 +36,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "src"))
 
-from eval_genes import parse_cds                       # noqa: E402
+from eval_genes import (parse_cds, _merge, _overlap_len,  # noqa: E402
+                        _metrics)
 from eval_errors import classify_contig, summarize     # noqa: E402
 from omniphyl.annotate import STOPS, STARTS            # noqa: E402
 from omniphyl.refiner import (load_refiner, refiner_tracks,  # noqa: E402
@@ -93,6 +94,17 @@ def _intron_diag(true_introns, pred_introns, p_state, p_site):
                    np.percentile(v, [10, 50, 90])] if v else []
     rep = {"n_true": len(stats),
            "n_matched": sum(s["matched"] for s in stats)}
+    # recall binned by intron length — the ToL gate S2-B needs the
+    # 5-30 kb band (v1's 8192 bp chunk structurally misses those)
+    rep["by_len"] = {}
+    for lo, hi in ((0, 5000), (5000, 30000), (30000, None)):
+        sub = [s for s in stats
+               if lo <= s["len"] < (hi if hi is not None else 1 << 60)]
+        rep["by_len"][f"{lo}_{hi if hi is not None else 'inf'}"] = {
+            "n": len(sub),
+            "n_matched": sum(s["matched"] for s in sub),
+            "recall": round(sum(s["matched"] for s in sub) / len(sub),
+                            4) if sub else None}
     for label, sub in (("matched", [s for s in stats if s["matched"]]),
                        ("unmatched", [s for s in stats
                                       if not s["matched"]])):
@@ -128,6 +140,30 @@ def _pick_contig(res_list, ref_rows, contig=None):
     if not avail:
         sys.exit("no res.pkl contig is annotated in the GFF")
     return max(avail, key=lambda r: r.length)
+
+
+def _gene_exons(g) -> list:
+    """Pred gene dict -> [(s,e)] exon intervals (span minus introns)."""
+    ivs = [(g["start"], g["end"])]
+    for d, a in sorted(g.get("introns", [])):
+        ivs = [(s, e) for s0, e0 in ivs
+               for s, e in ((s0, min(d, e0)), (max(a, s0), e0))
+               if e > s]
+    return ivs
+
+
+def _nuc_exon_f1(ref_rows, genes) -> dict:
+    """nucleotide + exon precision/recall of decoded genes vs ref CDS."""
+    ref_iv = _merge([iv for _tx, _st, iv in ref_rows])
+    pred_iv = _merge([ex for g in genes for ex in _gene_exons(g)])
+    hit = _overlap_len(ref_iv, pred_iv)
+    ref_ex = {(_st, s, e) for _tx, _st, (s, e) in ref_rows}
+    pred_ex = {(g["strand"], s, e) for g in genes
+               for s, e in _gene_exons(g)}
+    return {"nucleotide": _metrics(hit, sum(e - s for s, e in ref_iv),
+                                   sum(e - s for s, e in pred_iv)),
+            "exon": _metrics(len(ref_ex & pred_ex), len(ref_ex),
+                             len(pred_ex))}
 
 
 def main():
@@ -166,7 +202,7 @@ def main():
         euk = dom == "Eukaryota"
         starts = ("ATG",) if euk else STARTS
 
-        p_state, p_site = refiner_tracks(ref, seq_u, res,
+        p_state, p_site, _p_phase = refiner_tracks(ref, seq_u, res,
                                          gcode=gcode,
                                          device=args.device)
         genes = decode_with_refiner(ref, seq, res, stops=STOPS,
@@ -182,10 +218,14 @@ def main():
         s = summarize({res.contig: classify_contig(
             res.contig, ref_rows_all, genes, seq)})
         pi = np.maximum(p_state[:, ST_INT_P], p_state[:, ST_INT_M])
+        f1 = _nuc_exon_f1(ref_rows_all[res.contig], genes)
         row = {"contig": res.contig, "domain": dom, "euk": euk,
+               "gcode": (getattr(res, "gcode", None) or gcode),
                "n_pred": len(genes), "n_pred_introns": len(pred_intr),
                "frac_bases_p_int>0.5": round(float((pi > 0.5).mean()),
                                              4),
+               "nuc_f1": f1["nucleotide"]["f1"],
+               "exon_f1": f1["exon"]["f1"],
                "intron": intr,
                "ref_classes": s["ref_classes"],
                "pred_classes": s["pred_classes"]}
@@ -193,6 +233,7 @@ def main():
         match = (f"{intr['n_matched']}/{intr['n_true']} "
                  f"({100 * intr['n_matched'] / max(intr['n_true'], 1):.1f}%)")
         print(f"{name}/{res.contig}: introns {match}  "
+              f"nucF1={row['nuc_f1']}  exonF1={row['exon_f1']}  "
               f"pred_introns={len(pred_intr)}  "
               f"p_int>0.5 bases={row['frac_bases_p_int>0.5']}  "
               f"ref_exact={s['ref_classes'].get('exact', 0)} "

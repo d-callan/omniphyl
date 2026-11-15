@@ -149,6 +149,52 @@ def assemble_cluster(seqs: list[str], k: int = 21, min_overlap: int = 30,
     return [s for s, a in zip(items, alive) if a]
 
 
+def _kmer_base_entropy(kid: int, k: int = 21) -> float:
+    """Per-base Shannon entropy (bits) of a base-4 k-mer id.
+
+    Homopolymers sit at 0, near-homopolymers and short-period
+    satellites well below ~1.2. These k-mers legitimately occur in
+    many unrelated reads, so they chain clusters the way a masked
+    high-frequency k-mer would — but at small n they stay under the
+    frequency cap, which is why the cap alone is not enough."""
+    c1 = c2 = c3 = c4 = 0
+    for _ in range(k):
+        d = kid & 3
+        if d == 0:
+            c1 += 1
+        elif d == 1:
+            c2 += 1
+        elif d == 2:
+            c3 += 1
+        else:
+            c4 += 1
+        kid >>= 2
+    h = 0.0
+    for c in (c1, c2, c3, c4):
+        if c:
+            p = c / k
+            h -= p * np.log2(p)
+    return h
+
+
+# k-mers below this per-base entropy never seed a shared-kmer edge;
+# ~8 bits total across a 21-mer masks homopolymers and short-period
+# runs while keeping ordinary genomic k-mers (~1.7-2.0 bits/base).
+KMER_MIN_ENTROPY = 0.4
+
+# Floor for the frequency cap: cap must stay above min_shared or
+# every k-mer shared by >= min_shared reads is masked and clustering
+# degenerates to singletons on small inputs (n * max_kmer_freq < 3).
+MIN_FREQ_CAP = 8
+
+# Hard bound on pair emission per k-mer: a group of m reads yields
+# m(m-1)/2 pairs, so beyond a few hundred members the edge dict
+# explodes combinatorially. Groups this large under the cap are
+# near-universal anyway; skipping is cheaper than partial emission
+# because partial pair order would bias clustering toward read order.
+MAX_GROUP_MEMBERS = 200
+
+
 def cluster_reads(ids: list[str], seqs: list[str], k: int = 21,
                   min_shared: int = 2, max_kmer_freq: float = 0.10,
                   max_cluster_reads: int = 64,
@@ -161,8 +207,10 @@ def cluster_reads(ids: list[str], seqs: list[str], k: int = 21,
     union is only allowed while the merged cluster stays under
     max_cluster_reads (bounds memory + transitive chaining). K-mers
     occurring in > max_kmer_freq of reads are masked (repeats /
-    universal markers would chain unrelated loci). Each cluster is then
-    overlap-assembled; returns (member_ids, [assembled seqs]) --
+    universal markers would chain unrelated loci); low-complexity
+    k-mers are additionally masked by base entropy so homopolymer
+    runs can't chain reads that slip under the cap. Each cluster is
+    then overlap-assembled; returns (member_ids, [assembled seqs]) --
     usually one seq, more when assembly splits into disjoint contigs.
 
     Single-sort design: an earlier version held per-read k-mer sets +
@@ -182,7 +230,7 @@ def cluster_reads(ids: list[str], seqs: list[str], k: int = 21,
             ka.append(kids)
             ra.append(np.full(kids.size, i, dtype=np.int32))
     shared: dict[tuple[int, int], int] = defaultdict(int)
-    cap = max(2, int(max_kmer_freq * n))
+    cap = max(MIN_FREQ_CAP, int(max_kmer_freq * n))
     if ka:
         km = np.concatenate(ka)
         rd = np.concatenate(ra)
@@ -197,13 +245,18 @@ def cluster_reads(ids: list[str], seqs: list[str], k: int = 21,
         del keep
         starts = np.flatnonzero(np.r_[True, km[1:] != km[:-1]])
         ends = np.r_[starts[1:], len(km)]
+        # per-kmer base entropy mask: decode the k-mer id once per
+        # distinct group (groups surviving the caps are small)
+        ent = np.array([_kmer_base_entropy(int(km[s]), k)
+                        for s in starts])
         del km
-        # groups >200 members are combinatorially skipped (same rule
-        # as before: each member pair is O(1) work only for small
-        # groups; huge groups are near-mask kmers anyway)
-        for st, en in zip(starts.tolist(), ends.tolist()):
+        # groups > MAX_GROUP_MEMBERS are combinatorially skipped (the
+        # edge dict is O(m^2) per k-mer; near-cap groups at metagenome
+        # n are universal anyway)
+        for st, en, e in zip(starts.tolist(), ends.tolist(), ent):
             m = en - st
-            if m < 2 or m > cap or m > 200:
+            if (m < 2 or m > cap or m > MAX_GROUP_MEMBERS
+                    or e < KMER_MIN_ENTROPY):
                 continue
             mem = rd[st:en]
             for a_i in range(m):
@@ -310,6 +363,29 @@ def _rows(arr, idxs):
     return arr[idxs]
 
 
+def _host_sketch(host_fasta) -> set:
+    """Union of canonical 21-mer ids over a host reference FASTA."""
+    sk: set[int] = set()
+    for _h, s, _c in iter_sequences(Path(host_fasta)):
+        sk.update(_kmer_ids(s, 21).tolist())
+    return sk
+
+
+def _host_masked(ids, seqs, host_km: set, k: int = 21,
+                 min_contain: float = 0.5) -> tuple:
+    """Drop units whose k-mer containment in the host sketch exceeds
+    min_contain — host reads dominate real metagenomic samples and
+    would otherwise anchor the abundance profile on the host, not
+    the community. Reads shorter than k (no k-mers) are kept."""
+    keep_i = [i for i, s in enumerate(seqs)
+              if _kmer_ids(s, k).size == 0
+              or (len(set(_kmer_ids(s, k).tolist()) & host_km)
+                  / len(set(_kmer_ids(s, k).tolist()))
+                  <= min_contain)]
+    return ([ids[i] for i in keep_i], [seqs[i] for i in keep_i],
+            len(ids) - len(keep_i))
+
+
 def run_profile(model_path, inputs, out_prefix: Path,
                 mode: str = "auto", reads2=None,
                 window: int = 500, stride: int = 250,
@@ -323,6 +399,8 @@ def run_profile(model_path, inputs, out_prefix: Path,
                 pack_below: int = 300,
                 domain_threshold: float = 0.5,
                 pool_reads: bool = False,
+                host_filter=None,
+                host_min_contain: float = 0.5,
                 verbose: bool = True) -> dict:
     """Run profiling; writes precontig/taxonomy/function outputs;
     returns the summary dict."""
@@ -343,9 +421,17 @@ def run_profile(model_path, inputs, out_prefix: Path,
             if n_sample >= 200:
                 break
 
+    host_km = None
+    if host_filter is not None:
+        host_km = _host_sketch(host_filter)
+        if verbose:
+            print(f"  host sketch: {len(host_km):,} distinct kmers "
+                  f"from {host_filter}")
+
     # units: id, member read ids, emitted seqs, windows split into
     # real vs 'N'-joined virtual (encoded with zeroed pos channels)
     units: list[dict] = []
+    n_host_dropped = 0
     if mode == "contig":
         for path in inputs:
             for cid, seq, cov in iter_sequences(Path(path)):
@@ -356,6 +442,14 @@ def run_profile(model_path, inputs, out_prefix: Path,
                               "seqs": [seq], "windows": ws,
                               "virtual": [False] * len(ws),
                               "cov": float(cov), "bp": len(seq)})
+        if host_km is not None:
+            ids = [u["id"] for u in units]
+            seqs = [u["seqs"][0] for u in units]
+            ids_k, seqs_k, n_host_dropped = _host_masked(
+                ids, seqs, host_km, k=cluster_k,
+                min_contain=host_min_contain)
+            keep = set(ids_k)
+            units = [u for u in units if u["id"] in keep]
     elif mode in ("precontig", "raw"):
         ids, seqs = [], []
         if reads2:
@@ -368,6 +462,13 @@ def run_profile(model_path, inputs, out_prefix: Path,
                 for rid, s, _c in iter_sequences(Path(path)):
                     ids.append(rid)
                     seqs.append(s)
+        if host_km is not None:
+            ids, seqs, n_host_dropped = _host_masked(
+                ids, seqs, host_km, k=cluster_k,
+                min_contain=host_min_contain)
+            if verbose:
+                print(f"  host filter: dropped {n_host_dropped:,} "
+                      f"of {len(ids) + n_host_dropped:,} reads")
         if mode == "precontig":
             groups = cluster_reads(ids, seqs, k=cluster_k,
                                    min_shared=cluster_min_shared,
@@ -638,6 +739,8 @@ def run_profile(model_path, inputs, out_prefix: Path,
     summary = {
         "mode": mode,
         "n_units": len(tax_rows),
+        "host_filtered_units": (n_host_dropped
+                               if host_km is not None else ""),
         "n_reads": (total_reads if mode != "contig" else ""),
         "n_lineages": len(abund),
         "unclassified_fraction": round(uncl, 4),

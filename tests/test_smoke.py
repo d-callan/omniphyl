@@ -956,7 +956,7 @@ def test_end_to_end():
          "--fragments", str(fna), "--labels", str(lab),
          "--out", str(out_a), "--k", "3", "--width", "16",
          "--epochs", "2", "--batch-size", "16", "--val-frac", "0.5",
-         "--region-head", "--struct-head", "--domain-head-k", "8",
+         "--struct-head", "--domain-head-k", "8",
          "--num-workers", "0", "--pos-channels", "--cpu"],
         capture_output=True, text=True, timeout=600)
     check("annot train exits 0", r.returncode == 0,
@@ -967,10 +967,11 @@ def test_end_to_end():
         import torch
         cka = torch.load(ck_a, map_location="cpu",
                          weights_only=False)
-        check("annot ckpt has the three head groups",
-              "heads.region_fracs.weight" in cka["model"] and
+        # region head retired (5da4628): struct + domain heads remain
+        check("annot ckpt has the two head groups",
               "head_frame.weight" in cka["model"] and
-              "heads.domains.weight" in cka["model"],
+              "heads.domains.weight" in cka["model"] and
+              "heads.region_fracs.weight" not in cka["model"],
               sorted(k for k in cka["model"] if "region" in k
                      or "frame" in k or "domains" in k))
         check("domain vocab respects >=20 floor",
@@ -990,7 +991,7 @@ def test_end_to_end():
             res = json.loads(res_a[0].read_text())
             ah = res.get("annot_heads", {})
             check("annot_heads sections present",
-                  "region_fracs" in ah and "active_frame" in ah
+                  "active_frame" in ah
                   and "struct_flags" in ah and "domains" in ah,
                   list(ah))
             fs = res.get("split_metrics", {}).get(
@@ -1009,11 +1010,11 @@ def test_end_to_end():
                 "val", {}).get("annot_heads", {}).get("region_fracs", {})
             check("intron-vs-intergenic AUROC emitted",
                   not rf or "intron_vs_intergenic_auroc" in rf, rf)
-            check("per_region breakdown + val_per_group emitted",
-                  "per_region" in rf and "val_per_group" in res and
+            check("val_per_group + coding_frac binary_acc emitted",
+                  "val_per_group" in res and
                   "binary_acc" in res.get("annotation_heads", {})
                                      .get("coding_frac", {}),
-                  list(rf.get("per_region", {})))
+                  list(res.get("annotation_heads", {})))
             check("reconciled genome consensus emitted",
                   "genome_consensus" in res.get("reconciled", {}),
                   list(res.get("reconciled", {})))
@@ -1062,7 +1063,7 @@ def test_end_to_end():
          "--fragments", str(fna), "--labels", str(lab),
          "--out", str(out_c), "--k", "3", "--width", "16",
          "--epochs", "2", "--batch-size", "16", "--val-frac", "0.5",
-         "--region-head", "--struct-head", "--domain-head-k", "8",
+         "--struct-head", "--domain-head-k", "8",
          "--annot-ctx", "--annot-weight", "0.5",
          "--num-workers", "0", "--pos-channels", "--cpu"],
         capture_output=True, text=True, timeout=600)
@@ -1075,9 +1076,8 @@ def test_end_to_end():
         ckc = torch.load(ck_c, map_location="cpu",
                          weights_only=False)
         check("annot-ctx ckpt uses detached-ctx head modules",
-              "head_region.weight" in ckc["model"] and
               "head_domains.weight" in ckc["model"] and
-              "heads.region_fracs.weight" not in ckc["model"],
+              "heads.domains.weight" not in ckc["model"],
               sorted(k for k in ckc["model"]
                      if "region" in k or "domains" in k))
         check("annot_ctx flag round-trips in ckpt args",
@@ -1095,7 +1095,6 @@ def test_end_to_end():
         if res_c:
             res = json.loads(res_c[0].read_text())
             check("annot-ctx eval emits annot_heads sections",
-                  "region_fracs" in res.get("annot_heads", {}) and
                   "domains" in res.get("annot_heads", {}),
                   list(res.get("annot_heads", {})))
 

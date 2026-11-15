@@ -136,6 +136,14 @@ def _profile_parser(sub):
                     help="skip unitig assembly: clusters only define "
                          "pooling groups, each member read is its own "
                          "model input")
+    ap.add_argument("--host-filter", type=Path, default=None,
+                    help="host reference FASTA (e.g. GRCh38): reads/"
+                         "contigs whose canonical-kmer containment in "
+                         "this sketch exceeds --host-min-contain are "
+                         "dropped before profiling")
+    ap.add_argument("--host-min-contain", type=float, default=0.5,
+                    help="k-mer containment fraction at which a unit "
+                         "is called host-derived (default 0.5)")
     return ap
 
 
@@ -197,6 +205,8 @@ def main(argv=None) -> int:
             pack_below=args.pack_below,
             pool_reads=args.pool_reads,
             domain_threshold=args.domain_threshold,
+            host_filter=args.host_filter,
+            host_min_contain=args.host_min_contain,
             verbose=not args.quiet)
     return 0
 

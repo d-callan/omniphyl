@@ -23,10 +23,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .encode import (AA_DIM, AA_EXTRA_DIM, AA_FRAME_DIM, HASH_BUCKETS,
-                     HASH_PAD, MS_KS, FeatureEncoder)
+from .encode import (AA_DIM, AA_EXTRA_DIM, AA_EXTRA_V2_DIM, AA_FRAME_DIM,
+                     DNA_STATS_DIM, HASH_BUCKETS, HASH_PAD, MS_KS,
+                     FeatureEncoder)
 
 RANKS = ["domain", "phylum", "class", "order", "family", "genus", "species"]
+# ancestor-chain sentinels: 0 = parent exists but out-of-vocab (mask
+# class); -1 = no parent info at all (legacy parent_of walk); -2 = true
+# rankless gap — NCBI legitimately lacks a name at this rank for the
+# lineage (Sar/Discoba protists, many viral realms). -2 must never be
+# penalized in path scores nor emitted as <unknown>.
+GAP_SENTINEL = -2
+OOV_SENTINEL = 0
+
+# replicon head classes (window-level): labeled for free from RefSeq GFF
+# genome= attributes / seqid provenance in fetch_refseq_corpus.py.
+REPLICON_CLASSES = ("nuclear_or_chrom", "mitochondrion", "plastid",
+                    "plasmid_or_viral")
 CODING_TARGETS = ["coding", "non-coding"]  # legacy binary labels; superseded by fractions
 # Continuous annotation heads (see docs/annotation-cascade.md):
 #   coding_frac  mixture-aware fraction target (replaces binary coding)
@@ -167,16 +180,26 @@ def build_tree(meta: dict[str, dict], vocab: dict[str, dict],
     """
     counts = {r: np.zeros(len(vocab[r]) + 1) for r in ranks}
     parent_votes = {r: defaultdict(Counter) for r in ranks[1:]}
+    # anc_votes[r][j][class_name][ancestor_name]: majority vote for the
+    # ancestor of each rank-r name at EVERY shallower rank j < ri
+    # independently -- unlike parent_votes, which only looks at the
+    # immediately adjacent rank and so collapses when an intermediate
+    # rank is empty (Trypanosoma: class="" between phylum and order).
+    anc_votes = {r: [defaultdict(Counter) for _ in range(ri)]
+                 for ri, r in enumerate(ranks)}
     for m in meta.values():
         for ri, r in enumerate(ranks):
             c = vocab[r].get(m.get(r, ""), -1)
             if c == -1:
                 continue
             counts[r][c + 1] += 1
+            for j in range(ri):
+                anc_votes[r][j][m[r]][m.get(ranks[j], "")] += 1
             if ri:
                 parent_votes[r][m[r]][m.get(ranks[ri - 1], "")] += 1
     parent_of: dict[str, torch.Tensor] = {}
     log_prior: dict[str, torch.Tensor] = {}
+    ancestor_of: dict[str, np.ndarray] = {}
     for ri, r in enumerate(ranks):
         n = len(vocab[r]) + 1
         po = np.zeros(n, dtype=np.int64)
@@ -194,7 +217,23 @@ def build_tree(meta: dict[str, dict], vocab: dict[str, dict],
             for c in cs:
                 lp[c] = float(np.log((counts[r][c] + 1) / tot))
         log_prior[r] = torch.tensor(lp, dtype=torch.float32)
-    return {"parent_of": parent_of, "log_prior": log_prior}
+        # ancestor_of[r] [n, ri+1]: col j = majority-voted ancestor id
+        # at ranks[j] (1..C_j-1); -2 = rankless gap (ancestor name ""
+        # won the vote -> NCBI has no name at this rank for the
+        # lineage); 0 = named ancestor but out-of-vocab.
+        anc = np.zeros((n, ri + 1), dtype=np.int64)
+        anc[:, ri] = np.arange(n)
+        for name, c in vocab[r].items():
+            for j in range(ri):
+                pv = anc_votes[r][j].get(name)
+                if not pv:
+                    continue
+                pname = pv.most_common(1)[0][0]
+                anc[c + 1, j] = (GAP_SENTINEL if pname == "" else
+                                 vocab[ranks[j]].get(pname, -1) + 1)
+        ancestor_of[r] = anc
+    return {"parent_of": parent_of, "log_prior": log_prior,
+            "ancestor_of": ancestor_of}
 
 
 def build_flat_priors(meta: dict[str, dict], vocab: dict[str, dict],
@@ -316,7 +355,10 @@ class OmniPhyl(nn.Module):
                  aux: set | None = None,
                  aa_mode: str = "plain", aa_drop: float = 0.0,
                  region_head: bool = False, struct_head: bool = False,
-                 domain_k: int = 0, annot_ctx: bool = False):
+                 domain_k: int = 0, annot_ctx: bool = False,
+                 head_bottleneck: int = 0, bottleneck_min_classes: int = 8192,
+                 replicon_head: bool = False, dna_stats: bool = False,
+                 aa_extra_v2: bool = False):
         super().__init__()
         self.annot_ctx = annot_ctx
         if backbone == "vit":
@@ -335,7 +377,11 @@ class OmniPhyl(nn.Module):
                          if "hash" in self.aux else None)
         self.aa_mode = aa_mode if "aa" in self.aux else "plain"
         self.aa_drop = aa_drop
-        aa_in = AA_DIM + (AA_EXTRA_DIM if self.aa_mode == "gated" else 0)
+        self.aa_extra_v2 = aa_extra_v2
+        self.aa_extra_dim = (AA_EXTRA_V2_DIM if aa_extra_v2
+                             else AA_EXTRA_DIM)
+        aa_in = AA_DIM + (self.aa_extra_dim
+                          if self.aa_mode == "gated" else 0)
         if "aa" not in self.aux:
             self.aa_proj = None
         elif self.aa_mode == "bottleneck":
@@ -356,20 +402,43 @@ class OmniPhyl(nn.Module):
         self.coding_head_dna = (nn.Linear(self.encoder.latent, 1)
                                 if gated else None)
         self.aa_gate = (nn.Linear(
-            self.encoder.latent + 1 + AA_EXTRA_DIM, aux_dim)
+            self.encoder.latent + 1 + self.aa_extra_dim, aux_dim)
             if gated else None)
-        self.latent = self.encoder.latent + aux_dim * len(self.aux)
+        # dna_stats scalars (repeat/CpG complexity) are concatenated into
+        # the fused latent -- NOT extra conv channels -- so backbone
+        # weight shapes are untouched. gated coding_head_dna stays on
+        # the raw encoder latent like the aa branch.
+        self.dna_stats = dna_stats
+        self.latent = (self.encoder.latent + aux_dim * len(self.aux)
+                       + (DNA_STATS_DIM if dna_stats else 0))
         self.infer_tau = 0.0   # prior offset at inference (MAP if >0)
         self.drop = nn.Dropout(dropout)
         keys = targets if targets is not None else list(n_classes.keys())
         if gated:              # coding_frac comes from z_dna, not z
             keys = [t for t in keys if t != "coding_frac"]
         tree_po = (tree or {}).get("parent_of", {}) if head == "tree" else {}
-        self.heads = nn.ModuleDict(
-            {t: (TreeRankHead(self.latent, n_classes[t],
-                              tree["parent_of"][t], tree["log_prior"][t])
-                 if t in tree_po else nn.Linear(self.latent, n_classes[t]))
-             for t in keys})
+        self.head_bottleneck = head_bottleneck
+        self.bottleneck_min_classes = bottleneck_min_classes
+
+        def _rank_head(t):
+            if t in tree_po:
+                return TreeRankHead(self.latent, n_classes[t],
+                                    tree["parent_of"][t],
+                                    tree["log_prior"][t])
+            if (head_bottleneck
+                    and n_classes[t] > bottleneck_min_classes):
+                # ToL species/genus heads: 120k+ classes x ~900 latent
+                # would cost ~100M params and 3.5x the backbone; a
+                # 256-d bottlenecked projection cuts that ~3.5x and
+                # lets training compute CE on labeled rows only
+                # (sel_mask in forward).
+                return nn.Sequential(
+                    nn.Linear(self.latent, head_bottleneck, bias=False),
+                    nn.LayerNorm(head_bottleneck), nn.GELU(),
+                    nn.Linear(head_bottleneck, n_classes[t]))
+            return nn.Linear(self.latent, n_classes[t])
+
+        self.heads = nn.ModuleDict({t: _rank_head(t) for t in keys})
         # P3 annotation heads (E3 region composition / E5 domain multi-
         # label) are plain linears on z; they ride the heads dict since
         # their input is the fused latent. The struct pair (E4) needs
@@ -398,6 +467,9 @@ class OmniPhyl(nn.Module):
                 self.heads["region_fracs"] = nn.Linear(self.latent, 4)
             if domain_k:
                 self.heads["domains"] = nn.Linear(self.latent, domain_k)
+        if replicon_head:
+            self.heads["replicon"] = nn.Linear(
+                self.latent, len(REPLICON_CLASSES))
         self.struct_head = struct_head
         if struct_head:
             struct_in = (self.latent + AA_FRAME_DIM
@@ -410,7 +482,15 @@ class OmniPhyl(nn.Module):
         return {t: h.cond_logits(z, tau) for t, h in self.heads.items()
                 if isinstance(h, TreeRankHead)}
 
-    def forward(self, x):
+    def forward(self, x, sel_mask: dict | None = None):
+        """x -> (z, logits dict).
+
+        sel_mask: {head_name: bool row mask} -- heads named here compute
+        logits ONLY on the selected rows (selective CE for huge species
+        heads: skips the [B, C] matmul on unlabeled MAG/env rows).
+        logits[t] then has [n_selected, C] rows aligned with the mask;
+        callers must gather labels with the same mask.
+        """
         lcf = None
         if isinstance(x, dict):
             z_dna = self.encoder(x["x"])
@@ -425,7 +505,7 @@ class OmniPhyl(nn.Module):
                 if self.aa_gate is not None:
                     gi = torch.cat(
                         [z_dna, lcf.detach(),
-                         x["aa"][:, -AA_EXTRA_DIM:]], 1)
+                         x["aa"][:, -self.aa_extra_dim:]], 1)
                     g = torch.sigmoid(self.aa_gate(gi))
                     if self.training and self.aa_drop > 0:
                         keep = torch.bernoulli(torch.full(
@@ -434,13 +514,22 @@ class OmniPhyl(nn.Module):
                         g = g * keep
                     za = g * za
                 parts.append(za)
+            if self.dna_stats:
+                ds = (x.get("dna_stats") if isinstance(x, dict)
+                      else None)
+                if ds is None:
+                    ds = z_dna.new_zeros(z_dna.size(0), DNA_STATS_DIM)
+                parts.append(ds)
             z = self.drop(torch.cat(parts, 1))
         else:
             z = self.drop(self.encoder(x))
         logits = {}
         prev_ext = None  # [B, C_prev] chained log-marginals, col 0 = log 1
         for t, h in self.heads.items():
-            if isinstance(h, TreeRankHead):
+            if (sel_mask is not None and t in sel_mask
+                    and not isinstance(h, TreeRankHead)):
+                logits[t] = h(z[sel_mask[t]])
+            elif isinstance(h, TreeRankHead):
                 logm = h.marginal_logp(z, prev_ext, self.infer_tau)
                 prev_ext = torch.cat(
                     [logm.new_zeros(logm.size(0), 1), logm], 1)
@@ -562,6 +651,7 @@ class BatchPredictions:
     active_frame: np.ndarray | None      # [N, 8]
     struct_flags: np.ndarray | None      # [N, 4]
     domains: np.ndarray | None           # [N, K]
+    replicon: np.ndarray | None = None   # [N, 4] P(REPLICON_CLASSES)
     extra: dict = field(default_factory=dict)
 
 
@@ -608,7 +698,13 @@ class OmniPhylPredictor:
             region_head=bool(ta.get("region_head")),
             struct_head=bool(ta.get("struct_head")),
             domain_k=len(ckpt.get("domain_vocab", {})),
-            annot_ctx=bool(ta.get("annot_ctx")))
+            annot_ctx=bool(ta.get("annot_ctx")),
+            head_bottleneck=int(ta.get("head_bottleneck") or 0),
+            bottleneck_min_classes=int(
+                ta.get("bottleneck_min_classes") or 8192),
+            replicon_head=bool(ta.get("replicon_head")),
+            dna_stats=bool(ta.get("dna_stats")),
+            aa_extra_v2=bool(ta.get("aa_extra_v2")))
         self.model.load_state_dict(ckpt["model"])
 
         # --- missing-head warnings (graceful degradation) ---------------
@@ -653,11 +749,18 @@ class OmniPhylPredictor:
         self.encoder = FeatureEncoder(self.k, self.train_args)
 
         # --- NCBI reconciliation state --------------------------------------
-        tree_po = (ckpt.get("tree") or {}).get("parent_of")
+        tree_d = ckpt.get("tree") or {}
         self.chains: dict | None = None
-        if tree_po is not None:
+        if tree_d.get("ancestor_of") is not None:
+            # gap-bridging chains (ToL): cols carry ancestor ids at each
+            # shallower rank voted independently, with -2 = rankless gap
+            # (NCBI has no name there) and 0 = OOV.
+            self.chains = {
+                r: np.asarray(tree_d["ancestor_of"][r], dtype=np.int64)
+                for r in self.cls_targets if r in tree_d["ancestor_of"]}
+        elif tree_d.get("parent_of") is not None:
             self.chains = ancestor_chains(
-                {r: np.asarray(tree_po[r], dtype=np.int64)
+                {r: np.asarray(tree_d["parent_of"][r], dtype=np.int64)
                  for r in self.cls_targets}, self.cls_targets)
         self.id2name: dict[str, dict[int, str]] = {
             t: {i + 1: n for n, i in v.items()}
@@ -671,7 +774,8 @@ class OmniPhylPredictor:
                       virtual_joined: bool):
         """Yield per-batch (adjusted-logits dict, raw-logits dict)."""
         enc_dtype = {"x": torch.float32, "hash": torch.int64,
-                     "aa": torch.float32, "aa_frame": torch.float32}
+                     "aa": torch.float32, "aa_frame": torch.float32,
+                     "dna_stats": torch.float32}
         for i in range(0, len(seqs), batch_size):
             chunk = seqs[i:i + batch_size]
             enc = self.encoder.encode_batch(chunk,
@@ -683,8 +787,15 @@ class OmniPhylPredictor:
             yield logits
 
     def predict_sequences(self, seqs: list[str], batch_size: int = 256,
-                          virtual_joined: bool = False) -> BatchPredictions:
-        """seqs -> stacked numpy predictions for all available heads."""
+                          virtual_joined: bool = False,
+                          return_window_tax: bool = True
+                          ) -> BatchPredictions:
+        """seqs -> stacked numpy predictions for all available heads.
+
+        return_window_tax=False skips materializing per-window logp /
+        p_ood entirely (taxonomy callers that only need contig-level
+        sums should use predict_taxonomy_sums instead).
+        """
         n = len(seqs)
         logp: dict[str, list[np.ndarray]] = {t: []
                                              for t in self.cls_targets}
@@ -693,28 +804,32 @@ class OmniPhylPredictor:
         cont: dict[str, list[np.ndarray]] = {t: [] for t in CONT_TARGETS}
         ann: dict[str, list[np.ndarray]] = {
             k: [] for k in ("region_fracs", "active_frame",
-                            "struct_flags", "domains")}
+                            "struct_flags", "domains", "replicon")}
         for logits in self._batch_logits(seqs, batch_size, virtual_joined):
-            for t in self.cls_targets:
-                raw = logits[t].float()
-                # p_ood: softmax at the TRAINING flat tau — the network's
-                # class-0 logit was calibrated against train_tau * lp[0],
-                # so user overrides must not touch this statistic.
-                if t in self.flat_lp:
-                    raw_ood = raw + self.train_flat_tau \
-                        * self.flat_lp[t].to(raw.device)
-                else:
-                    raw_ood = raw
-                p_ood[t].append(raw_ood.softmax(1)[:, 0].cpu().numpy())
-                # known-class logp: user-selected prior tau, class 0 masked.
-                if t in self.flat_lp:
-                    adj = raw + self.user_flat_tau \
-                        * self.flat_lp[t].to(raw.device)
-                else:
-                    adj = raw
-                adj = adj.clone()
-                adj[:, 0] = -1e9
-                logp[t].append(F.log_softmax(adj, 1).cpu().numpy())
+            if return_window_tax:
+                for t in self.cls_targets:
+                    raw = logits[t].float()
+                    # p_ood: softmax at the TRAINING flat tau — the
+                    # network's class-0 logit was calibrated against
+                    # train_tau * lp[0], so user overrides must not
+                    # touch this statistic.
+                    if t in self.flat_lp:
+                        raw_ood = raw + self.train_flat_tau \
+                            * self.flat_lp[t].to(raw.device)
+                    else:
+                        raw_ood = raw
+                    p_ood[t].append(
+                        raw_ood.softmax(1)[:, 0].cpu().numpy())
+                    # known-class logp: user-selected prior tau,
+                    # class 0 masked.
+                    if t in self.flat_lp:
+                        adj = raw + self.user_flat_tau \
+                            * self.flat_lp[t].to(raw.device)
+                    else:
+                        adj = raw
+                    adj = adj.clone()
+                    adj[:, 0] = -1e9
+                    logp[t].append(F.log_softmax(adj, 1).cpu().numpy())
             for t in CONT_TARGETS:
                 if t in logits:
                     cont[t].append(
@@ -731,6 +846,9 @@ class OmniPhylPredictor:
             if "domains" in logits:
                 ann["domains"].append(
                     logits["domains"].sigmoid().cpu().numpy())
+            if "replicon" in logits:
+                ann["replicon"].append(
+                    logits["replicon"].softmax(1).cpu().numpy())
 
         def cat(parts, shape_tail=()):
             if not parts or not parts[0]:
@@ -758,7 +876,45 @@ class OmniPhylPredictor:
             struct_flags=(np.concatenate(ann["struct_flags"])
                           if ann["struct_flags"] else None),
             domains=(np.concatenate(ann["domains"])
-                     if ann["domains"] else None))
+                     if ann["domains"] else None),
+            replicon=(np.concatenate(ann["replicon"])
+                      if ann["replicon"] else None))
+
+    def predict_taxonomy_sums(self, seqs: list[str],
+                              batch_size: int = 256,
+                              virtual_joined: bool = False) -> dict:
+        """Streaming rank-sum over seqs without materializing [N, C] logp.
+
+        Returns {"n": N, "logp": {t: float64 [C]}, "pood": {t: float}} —
+        the same accumulations annotate performs per contig. Use for
+        pooled calls over huge window sets where even one sub-batch of
+        the species head would exceed memory (C_species ~ 120k).
+        """
+        sums = {"n": len(seqs), "logp": {}, "pood": {}}
+        i = 0
+        for logits in self._batch_logits(seqs, batch_size, virtual_joined):
+            bs = logits[next(iter(logits))].size(0)
+            for t in self.cls_targets:
+                raw = logits[t].float()
+                if t in self.flat_lp:
+                    raw_ood = raw + self.train_flat_tau \
+                        * self.flat_lp[t].to(raw.device)
+                    adj = raw + self.user_flat_tau \
+                        * self.flat_lp[t].to(raw.device)
+                else:
+                    raw_ood = adj = raw
+                adj = adj.clone()
+                adj[:, 0] = -1e9
+                # exp in float32 + float64 accumulate, identical to the
+                # per-contig path in annotate._flush_group
+                acc = np.exp(F.log_softmax(adj, 1).cpu().numpy()
+                             ).sum(0, dtype=np.float64)
+                sums["logp"][t] = sums["logp"].get(t, 0.0) + acc
+                sums["pood"][t] = (sums["pood"].get(t, 0.0) +
+                                   float(raw_ood.softmax(1)[:, 0]
+                                         .sum().cpu()))
+            i += bs
+        return sums
 
     # ------------------------------------------------------------------
     def reconcile_logp(self, pooled_logp: dict[str, np.ndarray],
@@ -845,9 +1001,11 @@ class OmniPhylPredictor:
                 ri_star = self.cls_targets.index(r_star)
                 if self.chains is not None:
                     # project shallower ranks deterministically from the
-                    # anchor class's true NCBI chain
+                    # anchor class's true NCBI chain; keep the sentinel
+                    # sign so rankless gaps (-2) are distinguishable
+                    # from OOV (0/-1)
                     chain_row = self.chains[r_star][c_star]
-                    proj = {t: (max(0, int(chain_row[j]))
+                    proj = {t: (int(chain_row[j])
                                 if j <= ri_star else 0)
                             for j, t in enumerate(self.cls_targets)}
                 else:
@@ -857,12 +1015,21 @@ class OmniPhylPredictor:
                                 if j <= ri_star else 0)
                             for j, t in enumerate(self.cls_targets)}
                 for t in self.cls_targets:
-                    cid = proj[t]
+                    v = proj[t]
+                    cid = max(0, v)
                     ids[t] = cid
-                    names[t] = (self.id2name[t].get(cid, "<unknown>")
-                                if cid else
-                                f"unclassified_"
-                                f"{self.id2name[r_star][c_star]}")
+                    if v == GAP_SENTINEL:
+                        # NCBI legitimately lacks a name at this rank
+                        # (rankless protist supergroups, viral realms):
+                        # emit the taxonomy term for unplaced taxa
+                        # rather than corrupting the lineage with
+                        # <unknown>/unclassified.
+                        names[t] = "incertae_sedis"
+                    else:
+                        names[t] = (self.id2name[t].get(cid, "<unknown>")
+                                    if cid else
+                                    f"unclassified_"
+                                    f"{self.id2name[r_star][c_star]}")
             else:
                 for t in self.cls_targets:
                     ids[t] = 0

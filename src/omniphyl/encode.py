@@ -177,30 +177,112 @@ AA_ALPHA = len(AA_LETTERS) + 1
 AA_DIM = AA_ALPHA ** 3         # 9261-dim tripeptide spectrum
 AA_EXTRA_DIM = 18              # gated mode: 6 frames x (stop density,
                                #   longest ORF fraction, TGA share of stops)
+AA_EXTRA_V2_DIM = 30           # ToL: + per-frame (TGA-only ORF frac,
+                               #   AGA/AGG density) -- ciliate (code 6) and
+                               #   vertebrate-mito (code 2) signatures
+
+# ------------------------------------------------------ genetic codes ---
+# Standard NCBI translation table (code 1); letters use the AA_LETTERS
+# alphabet with "*" = stop. Codes that reassign sense codons or stops are
+# expressed as overrides on this table (NCBI gc.prt).
+_STANDARD_CODE = {
+    "TTT": "F", "TTC": "F", "TTA": "L", "TTG": "L",
+    "CTT": "L", "CTC": "L", "CTA": "L", "CTG": "L",
+    "ATT": "I", "ATC": "I", "ATA": "I", "ATG": "M",
+    "GTT": "V", "GTC": "V", "GTA": "V", "GTG": "V",
+    "TCT": "S", "TCC": "S", "TCA": "S", "TCG": "S",
+    "CCT": "P", "CCC": "P", "CCA": "P", "CCG": "P",
+    "ACT": "T", "ACC": "T", "ACA": "T", "ACG": "T",
+    "GCT": "A", "GCC": "A", "GCA": "A", "GCG": "A",
+    "TAT": "Y", "TAC": "Y", "TAA": "*", "TAG": "*",
+    "CAT": "H", "CAC": "H", "CAA": "Q", "CAG": "Q",
+    "AAT": "N", "AAC": "N", "AAA": "K", "AAG": "K",
+    "GAT": "D", "GAC": "D", "GAA": "E", "GAG": "E",
+    "TGT": "C", "TGC": "C", "TGA": "*", "TGG": "W",
+    "CGT": "R", "CGC": "R", "CGA": "R", "CGG": "R",
+    "AGT": "S", "AGC": "S", "AGA": "R", "AGG": "R",
+    "GGT": "G", "GGC": "G", "GGA": "G", "GGG": "G",
+}
+
+# Codon reassignments per NCBI genetic code (gc.prt), relative to code 1.
+# Only differences from the standard table are listed; code 11 is
+# amino-acid-identical to 1 (it differs in the START set only).
+_GCODE_OVERRIDES: dict[int, dict[str, str]] = {
+    # 2  Vertebrate mitochondrial: TGA->Trp, ATA->Met, AGA/AGG->stop
+    2: {"TGA": "W", "ATA": "M", "AGA": "*", "AGG": "*"},
+    # 4  Mold/protozoan/coelenterate mt + Mycoplasma/Spiroplasma: TGA->Trp
+    4: {"TGA": "W"},
+    # 5  Invertebrate mitochondrial: TGA->Trp, ATA->Met, AGA/AGG->Ser
+    5: {"TGA": "W", "ATA": "M", "AGA": "S", "AGG": "S"},
+    # 6  Ciliate/Dasycladacean/Hexamita nuclear: TAA/TAG->Gln (TGA only stop)
+    6: {"TAA": "Q", "TAG": "Q"},
+    # 11 Bacterial/Archaeal/Plastid: sense codons identical to code 1
+    11: {},
+    # 12 Alternative yeast nuclear (Candida CTG clade): CTG->Ser
+    12: {"CTG": "S"},
+    # 16 Chlorophycean mitochondrial: TAG->Leu
+    16: {"TAG": "L"},
+    # 22 Scenedesmus obliquus mitochondrial: TAG->Leu, TCA->stop
+    22: {"TAG": "L", "TCA": "*"},
+    # 23 Thraustochytrium mitochondrial: TTA->stop
+    23: {"TTA": "*"},
+    # 25 Candidate Division SR1 / Gracilibacteria: TGA->Gly
+    25: {"TGA": "G"},
+}
+
+_BASES = "ACGT"
+# base-4 codon index -> codon string (d0 most significant)
+_CODON_STRS = [_BASES[i // 16] + _BASES[(i // 4) % 4] + _BASES[i % 4]
+               for i in range(64)]
 
 
-def _build_aa_lut() -> np.ndarray:
-    """codon base-4 index (A,C,G,T digit order) -> AA letter idx; 20=stop."""
-    # standard genetic code, rows = first base, cols = second*4+third
-    # in T,C,A,G order
-    rows = {"T": "FFLLSSSSYY**CC*W",
-            "C": "LLLLPPPPHHQQRRRR",
-            "A": "IIIMTTTTNNKKSSRR",
-            "G": "VVVVAAAADDEEGGGG"}
-    tcag = {0: 2, 1: 1, 2: 3, 3: 0}      # our digit -> T,C,A,G position
-    first = {0: "A", 1: "C", 2: "G", 3: "T"}
+def _build_aa_lut(overrides: dict[str, str] | None = None) -> np.ndarray:
+    """codon base-4 index (A,C,G,T digit order) -> AA letter idx; 20=stop.
+
+    overrides: codon -> letter reassignments on top of the standard code
+    (code 1); ``overrides=None`` reproduces the legacy standard LUT
+    bit-exactly.
+    """
+    table = _STANDARD_CODE if not overrides else {**_STANDARD_CODE,
+                                                  **overrides}
     lut = np.full(64, -1, dtype=np.int64)
-    for d0 in range(4):
-        row = rows[first[d0]]
-        for d1 in range(4):
-            for d2 in range(4):
-                aa = row[tcag[d1] * 4 + tcag[d2]]
-                lut[d0 * 16 + d1 * 4 + d2] = (
-                    AA_ALPHA - 1 if aa == "*" else AA_LETTERS.index(aa))
+    for i in range(64):
+        aa = table[_CODON_STRS[i]]
+        lut[i] = AA_ALPHA - 1 if aa == "*" else AA_LETTERS.index(aa)
     return lut
 
 
-_AA_LUT = _build_aa_lut()
+GCODE_LUTS: dict[int, np.ndarray] = {
+    g: _build_aa_lut(_GCODE_OVERRIDES.get(g))
+    for g in (1, 2, 4, 5, 6, 11, 12, 16, 22, 23, 25)}
+_AA_LUT = GCODE_LUTS[1]      # standard code; fixed Stage-1 basis
+
+GCODE_STOPS: dict[int, set] = {
+    g: {_CODON_STRS[i] for i in range(64) if lut[i] == AA_ALPHA - 1}
+    for g, lut in GCODE_LUTS.items()}
+
+# Start codons per code (gc.prt). Code 1 here uses the prokaryotic-style
+# ATG/GTG/TTG set historically named STARTS (euk nuclear callers pass
+# ("ATG",) explicitly, as before).
+GCODE_STARTS: dict[int, set] = {
+    1: {"ATG", "GTG", "TTG"},
+    2: {"ATG", "ATA", "ATT", "ATC", "GTG"},
+    4: {"TTA", "TTG", "CTG", "ATT", "ATC", "ATA", "ATG", "GTG"},
+    5: {"TTG", "ATT", "ATC", "ATA", "ATG", "GTG"},
+    6: {"ATG"},
+    11: {"ATG", "GTG", "TTG", "CTG", "ATT", "ATC", "ATA"},
+    12: {"ATG", "CTG"},
+    16: {"ATG"},
+    22: {"ATG"},
+    23: {"ATT", "ATG", "GTG"},
+    25: {"TTG", "ATG", "GTG"},
+}
+
+# Codes whose stop set differs from the standard code and can therefore
+# be distinguished by in-frame codon-usage likelihood. Standard-stop
+# codes {1, 11, 12} share identical stops and are resolved from
+# replicon/taxon context instead (see annotate._infer_gcode).
+GCODE_STOP_VARIANTS = (1, 2, 4, 5, 6, 16, 22, 23, 25)
 
 
 def hash_encode(seq: str, canon: np.ndarray) -> np.ndarray:
@@ -228,7 +310,8 @@ def hash_encode(seq: str, canon: np.ndarray) -> np.ndarray:
     return out
 
 
-def aa_encode(seq: str, extra: bool = False) -> np.ndarray:
+def aa_encode(seq: str, extra: bool = False,
+              v2: bool = False) -> np.ndarray:
     """sequence -> 6-frame AA 3-mer spectrum [AA_DIM] float32 (A3 branch).
 
     Translates all 3 frames on both strands (stop = letter 20), counts
@@ -241,17 +324,28 @@ def aa_encode(seq: str, extra: bool = False) -> np.ndarray:
     (F0,F1,F2,R0,R1,R2) -> [stop_density, longest_orf_frac, tga_ratio].
     tga_ratio (share of TGA among stops) separates Code-4 Mycoplasma
     (TGA->Trp) from standard-code genomes.
+
+    v2=True (aa_extra_v2) appends two more per-frame features, widening
+    the tail to AA_EXTRA_V2_DIM=30:
+      - tga_only_orf_frac: longest ORF fraction when only TGA counts as
+        a stop. On ciliate nuclear genomes (code 6, TAA/TAG->Gln) the
+        standard-code ORF measure collapses while this one stays high --
+        the signature for the reassignments Stage-1 must recognize.
+      - aga_agg_density: AGA+AGG codon share of the frame. Vertebrate
+        mitochondria (code 2) show near-zero in-frame AGA/AGG (they are
+        stops); standard-code genomes keep ~Arg background density.
     """
     codes = BASE2DIGIT[np.frombuffer(seq.encode("ascii", "replace"),
                                      dtype=np.uint8)]
     vec = np.zeros(AA_DIM, dtype=np.float32)
     feats: list[float] = []
+    nf = 5 if (extra and v2) else 3
     for c in (codes, 3 - codes[::-1]):      # forward + reverse-complement
         for off in range(3):
             n = (len(c) - off) // 3 * 3
             if n <= 0:
                 if extra:
-                    feats.extend((0.0, 0.0, 0.0))
+                    feats.extend((0.0,) * nf)
                 continue
             trip = c[off:off + n].reshape(-1, 3)
             ok = (trip >= 0).all(axis=1)
@@ -265,12 +359,24 @@ def aa_encode(seq: str, extra: bool = False) -> np.ndarray:
                 n_st = int(is_stop.sum())
                 sp = np.where(is_stop)[0]
                 runs = np.diff(np.concatenate(([-1], sp, [n_cod]))) - 1
-                # TGA codon id = 3*16 + 2*4 + 0 = 56 (stop #20)
-                tga = int((cidx[ok][is_stop] == 56).sum())
+                ccod = cidx[ok]            # codon ids aligned with aa
+                # TGA codon id = 3*16 + 2*4 + 0 = 56; AGA=8, AGG=10
+                tga = int((ccod[is_stop] == 56).sum())
                 feats.extend((n_st / max(n_cod, 1),
                               float(runs.max()) / max(n_cod, 1)
                               if len(runs) else 0.0,
                               tga / max(n_st, 1)))
+                if v2:
+                    is_tga = is_stop & (ccod == 56)
+                    sp2 = np.where(is_tga)[0]
+                    runs2 = np.diff(
+                        np.concatenate(([-1], sp2, [n_cod]))) - 1
+                    aga_agg = int((((ccod == 8) | (ccod == 10))
+                                   & (aa >= 0)).sum())
+                    feats.extend(
+                        (float(runs2.max()) / max(n_cod, 1)
+                         if len(runs2) else 0.0,
+                         aga_agg / max(n_cod, 1)))
             if len(aa) < 3:
                 continue
             w = np.lib.stride_tricks.sliding_window_view(aa, 3)
@@ -344,10 +450,98 @@ def seq_encode(seq: str, seq_len: int,
     return out
 
 
+# -------------------------------------- repeat/complexity scalars ----
+
+DNA_STATS_DIM = 8
+
+
+def dna_stats_encode(seq: str) -> np.ndarray:
+    """sequence -> [DNA_STATS_DIM] float32 window-level composition /
+    repeat-complexity scalars (ToL: vertebrate + plant corpora are
+    40-85% transposable elements and tandem repeats).
+
+    Kept as scalars fused into z_dna rather than extra conv channels so
+    backbone weight shapes are untouched. Features, in order:
+      0  shannon_k1  -- base-composition entropy / log2(4)
+      1  shannon_k3  -- 3-mer entropy / log2(64); low on repeats
+      2  gc          -- GC fraction
+      3  cpg_oe      -- CpG observed/expected (diploid promoters /
+                        5' exons in vertebrates are CpG-rich)
+      4  homo_frac   -- longest homopolymer run / len (poly-A/T,
+                        simple-sequence expansion)
+      5  tandem2     -- max fraction covered by a tandem dinucleotide
+                        repeat (e.g. (CA)n microsats)
+      6  tandem3     -- same for trinucleotides (CAG expansions etc.)
+      7  n_frac      -- ambiguous-base fraction
+    """
+    codes = BASE2DIGIT[np.frombuffer(seq.encode("ascii", "replace"),
+                                     dtype=np.uint8)]
+    n = len(codes)
+    out = np.zeros(DNA_STATS_DIM, dtype=np.float32)
+    if n == 0:
+        return out
+    ok = codes >= 0
+    nv = int(ok.sum())
+    out[7] = 1.0 - nv / n
+    if nv == 0:
+        return out
+    c = codes[ok]
+    # k=1 and k=3 Shannon entropy (normalized to [0,1] by max entropy)
+    cnt1 = np.bincount(c, minlength=4).astype(np.float64) / nv
+    out[0] = float(-(cnt1[cnt1 > 0] * np.log2(cnt1[cnt1 > 0])).sum() / 2.0)
+    if nv >= 3:
+        trip = c[:nv - (nv % 3)].reshape(-1, 3)
+        # contiguous 3-mers only within the filtered valid stretch
+        if len(trip) >= 1:
+            tidx = trip[:, 0] * 16 + trip[:, 1] * 4 + trip[:, 2]
+            cnt3 = np.bincount(tidx, minlength=64).astype(np.float64)
+            cnt3 /= cnt3.sum()
+            out[1] = float(-(cnt3[cnt3 > 0]
+                             * np.log2(cnt3[cnt3 > 0])).sum() / 6.0)
+    # GC + CpG O/E on valid dinucleotide positions
+    gc = float(((c == 1) | (c == 2)).sum()) / nv
+    out[2] = gc
+    pc, pg = cnt1[1], cnt1[2]
+    if nv >= 2 and pc > 0 and pg > 0:
+        di = c[:-1] * 4 + c[1:]
+        # dinucleotide index C->G is 1*4+2 = 6
+        cpg = float((di == 6).sum()) / (nv - 1)
+        out[3] = min(cpg / max(pc * pg, 1e-9), 4.0) / 4.0
+    # longest homopolymer run fraction (on raw incl. N-break boundaries)
+    if nv:
+        changes = np.concatenate(([True], c[1:] != c[:-1]))
+        runs = np.diff(np.concatenate(
+            (np.flatnonzero(changes), [len(c)])))
+        out[4] = float(runs.max()) / nv
+    # tandem di-/tri-nucleotide repeat coverage: scan periods 2,3
+    for k, out_i in ((2, 5), (3, 6)):
+        best = 0
+        for off in range(k):
+            s = c[off:]
+            w = len(s) // k
+            if w < 2:
+                continue
+            pat = s[:w * k].reshape(w, k)
+            match = (pat == pat[0][None, :]).all(1)
+            # longest run of matching units
+            i = 0
+            while i < len(match):
+                if match[i]:
+                    j = i
+                    while j + 1 < len(match) and match[j + 1]:
+                        j += 1
+                    best = max(best, (j - i + 1) * k)
+                    i = j + 1
+                else:
+                    i += 1
+        out[out_i] = best / nv
+    return out
+
+
 # -------------------------------------------- stage-2 boundary scan ---
 
-STOPS = {"TAA", "TAG", "TGA"}
-STARTS = {"ATG", "GTG", "TTG"}  # ~15-20% of prokaryotic starts are non-ATG
+STOPS = GCODE_STOPS[1]          # TAA, TAG, TGA (standard code)
+STARTS = GCODE_STARTS[1]        # ~15-20% of prokaryotic starts are non-ATG
 
 
 def scan_transition(seq: str, frame: int, kind: str,
@@ -400,7 +594,9 @@ class FeatureEncoder:
         self.aux = {a for a in (train_args.get("aux") or "").split(",")
                     if a}
         self.aa_mode = train_args.get("aa_mode", "plain")
+        self.aa_extra_v2 = bool(train_args.get("aa_extra_v2", False))
         self.struct_head = bool(train_args.get("struct_head"))
+        self.dna_stats = bool(train_args.get("dna_stats", False))
         self.lut = build_cell_lut(self.k)
         if self.backbone == "msfcgr":
             self.ms_luts = {kk: build_cell_lut(kk) for kk in MS_KS}
@@ -431,16 +627,20 @@ class FeatureEncoder:
         if "hash" in self.aux:
             out["hash"] = hash_encode(seq, self.hash_canon)
         if "aa" in self.aux:
-            out["aa"] = aa_encode(seq, extra=(self.aa_mode == "gated"))
+            out["aa"] = aa_encode(seq, extra=(self.aa_mode == "gated"),
+                                  v2=self.aa_extra_v2)
         if self.struct_head:
             out["aa_frame"] = aa_frame_encode(seq)
+        if self.dna_stats:
+            out["dna_stats"] = dna_stats_encode(seq)
         return out
 
     def encode_batch(self, seqs: list[str],
                      virtual_joined: bool = False) -> dict:
         """list[seq] -> dict[str, np.ndarray] stacked along axis 0."""
         keys = ("x", *sorted(self.aux),
-                *(("aa_frame",) if self.struct_head else ()))
+                *(("aa_frame",) if self.struct_head else ()),
+                *(("dna_stats",) if self.dna_stats else ()))
         stacks: dict[str, list] = {k: [] for k in keys}
         for s in seqs:
             enc = self.encode_one(s, virtual_joined=virtual_joined)
