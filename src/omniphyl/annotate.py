@@ -20,7 +20,7 @@ import numpy as np
 from .encode import STOPS, STARTS
 from .io import (ContigEvidence, iter_sequences, load_lexicmap_evidence,
                  revcomp, write_gff3)
-from .model import OmniPhylPredictor, RANKS
+from .model import BatchPredictions, OmniPhylPredictor, RANKS
 
 REGION_NAMES = ("coding", "intron", "rna", "intergenic")
 FLAG_NAMES = ("start", "stop", "donor", "acceptor")
@@ -30,6 +30,14 @@ FLAG_NAMES = ("start", "stop", "donor", "acceptor")
 # group); genome-wide prediction OOM'd on >20 Mb genomes and
 # metagenomes.
 WINDOW_GROUP_MAX = 8192
+
+# predict_sequences is sub-batched inside a flush group so no
+# [n_windows x n_classes] logp matrix exceeds this many rows. The
+# group cap is only enforced BETWEEN contigs (a 7.5 Mb chrX would
+# otherwise put ~75k windows into one call: ~16 GB of species-rank
+# logp, ~2x transient during concatenate -> the observed ~31 GB
+# OOM). 4096 rows x ~52k classes x 4B ~= 0.85 GB per rank.
+PRED_SUBBATCH = 4096
 
 _CODE4_STOPS = {"TAA", "TAG"}  # TGA->Trp in genetic code 4
 
@@ -82,6 +90,31 @@ def _gcode_stops(gcode: int) -> set:
 
 def _n_frac(seq: str) -> float:
     return sum(1 for b in seq if b.upper() not in "ACGT") / max(len(seq), 1)
+
+
+def _merge_preds(parts: list) -> BatchPredictions:
+    """Concatenate the small per-window heads of sub-batched
+    BatchPredictions into one object, in window order.
+
+    logp/p_ood are absent (the taxonomy sums consumed them inside the
+    sub-batch loop) and domains were distributed to per-contig
+    buckets, so nothing O(n_windows x n_classes) survives here."""
+    if len(parts) == 1:
+        return parts[0]
+
+    def cat(field):
+        vals = [getattr(p, field) for p in parts]
+        return np.concatenate(vals) if vals[0] is not None else None
+
+    return BatchPredictions(
+        logp={}, p_ood={},
+        coding_frac=np.concatenate([p.coding_frac for p in parts]),
+        boundary=np.concatenate([p.boundary for p in parts]),
+        offset=np.concatenate([p.offset for p in parts]),
+        region_fracs=cat("region_fracs"),
+        active_frame=cat("active_frame"),
+        struct_flags=cat("struct_flags"),
+        domains=None)
 
 
 def run_annotate(model_path, fasta_path, out_prefix: Path,
@@ -171,7 +204,51 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
     def _flush_group():
         if not g_seqs:
             return
-        bp = pred.predict_sequences(g_seqs, batch_size=batch_size)
+        # Sub-batch the predictor so the only O(n_windows x n_classes)
+        # arrays (logp, and domains when present) never exceed
+        # PRED_SUBBATCH rows. logp's ONLY consumer is the taxonomy
+        # sums below; domains/wmeta likewise go straight to their
+        # per-contig buckets, so each sub-batch's class matrices die
+        # with the loop iteration and _fuse_contig sees just the small
+        # per-window heads merged in window order.
+        fused = []
+        for i0 in range(0, len(g_seqs), PRED_SUBBATCH):
+            i1 = min(len(g_seqs), i0 + PRED_SUBBATCH)
+            bp_i = pred.predict_sequences(g_seqs[i0:i1],
+                                          batch_size=batch_size)
+            for ci in dict.fromkeys(m[0] for m in g_meta[i0:i1]):
+                wi = [i - i0 for i in range(i0, i1)
+                      if g_meta[i][0] == ci]
+                d = tax_by_contig.setdefault(
+                    ci, {"logp": {}, "pood": {}, "n": 0})
+                d["n"] += len(wi)
+                for t in pred.cls_targets:
+                    # exp in float32 + f64 accumulation over window
+                    # slices: a full wi x C_r float64 exp would
+                    # transiently cost ~3.4 GB at species-rank class
+                    # counts per sub-batch
+                    lp = bp_i.logp[t]
+                    acc = np.zeros(lp.shape[1], np.float64)
+                    for j0 in range(0, len(wi), 2048):
+                        acc += np.exp(lp[wi[j0:j0 + 2048]]).sum(
+                            0, dtype=np.float64)
+                    d["logp"][t] = d["logp"].get(t, 0.0) + acc
+                    d["pood"][t] = (d["pood"].get(t, 0.0) +
+                                    bp_i.p_ood[t][wi].astype(
+                                        np.float64).sum())
+                if not tracks_only:
+                    if bp_i.domains is not None:
+                        dom_by_contig[ci].append(bp_i.domains[wi])
+                    wmeta_by_contig[ci].extend(
+                        g_meta[i][1:] for i in range(i0, i1)
+                        if g_meta[i][0] == ci)
+            has_af[0] = (has_af[0]
+                         or bp_i.active_frame is not None)
+            bp_i.logp = {}
+            bp_i.p_ood = {}
+            bp_i.domains = None
+            fused.append(bp_i)
+        bp = _merge_preds(fused)
         for ci in g_cis:
             cid, seq, _cov = contigs[ci]
             wi = [i for i, m in enumerate(g_meta) if m[0] == ci]
@@ -179,30 +256,6 @@ def run_annotate(model_path, fasta_path, out_prefix: Path,
                                evidence.get(cid), lexicmap_source)
             res.n_windows = len(wi)
             results.append(res)
-            # taxonomy sums: cheap, and needed even for tracks-only
-            # caches (res.taxon feeds refiner conditioning)
-            d = tax_by_contig.setdefault(
-                ci, {"logp": {}, "pood": {}, "n": 0})
-            d["n"] += len(wi)
-            for t in pred.cls_targets:
-                # exp in float32 + f64 accumulation over window slices:
-                # a full wi x C_r float64 exp would transiently cost
-                # ~3.4 GB at species-rank class counts per flush group
-                lp = bp.logp[t]
-                acc = np.zeros(lp.shape[1], np.float64)
-                for i0 in range(0, len(wi), 2048):
-                    acc += np.exp(lp[wi[i0:i0 + 2048]]).sum(
-                        0, dtype=np.float64)
-                d["logp"][t] = d["logp"].get(t, 0.0) + acc
-                d["pood"][t] = (d["pood"].get(t, 0.0) +
-                                bp.p_ood[t][wi].astype(
-                                    np.float64).sum())
-            if tracks_only:
-                continue
-            if bp.domains is not None:
-                dom_by_contig[ci].append(bp.domains[wi])
-            wmeta_by_contig[ci].extend(g_meta[i][1:] for i in wi)
-        has_af[0] = has_af[0] or bp.active_frame is not None
         g_meta.clear()
         g_seqs.clear()
         g_cis.clear()
