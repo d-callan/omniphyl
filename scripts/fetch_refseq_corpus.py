@@ -1368,10 +1368,6 @@ def slice_assembly(row: dict, gdir: Path, args, cache: Path):
                          if _frac(c[3]) is not None and
                          0 < _frac(c[3]) < 1]
                 pure = [c for c in cands
-        # per-accession label caches are dead weight on the quota once
-        # the assembly is sliced
-        (cache / f"{acc}.veupathGenes.gtf.gz").unlink(missing_ok=True)
-        (cache / f"{acc}.chromAlias.txt").unlink(missing_ok=True)
                         if _frac(c[3]) is None or
                         not 0 < _frac(c[3]) < 1]
                 n_b = min(len(mixed),
@@ -1385,6 +1381,11 @@ def slice_assembly(row: dict, gdir: Path, args, cache: Path):
         for name in (f"{acc}.fna.gz", f"{acc}.fna.gz.part",
                      f"{acc}.gff.gz", f"{acc}.gff.gz.part"):
             (gdir / name).unlink(missing_ok=True)
+        # per-accession label caches are dead weight on the quota once
+        # the assembly is sliced
+        (cache / f"{acc}.veupathGenes.gtf.gz").unlink(missing_ok=True)
+        (cache / f"{acc}.chromAlias.txt").unlink(missing_ok=True)
+        (cache / f"{acc}.veupath_genes.json").unlink(missing_ok=True)
 
 
 def main():
