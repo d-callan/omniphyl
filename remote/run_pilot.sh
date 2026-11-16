@@ -187,7 +187,8 @@ else
         --nt-budget "$NT_BUDGET" --frag-len-min "$FRAG_LEN" \
         --frag-len-max "$FRAG_LEN" --boundary-frac "$BOUNDARY_FRAC" \
         $VEUPATH_FLAG $RANK_FLAG $GFF_FLAG $GBUDGET_FLAG $GENBANK_FLAG \
-        $GTDB_FLAG $MAG_FLAG $PFAM_FLAG "${EXTRA_FETCH_ARGS[@]}" --workers 8
+        $GTDB_FLAG $MAG_FLAG $PFAM_FLAG "${EXTRA_FETCH_ARGS[@]}" \
+        --workers "${FETCH_WORKERS:-4}"
 fi
 
 # --- contaminant screen (all fragments) --------------------------------------

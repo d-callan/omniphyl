@@ -98,21 +98,34 @@ RL_COLS = ["species", "genus", "family", "order", "class", "phylum",
            "kingdom", "superkingdom"]
 
 
-def download(url: str, dest: Path, retries: int = 3, timeout: int = 300) -> Path:
+def download(url: str, dest: Path, retries: int = 3, timeout: int = 300,
+             max_secs: int = 1800) -> Path:
+    """url -> dest, resumable-naive.
+
+    `timeout` is a per-read socket timeout; `max_secs` is a wall-clock cap
+    on the whole transfer. NCBI FTP sometimes trickles at KB/s without
+    ever stalling, which would otherwise hold a worker hostage for hours
+    on a multi-GB assembly.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(retries):
+        part = dest.parent / (dest.name + ".part")
         try:
-            part = dest.parent / (dest.name + ".part")
+            deadline = time.time() + max_secs
             with urllib.request.urlopen(url, timeout=timeout) as r, \
                     open(part, "wb") as f:
                 while True:
                     chunk = r.read(1 << 20)
                     if not chunk:
                         break
+                    if time.time() > deadline:
+                        raise TimeoutError(
+                            f"download exceeded {max_secs}s: {url}")
                     f.write(chunk)
             part.replace(dest)  # atomic: never leave a truncated cache
             return dest
         except Exception as e:
+            part.unlink(missing_ok=True)  # don't leak partial downloads
             # a full disk or HTTP 404 can't be fixed by retrying; fail fast
             if (getattr(e, "errno", None) == errno.ENOSPC
                     or getattr(e, "code", None) == 404):
@@ -1355,6 +1368,10 @@ def slice_assembly(row: dict, gdir: Path, args, cache: Path):
                          if _frac(c[3]) is not None and
                          0 < _frac(c[3]) < 1]
                 pure = [c for c in cands
+        # per-accession label caches are dead weight on the quota once
+        # the assembly is sliced
+        (cache / f"{acc}.veupathGenes.gtf.gz").unlink(missing_ok=True)
+        (cache / f"{acc}.chromAlias.txt").unlink(missing_ok=True)
                         if _frac(c[3]) is None or
                         not 0 < _frac(c[3]) < 1]
                 n_b = min(len(mixed),
@@ -1604,33 +1621,18 @@ def main():
               if r.get("species_taxid")}
     tax_map = resolve_taxonomy(taxids, cache)
 
-    # 4. fetch + fragment (parallel); results buffered by selection index
-    #    so fragments/labels are written in deterministic order
-    results = {}  # i -> (row, label_source, frags, n_veu_unmatched)
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(slice_assembly, r, gdir, args, cache): i
-                for i, r in enumerate(selected)}
-        for n_done, fut in enumerate(as_completed(futs), 1):
-            i = futs[fut]
-            row = selected[i]
-            try:
-                results[i] = fut.result()
-            except Exception as e:
-                print(f"  FAILED {row['assembly_accession']}: {e}",
-                      file=sys.stderr)
-                skipped.append({"accession": row["assembly_accession"],
-                                "group": row["group"],
-                                "reason": f"fetch_error: {e}"})
-            if n_done % max(1, len(selected) // 20) == 0:
-                print(f"  processed {n_done}/{len(selected)}")
-    ok = [selected[i] for i in sorted(results)]
-    print(f"downloaded+sliced {len(ok)}/{len(selected)} genomes")
-
-    # 5. emit (copy base corpus first when --base-corpus is supplied)
+    # 4. fetch + fragment + emit (streaming). Each assembly's fragments
+    #    are written as soon as its worker finishes, so neither RAM nor
+    #    disk ever holds more than ~`workers` genomes' worth at once --
+    #    buffering all results until the end is what pushed the Kaggle
+    #    ~20GB quota over the edge on the eukaryote groups. Emit order is
+    #    completion order (nondeterministic across runs); frag_ids stay
+    #    unique and downstream consumers shuffle anyway.
     frag_path = args.outdir / "fragments.fna"
     lab_path = args.outdir / "labels.tsv"
     skip_path = args.outdir / "skipped.tsv"
     n_frags = base_n_frags
+    n_ok = 0
     new_fids: set[str] = set()
     f_mode = "w"
     if args.base_corpus:
@@ -1649,61 +1651,85 @@ def main():
                        ["intron_frac", "rna_frac", "active_frame",
                         "struct_flags", "domain_ids",
                         "replicon", "gcode"])
-        for i in sorted(results):
-            row, label_source, frags, n_veu_unmatched, seq_meta = \
-                results[i]
-            tax = tax_domain_fallback(
-                row.get("_gtdb_lin")
-                or tax_map.get(row.get("species_taxid", ""), {}),
-                row["group"])
-            for seqid, s, e, frag, stats in frags:
-                fid = f"{row['assembly_accession']}|{seqid}|{s}-{e}"
-                new_fids.add(fid)
-                ff.write(f">{fid}\n")
-                for i2 in range(0, len(frag), 70):
-                    ff.write(frag[i2:i2 + 70] + "\n")
-                if stats is None:
-                    frac_s = bnd_s = nb_s = boff_s = ""
-                    intr_s = rna_s = frame_s = flag_s = dom_s = "NA"
-                    frac = None
-                elif isinstance(stats, dict):  # refseq_gff rich tier
-                    frac = stats["frac"]
-                    frac_s = f"{frac:.4f}"
-                    bnd_s = "1" if 0 < frac < 1 else "0"
-                    nb_s = str(stats["n_bnd"])
-                    boff_s = (f"{stats['boff']:.4f}"
-                              if stats["boff"] is not None else "")
-                    intr_s = f"{stats['intron']:.4f}"
-                    rna_s = f"{stats['rna']:.4f}"
-                    frame_s = str(stats["frame"])
-                    flag_s = str(stats["flags"])
-                    # "" = annotated, no domains; "NA" = unannotated
-                    dom_s = ",".join(stats["domains"])
-                else:                        # veupath tuple tier
-                    frac, n_bnd, boff = stats
-                    frac_s = f"{frac:.4f}"
-                    bnd_s = "1" if 0 < frac < 1 else "0"
-                    nb_s = str(n_bnd)
-                    boff_s = f"{boff:.4f}" if boff is not None else ""
-                    intr_s = rna_s = frame_s = flag_s = dom_s = "NA"
-                cod = ("NA" if stats is None else
-                       "coding" if frac >= 0.5 else "non-coding")
-                rep_s, gcode_i = seq_meta.get(
-                    seqid, ("nuclear_or_chrom", 1))
-                w.writerow([fid, row["assembly_accession"], seqid, s, e,
-                            len(frag), row.get("species_taxid", ""),
-                            row["group"], row.get("_rank_unresolved", "0"),
-                            row.get("_seq_source", "refseq"),
-                            cod, label_source,
-                            frac_s, bnd_s, nb_s, boff_s] +
-                           [tax.get(r, "") or "" for r in RANKS] +
-                           [intr_s, rna_s, frame_s, flag_s, dom_s,
-                            rep_s, str(gcode_i)])
-                n_frags += 1
-            if n_veu_unmatched:
-                print(f"  {row['assembly_accession']}: "
-                      f"{n_veu_unmatched} seqids unmatched to VEuPathDB "
-                      f"chrom names (NA labels)", file=sys.stderr)
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futs = {ex.submit(slice_assembly, r, gdir, args, cache): r
+                    for r in selected}
+            for n_done, fut in enumerate(as_completed(futs), 1):
+                row = futs[fut]
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    print(f"  FAILED {row['assembly_accession']}: {e}",
+                          file=sys.stderr)
+                    skipped.append(
+                        {"accession": row["assembly_accession"],
+                         "group": row["group"],
+                         "reason": f"fetch_error: {e}"})
+                else:
+                    row, label_source, frags, n_veu_unmatched, seq_meta = res
+                    tax = tax_domain_fallback(
+                        row.get("_gtdb_lin")
+                        or tax_map.get(row.get("species_taxid", ""), {}),
+                        row["group"])
+                    for seqid, s, e, frag, stats in frags:
+                        fid = (f"{row['assembly_accession']}|{seqid}"
+                               f"|{s}-{e}")
+                        new_fids.add(fid)
+                        ff.write(f">{fid}\n")
+                        for i2 in range(0, len(frag), 70):
+                            ff.write(frag[i2:i2 + 70] + "\n")
+                        if stats is None:
+                            frac_s = bnd_s = nb_s = boff_s = ""
+                            intr_s = rna_s = frame_s = flag_s = dom_s = "NA"
+                            frac = None
+                        elif isinstance(stats, dict):  # refseq_gff tier
+                            frac = stats["frac"]
+                            frac_s = f"{frac:.4f}"
+                            bnd_s = "1" if 0 < frac < 1 else "0"
+                            nb_s = str(stats["n_bnd"])
+                            boff_s = (f"{stats['boff']:.4f}"
+                                      if stats["boff"] is not None else "")
+                            intr_s = f"{stats['intron']:.4f}"
+                            rna_s = f"{stats['rna']:.4f}"
+                            frame_s = str(stats["frame"])
+                            flag_s = str(stats["flags"])
+                            # "" = annotated, no domains; "NA" = none
+                            dom_s = ",".join(stats["domains"])
+                        else:                        # veupath tuple tier
+                            frac, n_bnd, boff = stats
+                            frac_s = f"{frac:.4f}"
+                            bnd_s = "1" if 0 < frac < 1 else "0"
+                            nb_s = str(n_bnd)
+                            boff_s = (f"{boff:.4f}"
+                                      if boff is not None else "")
+                            intr_s = rna_s = frame_s = flag_s = dom_s = "NA"
+                        cod = ("NA" if stats is None else
+                               "coding" if frac >= 0.5 else "non-coding")
+                        rep_s, gcode_i = seq_meta.get(
+                            seqid, ("nuclear_or_chrom", 1))
+                        w.writerow(
+                            [fid, row["assembly_accession"], seqid, s, e,
+                             len(frag), row.get("species_taxid", ""),
+                             row["group"],
+                             row.get("_rank_unresolved", "0"),
+                             row.get("_seq_source", "refseq"),
+                             cod, label_source,
+                             frac_s, bnd_s, nb_s, boff_s] +
+                            [tax.get(r, "") or "" for r in RANKS] +
+                            [intr_s, rna_s, frame_s, flag_s, dom_s,
+                             rep_s, str(gcode_i)])
+                        n_frags += 1
+                    if n_veu_unmatched:
+                        print(f"  {row['assembly_accession']}: "
+                              f"{n_veu_unmatched} seqids unmatched to "
+                              f"VEuPathDB chrom names (NA labels)",
+                              file=sys.stderr)
+                    n_ok += 1
+                if n_done % max(1, len(selected) // 20) == 0:
+                    free_gb = shutil.disk_usage(args.outdir).free / 1e9
+                    print(f"  processed {n_done}/{len(selected)} "
+                          f"({n_frags} frags, {free_gb:.1f} GB free)")
+    print(f"downloaded+sliced {n_ok}/{len(selected)} genomes")
     print(f"wrote {n_frags} fragments -> {frag_path}")
 
     if args.pfam_hmms:
@@ -1724,7 +1750,7 @@ def main():
         "args": {k: (str(v) if isinstance(v, Path) else v)
                  for k, v in vars(args).items()},
         "groups": args.groups,
-        "genomes_downloaded": len(ok),
+        "genomes_downloaded": n_ok,
         "genomes_skipped": len(skipped),
         "fragments": n_frags,
         "created": time.strftime("%Y-%m-%d %H:%M:%S %Z"),

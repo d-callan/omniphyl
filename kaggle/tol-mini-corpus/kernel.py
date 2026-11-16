@@ -20,6 +20,7 @@ can mount it.
 import io
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -62,6 +63,8 @@ os.environ["VEUPATH"] = "1"
 os.environ["GENBANK_GROUPS"] = "archaea protozoa fungi plant invertebrate"
 os.environ["GENBANK_EXTRA"] = "0"
 os.environ["FETCH_ONLY"] = "1"
+# 8 concurrent euk genomes blew the ~20GB quota (ENOSPC on GCA_* downloads)
+os.environ["FETCH_WORKERS"] = "4"
 
 subprocess.run(["bash", str(WORK / "omniphyl/remote/run_pilot.sh")],
                check=True)
@@ -95,6 +98,10 @@ for extra in ("screen_manifest.json", "manifest.json"):
         (OUT / extra).write_bytes(locate(extra).read_bytes())
     except SystemExit:
         pass
+
+# the corpus now lives under OUT; drop the workdir copy so the panel
+# downloads + tarball have headroom
+shutil.rmtree(fna.parent, ignore_errors=True)
 
 # ---- Phase 2: refiner panel ------------------------------------------
 NCBI_DL = ("https://api.ncbi.nlm.nih.gov/datasets/v2/genome/accession/"
@@ -245,11 +252,16 @@ def write_panel(name, acc, seqmatch, clade, gcode, role, cap):
           flush=True)
 
 
-for spec in PANEL:
+for i, spec in enumerate(PANEL):
     try:
         write_panel(*spec)
     except Exception as ex:
         print(f"  {spec[0]}: FAILED ({ex}) -- skipping", flush=True)
+    acc = spec[1]
+    if acc not in {s[1] for s in PANEL[i + 1:]}:
+        # last panel entry for this accession: release its zip + extract
+        shutil.rmtree(DL / acc, ignore_errors=True)
+        (DL / f"{acc}.zip").unlink(missing_ok=True)
 
 (PANEL_DIR / "panel.json").write_text(json.dumps(manifest, indent=1))
 print(f"\npanel manifest: {len(manifest)} genomes "
@@ -258,7 +270,14 @@ print(f"\npanel manifest: {len(manifest)} genomes "
       f"{sum(1 for m in manifest.values() if m['role'] == 'heldout')} "
       f"heldout)")
 
-# tarball for `kaggle kernels output` download
-subprocess.run(["tar", "-czf", str(WORK / "omniphyl-tol-mini.tar.gz"),
-                "-C", str(WORK), "omniphyl-tol-mini"], check=True)
-print(f"done -> {OUT} (+ omniphyl-tol-mini.tar.gz)")
+# tarball for `kaggle kernels output` download -- it duplicates OUT on
+# disk, so skip it rather than ENOSPC the output dir when space is tight
+out_bytes = sum(p.stat().st_size for p in OUT.rglob("*") if p.is_file())
+free_bytes = shutil.disk_usage(WORK).free
+if free_bytes > out_bytes * 1.2:
+    subprocess.run(["tar", "-czf", str(WORK / "omniphyl-tol-mini.tar.gz"),
+                    "-C", str(WORK), "omniphyl-tol-mini"], check=True)
+    print(f"done -> {OUT} (+ omniphyl-tol-mini.tar.gz)")
+else:
+    print(f"done -> {OUT} (skipped tarball: "
+          f"{out_bytes/1e9:.1f} GB out, {free_bytes/1e9:.1f} GB free)")
