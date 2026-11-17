@@ -69,6 +69,7 @@ PFAM_EVALUE="${PFAM_EVALUE:-1e-5}"
 PUBLISH_DATASET_ID="${PUBLISH_DATASET_ID:-}"      # e.g. "daniellecallan/omniphyl-v5-20k"
 PUBLISH_DATASET_TITLE="${PUBLISH_DATASET_TITLE:-}"
 VEUPATH="${VEUPATH:-1}"
+VEUPATH_GROUPS="${VEUPATH_GROUPS:-}"  # e.g. "protozoa fungi invertebrate"; empty = all groups
 REQUIRE_GFF="${REQUIRE_GFF:-0}"  # 1 = drop assemblies lacking RefSeq GFF
 K="${K:-7}"
 WIDTH="${WIDTH:-64}"
@@ -158,6 +159,7 @@ else
     mkdir -p "$DATA"
     VEUPATH_FLAG=""
     [ "$VEUPATH" = 1 ] && VEUPATH_FLAG="--veupath"
+    [ -n "$VEUPATH_GROUPS" ] && VEUPATH_FLAG="$VEUPATH_FLAG --veupath-groups $VEUPATH_GROUPS"
     RANK_FLAG=""
     [ -n "$ONE_PER_RANK" ] && RANK_FLAG="--one-per-rank $ONE_PER_RANK --per-rank-n $PER_RANK_N"
     GFF_FLAG=""

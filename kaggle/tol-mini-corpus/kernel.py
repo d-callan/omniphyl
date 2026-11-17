@@ -63,8 +63,26 @@ os.environ["VEUPATH"] = "1"
 os.environ["GENBANK_GROUPS"] = "archaea protozoa fungi plant invertebrate"
 os.environ["GENBANK_EXTRA"] = "0"
 os.environ["FETCH_ONLY"] = "1"
-# 8 concurrent euk genomes blew the ~20GB quota (ENOSPC on GCA_* downloads)
-os.environ["FETCH_WORKERS"] = "4"
+# 8 concurrent euk genomes blew the ~20GB quota back when results were
+# buffered until the end; streaming emit keeps disk bounded now. RAM is
+# the limit on the big-euk tail -- a MemoryError'd worker just marks its
+# accession skipped (retried by the next resume run).
+os.environ["FETCH_WORKERS"] = "6"
+# VEuPathDB only covers eukaryotic pathogens/vectors; skipping UCSC
+# lookups for the other ~6k accessions saves ~2 HTTP calls each
+os.environ["VEUPATH_GROUPS"] = "protozoa fungi invertebrate"
+
+# resume: if a partial-corpus dataset is attached (output of a previous
+# run that hit Kaggle's 12h cap), seed it into the fetch workdir and set
+# BASE_CORPUS so selection skips every accession already in labels.tsv.
+CORPUS_DIR = Path(os.environ["WORKDIR"]) / "corpus"
+for _d in Path("/kaggle/input").iterdir():
+    if (_d / "fragments.fna").exists() and (_d / "labels.tsv").exists():
+        CORPUS_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(_d, CORPUS_DIR, dirs_exist_ok=True)
+        os.environ["BASE_CORPUS"] = str(CORPUS_DIR)
+        print(f"resuming corpus from {_d.name}")
+        break
 
 subprocess.run(["bash", str(WORK / "omniphyl/remote/run_pilot.sh")],
                check=True)

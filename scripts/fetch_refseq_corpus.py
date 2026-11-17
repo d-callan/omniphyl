@@ -119,15 +119,24 @@ def download(url: str, dest: Path, retries: int = 3, timeout: int = 300,
                     if not chunk:
                         break
                     if time.time() > deadline:
-                        raise TimeoutError(
+                        err = TimeoutError(
                             f"download exceeded {max_secs}s: {url}")
+                        # marker: the except below re-raises instead of
+                        # retrying. A transfer that can't finish inside
+                        # max_secs won't fit a second attempt either, and
+                        # on a 12h Kaggle budget each retry is another
+                        # 30min the worker can't spend elsewhere.
+                        err.wall_clock = True
+                        raise err
                     f.write(chunk)
             part.replace(dest)  # atomic: never leave a truncated cache
             return dest
         except Exception as e:
             part.unlink(missing_ok=True)  # don't leak partial downloads
-            # a full disk or HTTP 404 can't be fixed by retrying; fail fast
-            if (getattr(e, "errno", None) == errno.ENOSPC
+            # a full disk, HTTP 404, or our own wall-clock timeout can't
+            # be fixed by retrying; fail fast
+            if (getattr(e, "wall_clock", False)
+                    or getattr(e, "errno", None) == errno.ENOSPC
                     or getattr(e, "code", None) == 404):
                 raise
             if attempt == retries - 1:
@@ -1320,7 +1329,14 @@ def slice_assembly(row: dict, gdir: Path, args, cache: Path):
     try:
         req_gff = args.require_gff and row.get("_seq_source") != "genbank"
         fna, gff = fetch_fasta_and_gff(row, gdir, req_gff)
-        veu = (fetch_veupathdb_cds(acc, cache) if args.veupath else None)
+        # --veupath-groups keeps UCSC/VEuPathDB lookups off groups the
+        # resource never covers (bacteria, viral, plant, vertebrates):
+        # each miss otherwise costs ~2 HTTP round-trips per accession.
+        veu = (fetch_veupathdb_cds(acc, cache)
+               if args.veupath
+               and (args.veupath_groups is None
+                    or row["group"] in args.veupath_groups)
+               else None)
         alias_groups = load_chrom_alias(acc, cache) if veu else {}
         label_source = ("veupathdb" if veu else
                         "refseq_gff" if gff else "none")
@@ -1447,6 +1463,14 @@ def main():
                     help="use GTDB r220 taxonomy (bac120/ar53) over NCBI "
                          "rankedlineage for bacterial and archaeal "
                          "selection and rank labels")
+    ap.add_argument("--veupath-groups", nargs="+", default=None,
+                    metavar="GROUP",
+                    help="restrict VEuPathDB/UCSC lookups to these groups "
+                         "(default: all groups when --veupath). VEuPathDB "
+                         "covers eukaryotic pathogens/vectors only, so "
+                         "bacteria, viral, plant and vertebrate lookups "
+                         "are guaranteed misses that cost ~2 HTTP calls "
+                         "per accession")
     ap.add_argument("--pfam-hmms", action="store_true",
                     help="run pyhmmer Pfam-A hmmsearch over emitted "
                          "fragments and merge Pfam:PFxxxxx hits into "
@@ -1726,6 +1750,11 @@ def main():
                               f"VEuPathDB chrom names (NA labels)",
                               file=sys.stderr)
                     n_ok += 1
+                    # flush per assembly: the Kaggle 12h kill can land
+                    # mid-stream, and Python's stdio buffering would
+                    # otherwise lose the last few emitted fragments
+                    ff.flush()
+                    lf.flush()
                 if n_done % max(1, len(selected) // 20) == 0:
                     free_gb = shutil.disk_usage(args.outdir).free / 1e9
                     print(f"  processed {n_done}/{len(selected)} "
