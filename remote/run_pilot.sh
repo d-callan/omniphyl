@@ -183,6 +183,20 @@ else
     [ -n "$GROUP_NT_BUDGET" ] && EXTRA_FETCH_ARGS+=(--group-nt-budget "$GROUP_NT_BUDGET")
     [ -n "$GROUP_LEVELS" ] && EXTRA_FETCH_ARGS+=(--group-levels "$GROUP_LEVELS")
     [ -n "$BASE_CORPUS" ] && EXTRA_FETCH_ARGS+=(--base-corpus "$BASE_CORPUS")
+    # Kaggle's timeout snapshot dropped an open-for-append labels.tsv
+    # once even though fragments.fna survived. Keep periodic closed-file
+    # copies (.snap) of every emit file so harvest works after any kill.
+    (
+        while :; do
+            sleep 600
+            for f in "$DATA"/*.fna "$DATA"/*.tsv "$DATA"/*.json; do
+                [ -f "$f" ] && cp -f "$f" "$f.snap"
+            done
+        done
+    ) &
+    SNAP_PID=$!
+    trap 'kill $SNAP_PID 2>/dev/null' EXIT
+
     # shellcheck disable=SC2086
     python3 scripts/fetch_refseq_corpus.py --outdir "$DATA" \
         --groups $GROUPS --levels "$LEVELS" \

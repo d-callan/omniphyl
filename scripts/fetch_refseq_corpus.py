@@ -1646,6 +1646,14 @@ def main():
               if r.get("species_taxid")}
     tax_map = resolve_taxonomy(taxids, cache)
 
+    # the pool dispatches futures in submission order, so completion
+    # order ~= group order: on a wall-clock-capped run (Kaggle's 12h) the
+    # tail groups (viral, vertebrates) would never start. Shuffling makes
+    # every prefix of the run a representative sample of all groups and
+    # turns each resume into proportional coverage. Deterministic: rng is
+    # seeded from --seed.
+    rng.shuffle(selected)
+
     # 4. fetch + fragment + emit (streaming). Each assembly's fragments
     #    are written as soon as its worker finishes, so neither RAM nor
     #    disk ever holds more than ~`workers` genomes' worth at once --
