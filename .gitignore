@@ -28,3 +28,9 @@ eval_report.md
 data/
 runs/
 *.egg-info/
+
+# kaggle kernel output captures + build artifacts (never source)
+kaggle/*/output/
+kaggle/**/v*-out/
+kaggle/**/out-*/
+kaggle/**/out/
