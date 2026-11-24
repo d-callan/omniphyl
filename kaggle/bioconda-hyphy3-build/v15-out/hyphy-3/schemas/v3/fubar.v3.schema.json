@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/fubar.v3.schema.json",
+  "title": "HyPhy 3 Fast, Unconstrained Bayesian AppRoximation (FUBAR) Analysis Schema v3.0",
+  "description": "Standardized output schema for HyPhy 3 FUBAR Bayesian site-level selection analyses.",
+  "type": "object",
+  "required": [
+    "$schema",
+    "schema_version",
+    "analysis",
+    "software",
+    "provenance",
+    "dataset",
+    "phylogeny",
+    "model_fits",
+    "rate_grid",
+    "summary",
+    "site_results"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "format": "uri"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^3\\.[0-9]+\\.[0-9]+$"
+    },
+    "analysis": {
+      "type": "object",
+      "required": ["id", "name", "version", "category", "description"],
+      "properties": {
+        "id": { "type": "string", "enum": ["fubar"] },
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "category": { "type": "string" },
+        "description": { "type": "string" },
+        "citations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["citation"],
+            "properties": {
+              "citation": { "type": "string" },
+              "doi": { "type": "string" },
+              "pmid": { "type": "string" }
+            }
+          }
+        },
+        "settings": {
+          "type": "object"
+        }
+      }
+    },
+    "software": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "git_commit": { "type": "string" },
+        "build_type": { "type": "string" },
+        "compiler": { "type": "string" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["invocation", "inputs", "execution"],
+      "properties": {
+        "invocation": {
+          "type": "object",
+          "required": ["cli_command"],
+          "properties": {
+            "cli_command": { "type": "string" },
+            "working_directory": { "type": "string" },
+            "arguments": { "type": "object" }
+          }
+        },
+        "inputs": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+              "path": { "type": "string" },
+              "format": { "type": "string" },
+              "sha256": { "type": "string" },
+              "size_bytes": { "type": "integer" }
+            }
+          }
+        },
+        "execution": {
+          "type": "object",
+          "required": ["start_time", "end_time", "wall_time_seconds", "cpu_threads"],
+          "properties": {
+            "start_time": { "type": "string" },
+            "end_time": { "type": "string" },
+            "wall_time_seconds": { "type": "number", "minimum": 0 },
+            "cpu_threads": { "type": "integer", "minimum": 1 },
+            "hostname": { "type": "string" },
+            "os": { "type": "string" },
+            "compiler": { "type": "string" }
+          }
+        }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "required": ["file", "taxa", "taxa_count", "codon_sites", "nucleotide_sites", "partitions"],
+      "properties": {
+        "file": { "type": "string" },
+        "taxa": { "type": "array", "items": { "type": "string" } },
+        "taxa_count": { "type": "integer", "minimum": 1 },
+        "codon_sites": { "type": "integer", "minimum": 1 },
+        "nucleotide_sites": { "type": "integer", "minimum": 3 },
+        "partitions": { "type": "array" }
+      }
+    },
+    "phylogeny": {
+      "type": "object",
+      "required": ["tree", "total_tree_length", "nodes_count"],
+      "properties": {
+        "tree": { "type": "string" },
+        "total_tree_length": { "type": "number", "minimum": 0 },
+        "nodes_count": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "model_fits": {
+      "type": "object"
+    },
+    "rate_grid": {
+      "type": "object",
+      "required": ["dimensions", "total_points", "data"],
+      "properties": {
+        "dimensions": { "type": "array", "items": { "type": "integer" } },
+        "total_points": { "type": "integer", "minimum": 1 },
+        "prior_weight_non_positive": { "type": "number" },
+        "best_scaler_alpha": { "type": "number" },
+        "best_scaler_beta": { "type": "number" },
+        "data": {
+          "type": "object",
+          "required": ["alpha", "beta", "posterior_weight"],
+          "properties": {
+            "alpha": { "type": "array", "items": { "type": "number" } },
+            "beta": { "type": "array", "items": { "type": "number" } },
+            "posterior_weight": { "type": "array", "items": { "type": "number" } }
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "positive_sites_count",
+        "purifying_sites_count",
+        "posterior_threshold",
+        "expected_false_positives",
+        "false_positives_ci_95"
+      ],
+      "properties": {
+        "positive_sites_count": { "type": "integer", "minimum": 0 },
+        "purifying_sites_count": { "type": "integer", "minimum": 0 },
+        "posterior_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "expected_false_positives": { "type": "number", "minimum": 0 },
+        "false_positives_ci_95": { "type": "array", "items": { "type": "integer" } },
+        "positive_sites": { "type": "array", "items": { "type": "integer" } },
+        "purifying_sites": { "type": "array", "items": { "type": "integer" } }
+      }
+    },
+    "site_results": {
+      "type": "object",
+      "required": ["columns", "data"],
+      "properties": {
+        "columns": { "type": "object" },
+        "data": {
+          "type": "object",
+          "required": [
+            "site",
+            "alpha",
+            "beta",
+            "beta_minus_alpha",
+            "prob_neg",
+            "prob_pos",
+            "bayes_factor",
+            "classification"
+          ],
+          "properties": {
+            "site": { "type": "array", "items": { "type": "integer" } },
+            "alpha": { "type": "array", "items": { "type": "number" } },
+            "beta": { "type": "array", "items": { "type": "number" } },
+            "beta_minus_alpha": { "type": "array", "items": { "type": "number" } },
+            "prob_neg": { "type": "array", "items": { "type": "number" } },
+            "prob_pos": { "type": "array", "items": { "type": "number" } },
+            "bayes_factor": { "type": "array", "items": { "type": "number" } },
+            "classification": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    }
+  }
+}

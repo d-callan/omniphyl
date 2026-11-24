@@ -1,0 +1,495 @@
+#include "hyphy/analyses/characterize.hpp"
+#include "hyphy/core/cli_common.hpp"
+#include "hyphy/core/console.hpp"
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+using namespace hyphy::core;
+using namespace hyphy::analyses;
+
+static void print_characterize_banner() {
+    Panel::print_banner(
+        "CHARACTERIZE (ONE-BUTTON)",
+        "End-to-End Unaligned/Aligned Evolutionary & Selection Characterization",
+        "Co-Estimated MSA + POA • Ohmic Network • Compositional Audit • BUSTED-E/aBSREL/RELAX/MEME/dFEL • Model-Free Exchangeability & 1D Domains",
+        "Authors: Sergei L. Kosakovsky Pond & HyPhy Team • v3.0.0"
+    );
+}
+
+static void print_characterize_usage(const char* prog) {
+    print_characterize_banner();
+    std::cout << Console::bold("Usage:") << " " << prog << " [OPTIONS]\n\n"
+              << Console::bold("Input (choose one):") << "\n"
+              << "  " << Console::brand("--unaligned, -u") << " <file>       Path to raw unaligned homologous CDS FASTA file\n"
+              << "  " << Console::brand("--alignment, -a") << " <file>       Path to existing codon alignment (FASTA or NEXUS)\n"
+              << "  " << Console::brand("--tree, -t") << " <file>            Optional Newick tree file\n\n"
+              << Console::bold("Output:") << "\n"
+              << "  " << Console::brand("--output, -o") << " <file>          Path for unified JSON characterization report\n"
+              << "  " << Console::brand("--html") << " <file>                Path for standalone interactive multi-tab SPA HTML report\n"
+              << "  " << Console::brand("--no-html") << "                    Disable the auto-generated HTML report\n"
+              << "  " << Console::brand("--emit-legacy-jsons") << "          Also emit legacy .FEL.json, .MEME.json & .BUSTED.json files\n"
+              << "  " << Console::brand("--out-msa") << " <file>             Path to write co-estimated MAP codon alignment (FASTA)\n"
+              << "  " << Console::brand("--out-stockholm") << " <file>       Path to write Stockholm 1.0 quality-annotated alignment\n"
+              << "  " << Console::brand("--out-poa") << " <file>             Path to write Partial Order Alignment (POA) graph in GFAv1\n\n"
+              << Console::bold("Parameters:") << "\n"
+              << "  " << Console::brand("--code") << " <name>                Genetic code (default: Universal)\n"
+              << "  " << Console::brand("--pvalue, -p") << " <float>         Per-test significance threshold (default: 0.10)\n"
+              << "  " << Console::brand("--fdr") << " <float>                Benjamini-Hochberg / Simes FDR q-value threshold (default: 0.10)\n"
+              << "  " << Console::brand("--branches, -b") << " <tag>         Optional foreground branch tag for RELAX/Contrast-FEL (default: BIC-gated auto)\n"
+              << "  " << Console::brand("--coevolution") << "                Opt-in Tier 3 screen for epistatic co-substituting site pairs\n"
+              << "  " << Console::brand("--no-spr") << "                     Disable coupled SPR + indel search\n"
+              << "  " << Console::brand("--threads") << " <int>              Number of OpenMP threads (0 = auto)\n"
+              << "  " << Console::brand("--quiet, -q") << "                  Suppress progress output\n";
+}
+
+int run_characterize(int argc, char* argv[])
+{
+    std::string unaligned_path;
+    std::string aln_path;
+    std::string generic_input_path;
+    bool flag_unaligned = false;
+    bool flag_aligned = false;
+    std::string tree_path;
+    std::string out_json_path;
+    std::string out_html_path;
+    std::string out_msa_path;
+    std::string out_sto_path;
+    std::string out_poa_path;
+    std::string code_name = "Universal";
+    CharacterizeSettings settings;
+    int num_threads = 0;
+    bool no_html = false;
+    bool html_explicit = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            print_characterize_usage(argv[0]);
+            return 0;
+        } else if ((arg == "--input" || arg == "-i") && i + 1 < argc) {
+            generic_input_path = argv[++i];
+        } else if (arg == "--unaligned" || arg == "-u") {
+            flag_unaligned = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                unaligned_path = argv[++i];
+            }
+        } else if (arg == "--alignment" || arg == "-a" || arg == "--msa") {
+            flag_aligned = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                aln_path = argv[++i];
+            }
+        } else if ((arg == "--tree" || arg == "-t") && i + 1 < argc) {
+            tree_path = argv[++i];
+        } else if ((arg == "--output" || arg == "-o") && i + 1 < argc) {
+            out_json_path = argv[++i];
+        } else if (arg == "--html" && i + 1 < argc) {
+            out_html_path = argv[++i];
+            html_explicit = true;
+        } else if (arg == "--no-html") {
+            no_html = true;
+        } else if (arg == "--emit-legacy-jsons") {
+            settings.emit_legacy_jsons = true;
+        } else if (arg == "--out-msa" && i + 1 < argc) {
+            out_msa_path = argv[++i];
+        } else if (arg == "--out-stockholm" && i + 1 < argc) {
+            out_sto_path = argv[++i];
+        } else if (arg == "--out-poa" && i + 1 < argc) {
+            out_poa_path = argv[++i];
+        } else if (arg == "--code" && i + 1 < argc) {
+            code_name = argv[++i];
+            settings.genetic_code_name = code_name;
+        } else if ((arg == "--pvalue" || arg == "-p") && i + 1 < argc) {
+            std::string val_str = argv[++i];
+            try {
+                settings.p_value_threshold = parse_probability("--pvalue", val_str);
+            } catch (const std::exception& e) {
+                std::cerr << Console::danger("Error: ") << e.what() << "\n";
+                return 1;
+            }
+        } else if (arg == "--fdr" && i + 1 < argc) {
+            std::string val_str = argv[++i];
+            try {
+                settings.fdr_threshold = parse_probability("--fdr", val_str);
+            } catch (const std::exception& e) {
+                std::cerr << Console::danger("Error: ") << e.what() << "\n";
+                return 1;
+            }
+        } else if ((arg == "--branches" || arg == "-b") && i + 1 < argc) {
+            settings.foreground_tag = argv[++i];
+        } else if (arg == "--coevolution") {
+            settings.enable_coevolution = true;
+        } else if (arg == "--no-spr") {
+            settings.enable_coupled_spr = false;
+        } else if (arg == "--threads" && i + 1 < argc) {
+            std::string val_str = argv[++i];
+            try {
+                // 0 (the default) means "auto"; negatives and partial parses are rejected.
+                num_threads = static_cast<int>(
+                    parse_nonneg_ull("--threads", val_str, std::numeric_limits<int>::max()));
+            } catch (const std::exception& e) {
+                std::cerr << Console::danger("Error: ") << e.what() << "\n";
+                return 1;
+            }
+        } else if (arg == "--quiet" || arg == "-q") {
+            settings.quiet = true;
+        } else {
+            std::cerr << Console::danger("Error: ") << "Unknown or incomplete argument '" << arg << "'. Use --help for usage.\n";
+            return 1;
+        }
+    }
+
+    if (!generic_input_path.empty() && unaligned_path.empty() && aln_path.empty()) {
+        if (flag_unaligned && !flag_aligned) {
+            unaligned_path = generic_input_path;
+        } else {
+            aln_path = generic_input_path;
+        }
+    }
+
+    if (unaligned_path.empty() && aln_path.empty()) {
+        print_characterize_usage(argv[0]);
+        return 1;
+    }
+    if (!unaligned_path.empty() && !aln_path.empty()) {
+        std::cerr << Console::danger("Error: ") << "Specify either --unaligned (-u) or --alignment (-a), not both.\n";
+        return 1;
+    }
+
+#ifdef _OPENMP
+    if (num_threads > 0) {
+        omp_set_num_threads(num_threads);
+    } else if (std::getenv("OMP_NUM_THREADS") == nullptr) {
+        int max_t = omp_get_max_threads();
+        if (max_t > 8) {
+            omp_set_num_threads(8);
+        }
+    }
+#else
+    (void)num_threads;
+#endif
+
+    std::string input_label = !unaligned_path.empty() ? unaligned_path : aln_path;
+    size_t slash = input_label.find_last_of("/\\");
+    std::string short_label = (slash == std::string::npos) ? input_label : input_label.substr(slash + 1);
+
+    auto strip_json_stem = [](const std::string& p) -> std::string {
+        const std::string s1 = ".CHARACTERIZE.json";
+        if (p.size() > s1.size() && p.compare(p.size() - s1.size(), s1.size(), s1) == 0) {
+            return p.substr(0, p.size() - s1.size());
+        }
+        const std::string s2 = ".json";
+        if (p.size() > s2.size() && p.compare(p.size() - s2.size(), s2.size(), s2) == 0) {
+            return p.substr(0, p.size() - s2.size());
+        }
+        return p;
+    };
+
+    std::string output_stem = out_json_path.empty() ? input_label : strip_json_stem(out_json_path);
+    if (out_json_path.empty()) {
+        out_json_path = input_label + ".CHARACTERIZE.json";
+    }
+    if (no_html) {
+        out_html_path.clear();
+    } else if (out_html_path.empty() && !html_explicit) {
+        // Derive the HTML path only when -o is (or will be) a regular file.
+        // `-o /dev/null` / `-o /dev/stdout` are legitimate JSON targets but a
+        // derived sibling path (/dev/null.CHARACTERIZE.html) is nonsense.
+        bool json_is_special = std::filesystem::exists(out_json_path) &&
+                               !std::filesystem::is_regular_file(out_json_path);
+        if (!json_is_special) {
+            out_html_path = output_stem + ".CHARACTERIZE.html";
+        }
+    }
+
+    if (!settings.quiet) {
+        print_characterize_banner();
+        std::vector<std::pair<std::string, std::string>> cfg = {
+            {"Input Source", !unaligned_path.empty() ? (unaligned_path + " (Raw Unaligned CDS)") : (aln_path + " (Aligned MSA)")},
+            {"Genetic Code", code_name},
+            {"Thresholds", "p <= " + std::to_string(settings.p_value_threshold).substr(0, 4) +
+                           "  •  Simes/BH FDR q <= " + std::to_string(settings.fdr_threshold).substr(0, 4)},
+            {"JSON / SPA HTML Output", out_json_path + "  •  " + out_html_path}
+        };
+        Panel::print_card("Unified One-Button Configuration", cfg);
+    }
+
+    std::shared_ptr<const GeneticCode> gcode;
+    try {
+        gcode = GeneticCode::from_name(code_name);
+    } catch (const std::exception& e) {
+        std::cerr << Console::danger("Error: ") << e.what() << "\n";
+        return 1;
+    }
+
+    CharacterizeEngine engine(settings);
+    CharacterizeResult res;
+
+    try {
+        if (!unaligned_path.empty()) {
+            if (!tree_path.empty()) {
+                Tree tr = Tree::from_newick_file(tree_path);
+                auto seqs = JointAlignEngine::load_unaligned_fasta(unaligned_path, gcode);
+                res = engine.run_from_unaligned(seqs, gcode, tr);
+            } else {
+                res = engine.run_from_unaligned_file(unaligned_path, gcode);
+            }
+        } else {
+            Alignment aln = Alignment::load(aln_path, gcode);
+            if (!tree_path.empty()) {
+                Tree tr = Tree::from_newick_file(tree_path);
+                res = engine.run_from_alignment(aln, tr);
+            } else {
+                res = engine.run_from_alignment(aln);
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << Console::danger("Error: ") << e.what() << "\n";
+        return 1;
+    }
+
+    if (!settings.quiet) {
+        // 1. Top Site Selection Atlas Table
+        Table site_tbl;
+        site_tbl.add_column("Site", Table::Align::Right);
+        site_tbl.add_column("Domain", Table::Align::Left);
+        site_tbl.add_column("Classification", Table::Align::Left);
+        site_tbl.add_column("Simes p (q)", Table::Align::Right);
+        site_tbl.add_column("PP (K)", Table::Align::Right);
+        site_tbl.add_column("α", Table::Align::Right);
+        site_tbl.add_column("β_perv", Table::Align::Right);
+        site_tbl.add_column("β+ (Epi)", Table::Align::Right);
+        site_tbl.add_column("MEME p", Table::Align::Right);
+        site_tbl.add_column("Driving Branches", Table::Align::Left);
+        site_tbl.add_column("Exchangeability / Toggle / Convergence", Table::Align::Left);
+
+        std::vector<UnifiedSiteAtlasEntry> ranked_sites = res.site_atlas;
+        std::sort(ranked_sites.begin(), ranked_sites.end(), [](const auto& a, const auto& b) {
+            bool a_pos = (a.classification.find("Diversifying") != std::string::npos);
+            bool b_pos = (b.classification.find("Diversifying") != std::string::npos);
+            if (a_pos != b_pos) return a_pos > b_pos;
+            return a.simes_omnibus_p < b.simes_omnibus_p;
+        });
+
+        size_t shown = 0;
+        for (const auto& s : ranked_sites) {
+            if (s.classification == "Neutral" || s.classification == "Invariant") continue;
+            if (shown >= 18) break;
+            shown++;
+
+            std::ostringstream s_simes, s_pp, s_a, s_b, s_bp, s_mp, s_br;
+            s_simes << std::fixed << std::setprecision(4) << s.simes_omnibus_p
+                    << " (" << std::setprecision(2) << s.simes_omnibus_q << ")";
+            s_pp << std::fixed << std::setprecision(3) << s.column_homology_posterior
+                 << " (" << s.ensemble_paths_evaluated << ")";
+            s_a  << std::fixed << std::setprecision(2) << s.alpha;
+            s_b  << std::fixed << std::setprecision(2) << s.beta_pervasive;
+            s_bp << std::fixed << std::setprecision(2) << s.beta_plus;
+            s_mp << std::fixed << std::setprecision(4) << s.meme_p_value;
+
+            if (s.top_episodic_branches.empty()) {
+                s_br << "-";
+            } else {
+                for (size_t k = 0; k < s.top_episodic_branches.size(); ++k) {
+                    if (k > 0) s_br << ",";
+                    s_br << s.top_episodic_branches[k];
+                }
+            }
+            std::string exch_summary = s.key_property_driver.empty() ? s.exchangeability_mode : s.key_property_driver;
+            if (s.cpg_hypermutable_context) {
+                exch_summary += " [CpG]";
+            } else if (s.apobec_motif_context) {
+                exch_summary += " [APOBEC]";
+            }
+            site_tbl.add_row({
+                std::to_string(s.site_index + 1),
+                s.spatial_domain,
+                s.classification,
+                s_simes.str(),
+                s_pp.str(),
+                s_a.str(),
+                s_b.str(),
+                s_bp.str(),
+                s_mp.str(),
+                s_br.str(),
+                exch_summary
+            });
+        }
+        if (site_tbl.num_rows() > 0) {
+            std::cout << Console::bold("Top Adaptive & Constrained Sites (Unified Site-Branch-Exchangeability Atlas):") << "\n";
+            site_tbl.print();
+            std::cout << "\n";
+        }
+
+        // 2. Three-Question Executive Summary Card
+        std::ostringstream s_q1, s_q2, s_q3_gene, s_q3_dom, s_q3_sites, s_q3_br, s_rt;
+        s_q1 << res.joint_align.map_alignment.num_taxa << " taxa × "
+             << res.joint_align.map_alignment.num_codons << " codons  │  Mean PP = "
+             << std::fixed << std::setprecision(4) << res.alignment_objective.mean_column_posterior
+             << "  │  Joint lnP = " << std::setprecision(2) << res.alignment_objective.joint_log_l
+             << "  │  LOTO CV = " << res.alignment_objective.loto_cv_log_l;
+
+        s_q2 << (res.composition_test.is_heterogeneous ? "Heterogeneous GC3 Drift (3-Regime Softmax Active)" : "Stationary")
+             << " (CP3 p = " << std::fixed << std::setprecision(3) << res.composition_test.p_value_cp3 << ")"
+             << "  │  Wheatstone Bridges: " << res.joint_align.ohmic_network.bridges.size()
+             << " (" << res.recombination_segments.size() << " localized)";
+        if (res.mutational_context_alert.triggered) {
+            s_q2 << "  │  [!] " << res.mutational_context_alert.alert_summary;
+        }
+
+        s_q3_gene << (res.gene_wide.has_gene_wide_positive_selection ? "POSITIVE SELECTION DETECTED" : "No Gene-Wide Signal")
+                  << " (BUSTED-E LRT = " << std::fixed << std::setprecision(2) << res.gene_wide.busted_lrt
+                  << ", p = " << std::setprecision(4) << res.gene_wide.busted_p_value
+                  << "  │  ω₃ = " << std::setprecision(2) << res.gene_wide.omega_classes[2]
+                  << " on " << std::setprecision(1) << (res.gene_wide.omega_weights[2] * 100.0)
+                  << "% sites  │  ErrSink = " << std::setprecision(2) << (res.gene_wide.error_sink_weight * 100.0) << "%)";
+
+        s_q3_dom << res.spatial_domains.size() << " 1D domains (";
+        for (size_t i = 0; i < res.spatial_domains.size(); ++i) {
+            if (i > 0) s_q3_dom << ", ";
+            s_q3_dom << (res.spatial_domains[i].start_codon + 1) << "-" << (res.spatial_domains[i].end_codon + 1)
+                     << ":" << res.spatial_domains[i].domain_type;
+        }
+        s_q3_dom << ")  │  SRV Islands: " << res.synonymous_islands.size();
+        if (!res.synonymous_islands.empty()) {
+            s_q3_dom << " (";
+            for (size_t i = 0; i < res.synonymous_islands.size(); ++i) {
+                if (i > 0) s_q3_dom << ", ";
+                s_q3_dom << "codons " << (res.synonymous_islands[i].start_codon + 1) << "-"
+                         << (res.synonymous_islands[i].end_codon + 1) << " [α="
+                         << std::fixed << std::setprecision(2) << res.synonymous_islands[i].mean_alpha
+                         << ", " << std::setprecision(2) << res.synonymous_islands[i].suppression_ratio << "x]";
+            }
+            s_q3_dom << ")";
+        }
+
+        s_q3_sites << "▲ Episodic (MEME): " << res.sites_episodic_diversifying
+                   << "  │  ▲ Pervasive (FEL/dFEL): " << res.sites_pervasive_diversifying
+                   << "  │  ▼ Purifying: " << res.sites_pervasive_purifying
+                   << "  │  ⇄ Toggle/Convergent: " << res.sites_property_constrained_or_shifting
+                   << "  │  Simes q<=" << std::fixed << std::setprecision(2) << settings.fdr_threshold << ": "
+                   << res.sites_simes_fdr_significant
+                   << " (▲" << res.sites_simes_diversifying << " div / ▼" << res.sites_simes_purifying << " pur)";
+
+        s_q3_br << "aBSREL Diversifying: " << res.branches_episodic_diversifying
+                << "  │  RELAX Intensified: " << res.branches_intensified
+                << "  │  RELAX Relaxed: " << res.branches_relaxed
+                << "  │  LoF / Core-Invasion: " << res.branches_loss_of_constraint
+                << "  │  Clade Split: " << (res.clade_macro_regime.triggered ? res.clade_macro_regime.test_regime_label : "Homogeneous");
+
+        s_rt << std::fixed << std::setprecision(2) << res.runtime_seconds << " s";
+
+        std::vector<std::pair<std::string, std::string>> summary_items = {
+            {"Stage 0-1. Is Data Trustworthy? (Homology/LOTO)", s_q1.str()},
+            {"Stage 2-3. Confounding Processes (Drift/Network/CpG)", s_q2.str()},
+            {"Stage 4A. Gene-Wide Adaptation (BUSTED-E)", s_q3_gene.str()},
+            {"Stage 4B. 1D Domain & Synonymous Architecture", s_q3_dom.str()},
+            {"Stage 4C-5. Site-Level Selection & Exchangeability", s_q3_sites.str()},
+            {"Stage 4D. Lineage Selection & Loss-of-Constraint", s_q3_br.str()},
+            {"Total Wall-Clock Time", s_rt.str()}
+        };
+        if (settings.enable_coevolution) {
+            summary_items.insert(summary_items.end() - 1,
+                {"Tier 3 Coevolution Pairs (--coevolution)", std::to_string(res.coevolution_pairs.size()) + " co-substituting site pairs"});
+        }
+        Panel::print_summary_card(
+            "One-Button Evolutionary Characterization Summary",
+            summary_items,
+            "Co-inferred alignment, network, compositional regimes & unified gene/domain/branch/site/exchangeability atlas",
+            true
+        );
+    }
+
+    // Requested outputs are written first so that a failure in the derived
+    // HTML report cannot suppress an explicitly requested file.
+    if (!out_json_path.empty()) {
+        try {
+            write_file_or_throw(out_json_path, CharacterizeEngine::to_json(res) + "\n");
+        } catch (const std::exception& e) {
+            std::cerr << Console::danger("Error: ") << e.what() << "\n";
+            return 1;
+        }
+        if (!settings.quiet) {
+            std::cout << Console::success("Saved unified JSON characterization to: ") << out_json_path << "\n";
+        }
+    }
+    if (settings.emit_legacy_jsons) {
+        CharacterizeEngine::write_legacy_json_bundle(res, output_stem);
+        if (!settings.quiet) {
+            std::cout << Console::success("Saved legacy JSON bundle (.FEL.json, .MEME.json, .BUSTED.json) for: ") << output_stem << "\n";
+        }
+    }
+    if (!out_msa_path.empty()) {
+        std::ofstream mf(out_msa_path);
+        if (!mf.is_open()) {
+            std::cerr << Console::danger("Error: could not open output file: ") << out_msa_path << "\n";
+            return 1;
+        }
+        for (const auto& s : res.joint_align.map_alignment.sequences) {
+            mf << ">" << s.name << "\n" << s.raw_seq << "\n";
+        }
+        try {
+            close_or_throw(mf, out_msa_path);
+        } catch (const std::exception& e) {
+            std::cerr << Console::danger("Error: ") << e.what() << "\n";
+            return 1;
+        }
+        if (!settings.quiet) {
+            std::cout << Console::success("Saved MAP codon alignment to: ") << out_msa_path << "\n";
+        }
+    }
+    if (!out_sto_path.empty()) {
+        try {
+            write_file_or_throw(out_sto_path, res.joint_align.stockholm_alignment);
+        } catch (const std::exception& e) {
+            std::cerr << Console::danger("Error: ") << e.what() << "\n";
+            return 1;
+        }
+        if (!settings.quiet) {
+            std::cout << Console::success("Saved Stockholm quality-annotated MSA to: ") << out_sto_path << "\n";
+        }
+    }
+    if (!out_poa_path.empty()) {
+        try {
+            write_file_or_throw(out_poa_path, res.joint_align.poa_gfa);
+        } catch (const std::exception& e) {
+            std::cerr << Console::danger("Error: ") << e.what() << "\n";
+            return 1;
+        }
+        if (!settings.quiet) {
+            std::cout << Console::success("Saved POA codon graph (GFAv1) to: ") << out_poa_path << "\n";
+        }
+    }
+    if (!out_html_path.empty()) {
+        try {
+            write_file_or_throw(out_html_path, CharacterizeEngine::render_standalone_html(res, short_label));
+        } catch (const std::exception& e) {
+            std::cerr << Console::danger("Error: ") << e.what() << "\n";
+            return 1;
+        }
+        if (!settings.quiet) {
+            std::cout << Console::success("Saved standalone multi-tab SPA HTML report to: ") << out_html_path << "\n";
+        }
+    }
+
+    return 0;
+}
+
+#ifndef HYPHY3_COMBINED_DRIVER
+int main(int argc, char* argv[]) {
+    try {
+        return run_characterize(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << Console::danger("Error: ") << e.what() << "\n";
+        return 1;
+    }
+}
+#endif

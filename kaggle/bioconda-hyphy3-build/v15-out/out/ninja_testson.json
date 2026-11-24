@@ -1,0 +1,199 @@
+{
+ "log": "build/.ninja_log",
+ "edges": 242,
+ "cumulative_edge_time_s": 16264.371,
+ "wall_time_s": 4333.583,
+ "parallelism": 3.75,
+ "groups": [
+  {
+   "name": "hyphy3",
+   "time_s": 5277.306
+  },
+  {
+   "name": "hyphy3_emitters",
+   "time_s": 2507.785
+  },
+  {
+   "name": "_hyphy3",
+   "time_s": 1922.031
+  },
+  {
+   "name": "hyphy3-expcm",
+   "time_s": 391.095
+  },
+  {
+   "name": "hyphy3-absrel",
+   "time_s": 348.119
+  },
+  {
+   "name": "hyphy3-prime",
+   "time_s": 339.221
+  },
+  {
+   "name": "hyphy3-relax",
+   "time_s": 338.101
+  },
+  {
+   "name": "hyphy3-gard",
+   "time_s": 336.226
+  },
+  {
+   "name": "hyphy3-meme",
+   "time_s": 334.392
+  },
+  {
+   "name": "hyphy3-slac",
+   "time_s": 331.864
+  },
+  {
+   "name": "hyphy3-contrast-fel",
+   "time_s": 331.115
+  },
+  {
+   "name": "hyphy3-dfel",
+   "time_s": 329.764
+  },
+  {
+   "name": "hyphy3-fel",
+   "time_s": 329.39
+  },
+  {
+   "name": "hyphy3-mss",
+   "time_s": 314.617
+  },
+  {
+   "name": "hyphy3-fubar",
+   "time_s": 312.772
+  },
+  {
+   "name": "hyphy3-busted",
+   "time_s": 304.488
+  },
+  {
+   "name": "hyphy3-ohmic",
+   "time_s": 295.965
+  },
+  {
+   "name": "hyphy_test_analyses_bin",
+   "time_s": 284.933
+  },
+  {
+   "name": "hyphy3-tree",
+   "time_s": 263.671
+  },
+  {
+   "name": "hyphy_test_optimizer_bin",
+   "time_s": 189.875
+  },
+  {
+   "name": "hyphy3-walrus",
+   "time_s": 164.34
+  },
+  {
+   "name": "hyphy3-joint-align",
+   "time_s": 162.7
+  },
+  {
+   "name": "hyphy_test_core_bin",
+   "time_s": 162.284
+  },
+  {
+   "name": "hyphy3-characterize",
+   "time_s": 160.897
+  },
+  {
+   "name": "hyphy_dfel_test",
+   "time_s": 111.735
+  },
+  {
+   "name": "hyphy_mss_test",
+   "time_s": 105.203
+  },
+  {
+   "name": "hyphy_characterize_test",
+   "time_s": 96.34
+  },
+  {
+   "name": "hyphy_joint_align_test",
+   "time_s": 64.403
+  },
+  {
+   "name": "hyphy_cpp_autograd_test",
+   "time_s": 60.536
+  },
+  {
+   "name": "nanobind-static",
+   "time_s": 54.985
+  },
+  {
+   "name": "hyphy3_pch",
+   "time_s": 26.212
+  },
+  {
+   "name": "(other)",
+   "time_s": 12.006
+  }
+ ],
+ "heaviest_outputs": [
+  {
+   "output": "CMakeFiles/hyphy3.dir/src/apps/hyphy_absrel.cpp.o",
+   "time_s": 354.078
+  },
+  {
+   "output": "CMakeFiles/hyphy3-absrel.dir/src/apps/hyphy_absrel.cpp.o",
+   "time_s": 348.119
+  },
+  {
+   "output": "CMakeFiles/hyphy3.dir/src/apps/hyphy_relax.cpp.o",
+   "time_s": 344.35
+  },
+  {
+   "output": "CMakeFiles/hyphy3.dir/src/apps/hyphy_meme.cpp.o",
+   "time_s": 341.272
+  },
+  {
+   "output": "CMakeFiles/hyphy3.dir/src/apps/hyphy_prime.cpp.o",
+   "time_s": 339.858
+  },
+  {
+   "output": "CMakeFiles/hyphy3-prime.dir/src/apps/hyphy_prime.cpp.o",
+   "time_s": 339.221
+  },
+  {
+   "output": "CMakeFiles/hyphy3-relax.dir/src/apps/hyphy_relax.cpp.o",
+   "time_s": 338.101
+  },
+  {
+   "output": "CMakeFiles/hyphy3.dir/src/apps/hyphy_gard.cpp.o",
+   "time_s": 336.697
+  },
+  {
+   "output": "CMakeFiles/hyphy3-gard.dir/src/apps/hyphy_gard.cpp.o",
+   "time_s": 336.226
+  },
+  {
+   "output": "CMakeFiles/hyphy3-meme.dir/src/apps/hyphy_meme.cpp.o",
+   "time_s": 334.392
+  },
+  {
+   "output": "CMakeFiles/hyphy3.dir/src/apps/hyphy_slac.cpp.o",
+   "time_s": 333.4
+  },
+  {
+   "output": "CMakeFiles/hyphy3-slac.dir/src/apps/hyphy_slac.cpp.o",
+   "time_s": 331.864
+  },
+  {
+   "output": "CMakeFiles/hyphy3_emitters.dir/src/analyses/joint_align_impl.cpp.o",
+   "time_s": 331.304
+  },
+  {
+   "output": "CMakeFiles/hyphy3-contrast-fel.dir/src/apps/hyphy_contrast_fel.cpp.o",
+   "time_s": 331.115
+  },
+  {
+   "output": "CMakeFiles/hyphy3-dfel.dir/src/apps/hyphy_dfel.cpp.o",
+   "time_s": 329.764
+  }
+ ]
+}

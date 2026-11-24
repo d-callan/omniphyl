@@ -57,6 +57,7 @@ import errno
 import gzip
 import io
 import json
+import os
 import random
 import re
 import shutil
@@ -1517,7 +1518,12 @@ def main():
     rng = random.Random(args.seed)
     args.outdir.mkdir(parents=True, exist_ok=True)
     cache = args.outdir / "_ncbi_cache"
-    gdir = args.outdir / "genomes"
+    # transient genome downloads. OMNIPHYL_GENOMES_DIR lets the runner put
+    # them outside the persisted corpus dir (Kaggle captures everything
+    # under /kaggle/working as kernel output -- leftover in-flight
+    # vertebrate genomes were ~4.4GB of a 5GB output pull).
+    gdir = Path(os.environ.get("OMNIPHYL_GENOMES_DIR",
+                               args.outdir / "genomes"))
     levels = set(args.levels.split(","))
     skipped: list[dict] = []
 

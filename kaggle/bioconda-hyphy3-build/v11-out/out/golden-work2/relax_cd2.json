@@ -1,0 +1,469 @@
+{
+  "$schema": "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/relax.v3.schema.json",
+  "analysis": {
+    "category": "comparative_selection",
+    "citations": [
+      {
+        "citation": "Wertheim JO, Murrell B, Smith MD, Kosakovsky Pond SL, Scheffler K (2015). RELAX: Detecting Relaxed Selection in a Phylogenetic Framework. Mol Biol Evol 32(3): 820-832.",
+        "doi": "10.1093/molbev/msu400",
+        "pmid": "25540451"
+      }
+    ],
+    "description": "RELAX uses a random effects branch-site model framework to test whether a set of 'Test' branches evolves under relaxed selection relative to a set of 'Reference' branches, as measured by the selection intensity parameter K.",
+    "id": "relax",
+    "name": "Relaxed Selection Analysis (RELAX)",
+    "settings": {
+      "max_joint_cycles": 15,
+      "mixture_level": "branch_site",
+      "normalization": "shared_mixture",
+      "reference_branches_count": 5,
+      "refine_branch_lengths": true,
+      "test_branches_count": 4
+    },
+    "version": "3.0.0"
+  },
+  "dataset": {
+    "codon_sites": 187,
+    "genetic_code": {
+      "id": "Universal",
+      "name": "Universal",
+      "sense_codons": 61,
+      "stop_codons": [
+        "TAA",
+        "TAG",
+        "TGA"
+      ]
+    },
+    "nucleotide_sites": 561,
+    "partitions": [
+      {
+        "id": "default",
+        "name": "Full Alignment",
+        "patterns_count": 186,
+        "sites_count": 187,
+        "span": [
+          [
+            1,
+            187
+          ]
+        ]
+      }
+    ],
+    "taxa": [
+      "Human",
+      "Chimp",
+      "Baboon",
+      "RhMonkey",
+      "Cow",
+      "Pig",
+      "Horse",
+      "Cat",
+      "Mouse",
+      "Rat"
+    ],
+    "taxa_count": 10,
+    "unique_patterns": 186
+  },
+  "model_fits": {
+    "alternative": {
+      "aicc": 6948.214764134114,
+      "converged": false,
+      "description": "RELAX alternative model with unconstrained relaxation parameter K",
+      "k_parameter": 0.22006537781300511,
+      "log_likelihood": -3426.093868553544,
+      "parameters_count": 38,
+      "rate_distributions": {
+        "reference": [
+          {
+            "class": 1,
+            "omega": 0.0,
+            "proportion": 0.47251884195056687
+          },
+          {
+            "class": 2,
+            "omega": 0.0,
+            "proportion": 0.04081406709913366
+          },
+          {
+            "class": 3,
+            "omega": 4.560577248175056,
+            "proportion": 0.48666709095029953
+          }
+        ],
+        "test": [
+          {
+            "class": 1,
+            "omega": 0.0,
+            "proportion": 0.47251884195056687
+          },
+          {
+            "class": 2,
+            "omega": 0.0,
+            "proportion": 0.04081406709913366
+          },
+          {
+            "class": 3,
+            "omega": 1.396456606130841,
+            "proportion": 0.48666709095029953
+          }
+        ],
+        "unclassified": [
+          {
+            "class": 1,
+            "omega": 0.23895294561647507,
+            "proportion": 0.8125388982282167
+          },
+          {
+            "class": 2,
+            "omega": 0.49129018133997726,
+            "proportion": 0.0
+          },
+          {
+            "class": 3,
+            "omega": 3.668718631098004,
+            "proportion": 0.18746110177178332
+          }
+        ]
+      },
+      "realized_cycles": 15
+    },
+    "codon_mg94": {
+      "aicc": 6986.716303795968,
+      "description": "Muse-Gaut 1994 x GTR with separate rates for Reference and Test branches",
+      "log_likelihood": -3457.3966134364455,
+      "parameters_count": 30,
+      "rate_distributions": {
+        "omega_reference": 1.525611855062953,
+        "omega_test": 0.6127568149387568
+      }
+    },
+    "nucleotide_gtr": {
+      "aicc": 7108.4331056236315,
+      "description": "General Time Reversible nucleotide model with empirical frequencies",
+      "equilibrium_frequencies": {
+        "A": 0.35928911689263465,
+        "C": 0.18193477464272628,
+        "G": 0.24001465738365702,
+        "T": 0.21876145108098205
+      },
+      "log_likelihood": -3532.359409954673,
+      "parameters_count": 23,
+      "substitution_rates": {
+        "AC": 0.5506571372973559,
+        "AG": 1.0,
+        "AT": 0.2649811151309322,
+        "CG": 0.4924826333088869,
+        "CT": 1.0300668896270369,
+        "GT": 0.30484435411541355
+      }
+    },
+    "null": {
+      "aicc": 6946.510849210273,
+      "converged": false,
+      "description": "RELAX null model fixing K = 1",
+      "k_parameter": 1.0,
+      "log_likelihood": -3426.819182994398,
+      "parameters_count": 37,
+      "rate_distributions": {
+        "reference": [
+          {
+            "class": 1,
+            "omega": 0.0,
+            "proportion": 0.48264150819014207
+          },
+          {
+            "class": 2,
+            "omega": 0.0,
+            "proportion": 0.03198928609529713
+          },
+          {
+            "class": 3,
+            "omega": 4.489907937168118,
+            "proportion": 0.4853692057145608
+          }
+        ],
+        "test": [
+          {
+            "class": 1,
+            "omega": 0.0,
+            "proportion": 0.48264150819014207
+          },
+          {
+            "class": 2,
+            "omega": 0.0,
+            "proportion": 0.03198928609529713
+          },
+          {
+            "class": 3,
+            "omega": 4.489907937168118,
+            "proportion": 0.4853692057145608
+          }
+        ],
+        "unclassified": [
+          {
+            "class": 1,
+            "omega": 0.23594337993342773,
+            "proportion": 0.8149013117341593
+          },
+          {
+            "class": 2,
+            "omega": 0.48722823648262564,
+            "proportion": 1.6509071710143754e-05
+          },
+          {
+            "class": 3,
+            "omega": 3.6602625002885283,
+            "proportion": 0.1850821791941306
+          }
+        ]
+      },
+      "realized_cycles": 15
+    }
+  },
+  "phylogeny": {
+    "newick": "((((Pig{Group2}:0,Cow{Group2}:0)Node3{Group2}:0,Horse{Group2}:0,Cat{Group2}:0)Node2:0,((RhMonkey{Group1}:0,Baboon{Group4}:0)Node5{Group4}:0,(Human{Group1}:0,Chimp{Group1}:0)Node6{Group1}:0)Node4:0)Node1:0,Rat{Group3}:0,Mouse{Group3}:0)END;",
+    "nodes": {
+      "Baboon": {
+        "branch_class": "Unclassified",
+        "branch_lengths": {
+          "alternative": 0.0018300738281381032,
+          "null": 0.001921882465252767
+        },
+        "model_tags": [
+          "Group4"
+        ],
+        "type": "leaf"
+      },
+      "Cat": {
+        "branch_class": "Reference",
+        "branch_lengths": {
+          "alternative": 0.32176014677124815,
+          "null": 0.32430679287923
+        },
+        "model_tags": [
+          "Group2"
+        ],
+        "type": "leaf"
+      },
+      "Chimp": {
+        "branch_class": "Test",
+        "branch_lengths": {
+          "alternative": 0.0021968837222112016,
+          "null": 0.00201737462911908
+        },
+        "model_tags": [
+          "Group1"
+        ],
+        "type": "leaf"
+      },
+      "Cow": {
+        "branch_class": "Reference",
+        "branch_lengths": {
+          "alternative": 0.2997745934560644,
+          "null": 0.30261622418125184
+        },
+        "model_tags": [
+          "Group2"
+        ],
+        "type": "leaf"
+      },
+      "END": {
+        "branch_lengths": {
+          "alternative": 0.0,
+          "null": 0.0
+        },
+        "type": "internal"
+      },
+      "Horse": {
+        "branch_class": "Reference",
+        "branch_lengths": {
+          "alternative": 0.2568333693589694,
+          "null": 0.2597095290177081
+        },
+        "model_tags": [
+          "Group2"
+        ],
+        "type": "leaf"
+      },
+      "Human": {
+        "branch_class": "Test",
+        "branch_lengths": {
+          "alternative": 1e-06,
+          "null": 1e-06
+        },
+        "model_tags": [
+          "Group1"
+        ],
+        "type": "leaf"
+      },
+      "Mouse": {
+        "branch_class": "Unclassified",
+        "branch_lengths": {
+          "alternative": 0.13526423597408188,
+          "null": 0.1359706094055369
+        },
+        "model_tags": [
+          "Group3"
+        ],
+        "type": "leaf"
+      },
+      "Node1": {
+        "branch_class": "Unclassified",
+        "branch_lengths": {
+          "alternative": 0.34014457086153305,
+          "null": 0.3451145513943449
+        },
+        "type": "internal"
+      },
+      "Node2": {
+        "branch_class": "Unclassified",
+        "branch_lengths": {
+          "alternative": 0.06508288922947571,
+          "null": 0.06465713767435405
+        },
+        "type": "internal"
+      },
+      "Node3": {
+        "branch_class": "Reference",
+        "branch_lengths": {
+          "alternative": 0.12167477417387984,
+          "null": 0.12259910088054543
+        },
+        "model_tags": [
+          "Group2"
+        ],
+        "type": "internal"
+      },
+      "Node4": {
+        "branch_class": "Unclassified",
+        "branch_lengths": {
+          "alternative": 0.1311163158225036,
+          "null": 0.13256877596459402
+        },
+        "type": "internal"
+      },
+      "Node5": {
+        "branch_class": "Unclassified",
+        "branch_lengths": {
+          "alternative": 0.027735786624115535,
+          "null": 0.02895490671133575
+        },
+        "model_tags": [
+          "Group4"
+        ],
+        "type": "internal"
+      },
+      "Node6": {
+        "branch_class": "Test",
+        "branch_lengths": {
+          "alternative": 0.017764796485520123,
+          "null": 0.016915240697771894
+        },
+        "model_tags": [
+          "Group1"
+        ],
+        "type": "internal"
+      },
+      "Pig": {
+        "branch_class": "Reference",
+        "branch_lengths": {
+          "alternative": 0.2187063123921799,
+          "null": 0.21925229691507575
+        },
+        "model_tags": [
+          "Group2"
+        ],
+        "type": "leaf"
+      },
+      "Rat": {
+        "branch_class": "Unclassified",
+        "branch_lengths": {
+          "alternative": 0.07726765408009548,
+          "null": 0.07754348076284351
+        },
+        "model_tags": [
+          "Group3"
+        ],
+        "type": "leaf"
+      },
+      "RhMonkey": {
+        "branch_class": "Test",
+        "branch_lengths": {
+          "alternative": 0.0036415619105466318,
+          "null": 0.0036029376613129645
+        },
+        "model_tags": [
+          "Group1"
+        ],
+        "type": "leaf"
+      }
+    },
+    "tree_lengths": {
+      "alternative": 2.0207949646905625,
+      "null": 2.0377518412402766
+    }
+  },
+  "provenance": {
+    "execution": {
+      "compiler": "GCC 15.3.0",
+      "cpu_threads": 4,
+      "end_time": "2026-11-13T03:43:01.366Z",
+      "hostname": "b9d801470d4c",
+      "os": "Linux",
+      "start_time": "2026-11-13T03:37:40.379Z",
+      "wall_time_seconds": 320.986656465
+    },
+    "inputs": {
+      "alignment": {
+        "format": "FASTA/NEXUS",
+        "path": "/kaggle/working/hyphy-3/benchmarks/data/cd2.fna",
+        "sha256": "50a2e1f155704e5794636052782036731e2c14447f4b7e56c6d8e7fb08020449",
+        "size_bytes": 5686
+      },
+      "tree": {
+        "format": "Newick",
+        "path": "/kaggle/working/hyphy-3/benchmarks/data/cd2.nwk",
+        "sha256": "8642608f7edb2fa484101c284daeba70dbcb95e19c7224f781fc8f5f0bc89bfa",
+        "size_bytes": 179
+      }
+    },
+    "invocation": {
+      "arguments": {
+        "alignment": "/kaggle/working/hyphy-3/benchmarks/data/cd2.fna",
+        "branches": "Group1",
+        "code": "Universal",
+        "full_model": "true",
+        "json_format": "modern_v3",
+        "pvalue": "0.050000",
+        "pvalue_threshold": "0.050000",
+        "refine_branch_lengths": "true",
+        "test": "Group1",
+        "tree": "/kaggle/working/hyphy-3/benchmarks/data/cd2.nwk"
+      },
+      "cli_command": "build/hyphy3 relax --alignment /kaggle/working/hyphy-3/benchmarks/data/cd2.fna --tree /kaggle/working/hyphy-3/benchmarks/data/cd2.nwk --test Group1 --reference Group2 --threads 4 --output /kaggle/working/out/golden-work2/relax_cd2.json",
+      "working_directory": "/kaggle/working/hyphy-3"
+    }
+  },
+  "schema_version": "3.0.0",
+  "software": {
+    "build_type": "Release",
+    "compiler": "GCC 15.3.0",
+    "git_commit": "1e491ce",
+    "name": "hyphy",
+    "version": "3.0.0"
+  },
+  "statistical_tests": {
+    "hypothesis_test": {
+      "alternative_hypothesis": "K != 1 (Selection is relaxed K < 1 or intensified K > 1)",
+      "decision": "No evidence of relaxed or intensified selection",
+      "degrees_of_freedom": 1,
+      "distribution": "Asymptotic Chi-squared",
+      "k_parameter": 0.22006537781300511,
+      "method": "Likelihood Ratio Test (LRT)",
+      "null_hypothesis": "K = 1 (Selection intensity is equal between Test and Reference)",
+      "p_value": 0.22842706993067957,
+      "statistic_value": 1.450628881708326,
+      "test_statistic": "LRT"
+    }
+  }
+}

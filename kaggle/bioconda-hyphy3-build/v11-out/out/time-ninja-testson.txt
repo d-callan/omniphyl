@@ -1,0 +1,4 @@
+	Command being timed: "/kaggle/working/miniforge/envs/h3/bin/ninja -C build -j2"
+	Elapsed (wall clock) seconds: 5436.6
+	Maximum resident set size (kbytes): 4148500
+	Exit status: 0

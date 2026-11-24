@@ -1,0 +1,167 @@
+{
+ "log": "build/.ninja_log",
+ "edges": 98,
+ "cumulative_edge_time_s": 7499.241,
+ "wall_time_s": 3822.889,
+ "parallelism": 1.96,
+ "groups": [
+  {
+   "name": "hyphy3",
+   "time_s": 3140.778
+  },
+  {
+   "name": "hyphy3_emitters",
+   "time_s": 802.796
+  },
+  {
+   "name": "hyphy3-characterize",
+   "time_s": 233.434
+  },
+  {
+   "name": "hyphy3-walrus",
+   "time_s": 232.168
+  },
+  {
+   "name": "hyphy3-busted",
+   "time_s": 224.013
+  },
+  {
+   "name": "hyphy3-absrel",
+   "time_s": 190.099
+  },
+  {
+   "name": "hyphy3-relax",
+   "time_s": 189.655
+  },
+  {
+   "name": "hyphy3-contrast-fel",
+   "time_s": 186.168
+  },
+  {
+   "name": "hyphy3-dfel",
+   "time_s": 184.851
+  },
+  {
+   "name": "hyphy3-prime",
+   "time_s": 184.257
+  },
+  {
+   "name": "hyphy3-slac",
+   "time_s": 183.724
+  },
+  {
+   "name": "hyphy3-fubar",
+   "time_s": 183.089
+  },
+  {
+   "name": "hyphy3-expcm",
+   "time_s": 182.565
+  },
+  {
+   "name": "hyphy3-mss",
+   "time_s": 182.006
+  },
+  {
+   "name": "hyphy3-meme",
+   "time_s": 180.3
+  },
+  {
+   "name": "hyphy3-fel",
+   "time_s": 179.949
+  },
+  {
+   "name": "hyphy3-joint-align",
+   "time_s": 179.713
+  },
+  {
+   "name": "_hyphy3",
+   "time_s": 176.746
+  },
+  {
+   "name": "hyphy3-gard",
+   "time_s": 164.05
+  },
+  {
+   "name": "hyphy3-ohmic",
+   "time_s": 145.748
+  },
+  {
+   "name": "hyphy3-tree",
+   "time_s": 128.219
+  },
+  {
+   "name": "nanobind-static",
+   "time_s": 26.981
+  },
+  {
+   "name": "hyphy3_pch",
+   "time_s": 12.414
+  },
+  {
+   "name": "(other)",
+   "time_s": 5.518
+  }
+ ],
+ "heaviest_outputs": [
+  {
+   "output": "CMakeFiles/hyphy3.dir/src/apps/hyphy_characterize.cpp.o",
+   "time_s": 243.256
+  },
+  {
+   "output": "CMakeFiles/hyphy3-characterize.dir/src/apps/hyphy_characterize.cpp.o",
+   "time_s": 233.434
+  },
+  {
+   "output": "CMakeFiles/hyphy3-walrus.dir/src/apps/hyphy_characterize.cpp.o",
+   "time_s": 232.168
+  },
+  {
+   "output": "CMakeFiles/hyphy3-busted.dir/src/apps/hyphy_busted.cpp.o",
+   "time_s": 224.013
+  },
+  {
+   "output": "CMakeFiles/hyphy3.dir/src/apps/hyphy_busted.cpp.o",
+   "time_s": 223.884
+  },
+  {
+   "output": "CMakeFiles/hyphy3.dir/src/apps/hyphy_absrel.cpp.o",
+   "time_s": 192.139
+  },
+  {
+   "output": "CMakeFiles/hyphy3-absrel.dir/src/apps/hyphy_absrel.cpp.o",
+   "time_s": 190.099
+  },
+  {
+   "output": "CMakeFiles/hyphy3.dir/src/apps/hyphy_dfel.cpp.o",
+   "time_s": 189.691
+  },
+  {
+   "output": "CMakeFiles/hyphy3-relax.dir/src/apps/hyphy_relax.cpp.o",
+   "time_s": 189.655
+  },
+  {
+   "output": "CMakeFiles/hyphy3-contrast-fel.dir/src/apps/hyphy_contrast_fel.cpp.o",
+   "time_s": 186.168
+  },
+  {
+   "output": "CMakeFiles/hyphy3.dir/src/apps/hyphy_relax.cpp.o",
+   "time_s": 186.102
+  },
+  {
+   "output": "CMakeFiles/hyphy3-dfel.dir/src/apps/hyphy_dfel.cpp.o",
+   "time_s": 184.851
+  },
+  {
+   "output": "CMakeFiles/hyphy3.dir/src/apps/hyphy_prime.cpp.o",
+   "time_s": 184.563
+  },
+  {
+   "output": "CMakeFiles/hyphy3-prime.dir/src/apps/hyphy_prime.cpp.o",
+   "time_s": 184.257
+  },
+  {
+   "output": "CMakeFiles/hyphy3-slac.dir/src/apps/hyphy_slac.cpp.o",
+   "time_s": 183.724
+  }
+ ]
+}

@@ -1,0 +1,248 @@
+#include "hyphy/core/types.hpp"
+#include "hyphy/core/cli_common.hpp"
+#include "hyphy/analyses/absrel.hpp"
+
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <chrono>
+#include <iomanip>
+
+using namespace hyphy::core;
+using namespace hyphy::analyses;
+
+static void print_absrel_banner() {
+    Panel::print_banner(
+        "aBSREL",
+        "Adaptive Branch-Site Random Effects Likelihood",
+        "Lineage-specific test for episodic diversifying selection",
+        "Citation: Mol Biol Evol. 32(5): 1342-1353 (2015) • v3.0.0"
+    );
+}
+
+static void print_absrel_usage(const char* prog) {
+    print_absrel_banner();
+    std::cout << Console::bold("Usage:") << " " << prog << " [OPTIONS]\n\n"
+              << Console::bold("Required arguments:") << "\n"
+              << "  " << Console::brand("--alignment") << " <file>   Path to codon alignment (FASTA or NEXUS)\n\n"
+              << Console::bold("Optional arguments:") << "\n"
+              << "  " << Console::brand("--tree") << " <file>        Path to Newick tree file or 'auto' (optional; auto-infers ML tree via TreeEngine if omitted or 'auto')\n"
+              << "  " << Console::brand("--ohmic") << "              Build Ohmic Phylogenetic Network with Wheatstone bridges\n"
+              << "  " << Console::brand("--hyphaeon") << "           Opt-in: HyphAeon 384D transformer conductances (needs Python aeon-core)\n"
+              << "  " << Console::brand("--no-hyphaeon") << "        Use empirical codon conductances only (default)\n"
+              << "  " << Console::brand("--embeddings") << " <file>  Path to precomputed [N x 384] HyphAeon embeddings (.bin/.csv/.tsv)\n"
+              << "  " << Console::brand("--code") << " <name>        Genetic code (default: Universal)\n"
+              << "  " << Console::brand("--branches") << " <set>     Branches to test: All, Internal, Leaves (default: All)\n"
+              << "  " << Console::brand("--pvalue") << " <threshold> Holm-Bonferroni p-value threshold (default: 0.05)\n"
+              << "  " << Console::brand("--max-rates, --rates") << " <N> Maximum rate classes per branch (default: 3)\n"
+              << "  " << Console::brand("--threads") << " <N>        Number of OpenMP worker threads (0 = auto)\n"
+              << "  " << Console::brand("--output") << " <file>      Path to output JSON file (default: <alignment>.ABSREL.json)\n"
+              << "  " << Console::brand("--html") << " <file>        Also write a self-contained interactive HTML report\n"
+              << "  " << Console::brand("--progress") << "           Force interactive progress bar\n"
+              << "  " << Console::brand("--no-progress") << "        Disable progress bar\n"
+              << "  " << Console::brand("--help, -h") << "           Show this help message\n\n"
+              << Console::bold("Examples:") << "\n"
+              << "  " << prog << " --alignment data/bglobin.nex\n"
+              << "  " << prog << " --alignment data/cd2.fna --tree auto --output cd2.ABSREL.json\n"
+              << "  " << prog << " --alignment data/cd2.fna --ohmic --branches Internal --threads 8\n\n";
+}
+
+int run_absrel(int argc, char* argv[]) {
+    CommonCLIOptions cli;
+    ABSRELSettings settings;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+
+        // aBSREL-specific spellings that the shared parser would otherwise
+        // consume into cli.* fields this tool does not read.
+        if ((arg == "--branches" || arg == "--test-branches") && i + 1 < argc) {
+            settings.test_branches = argv[++i];
+            continue;
+        }
+        if ((arg == "--pvalue" || arg == "-p") && i + 1 < argc) {
+            settings.p_threshold = parse_probability("--pvalue", argv[++i]);
+            continue;
+        }
+
+        auto status = parse_common_cli_arg(i, argc, argv, cli);
+        if (status == CommonArgParseStatus::Handled) continue;
+        if (status == CommonArgParseStatus::Error) return 1;
+
+        if ((arg == "--max-rates" || arg == "--rates") && i + 1 < argc) {
+            settings.max_rate_classes = static_cast<int>(parse_nonneg_ull("--max-rates", argv[++i], std::numeric_limits<int>::max(), 1));
+        } else if (arg == "--help" || arg == "-h") {
+            print_absrel_usage(argv[0]);
+            return 0;
+        } else {
+            std::cerr << "Unknown argument: " << arg << "\n";
+            print_absrel_usage(argv[0]);
+            return 1;
+        }
+    }
+
+    // Keep shared option fields in sync with the effective analysis settings so
+    // build_cli_provenance records what was actually used.
+    cli.branches = settings.test_branches;
+    cli.pvalue_threshold = settings.p_threshold;
+
+    if (cli.alignment_file.empty()) {
+        std::cerr << "Error: --alignment is required.\n\n";
+        print_absrel_usage(argv[0]);
+        return 1;
+    }
+
+    finalize_common_cli_options(cli, ".ABSREL.json");
+    print_absrel_banner();
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+    std::string start_iso = Provenance::current_iso8601();
+    std::string cli_cmd = join_cli_command(argc, argv);
+
+    LoadedCodonDataset ds;
+    if (!load_codon_dataset(cli, ds, true)) {
+        return 1;
+    }
+    auto& code = ds.gcode;
+    auto& aln = ds.aln;
+    auto& tree = ds.tree;
+    const auto& tree_source = ds.tree_source;
+
+    // Initialize and Run aBSREL
+    auto absrel = ABSRELAnalyzer::create(tree, aln, settings);
+
+    Panel::print_card("Dataset & Lineage Testing", {
+        {"Alignment File", cli.alignment_file},
+        {"Sequences / Taxa", std::to_string(aln.num_taxa)},
+        {"Codon Sites", std::to_string(aln.num_codons) + " (" + std::to_string(aln.num_codons * 3) + " nt)"},
+        {"Unique Patterns", std::to_string(aln.patterns.size())},
+        {"Tree Source", tree_source + " (" + std::to_string(tree.num_nodes()) + " nodes, " + std::to_string(tree.num_leaves()) + " leaves)"},
+        {"Tested Branches", settings.test_branches},
+        {"Max Rate Classes", std::to_string(settings.max_rate_classes)},
+        {"Genetic Code", code->name}
+    });
+
+    Panel::print_step(1, 1, "Running aBSREL Adaptive Branch-Site Workflow", 
+                      "Baseline MG94xREV, step-up complexity selection & lineage testing");
+
+    std::function<void(const std::string&, double)> progress_cb = nullptr;
+    if (!cli.show_progress && !cli.force_progress) {
+        progress_cb = [](const std::string& stage, double frac) {
+            std::cout << "  " << Console::muted("↳ [") << std::setw(3) << static_cast<int>(frac * 100) 
+                      << Console::muted("%] ") << stage << std::endl;
+        };
+    }
+
+    auto res = absrel.run(progress_cb, cli.show_progress, cli.force_progress);
+
+    // Branch table
+    Table branch_table;
+    branch_table.add_column("Branch", Table::Align::Left, 16);
+    branch_table.add_column("Rates", Table::Align::Center, 5);
+    branch_table.add_column("Full Length", Table::Align::Right, 11);
+    branch_table.add_column("Test LRT", Table::Align::Right, 8);
+    branch_table.add_column("Uncorrected p", Table::Align::Right, 13);
+    branch_table.add_column("Corrected p", Table::Align::Right, 12);
+    branch_table.add_column("EBF>=100", Table::Align::Right, 9);
+    branch_table.add_column("Selection", Table::Align::Left, 14);
+
+    for (const auto& bname : res.tested_branches) {
+        const auto& bres = res.branches.at(bname);
+        std::ostringstream len_ss, lrt_ss, un_p_ss, corr_p_ss;
+        len_ss << std::fixed << std::setprecision(4) << bres.full_branch_length;
+        lrt_ss << std::fixed << std::setprecision(2) << bres.lrt;
+        un_p_ss << std::scientific << std::setprecision(2) << bres.uncorrected_p_value;
+        corr_p_ss << std::scientific << std::setprecision(2) << bres.corrected_p_value;
+
+        std::string sel_label = Console::muted("-");
+        std::string row_color = "";
+        if (bres.is_positive) {
+            sel_label = Console::success("▲ Positive");
+            row_color = "\033[38;5;48m";
+        }
+
+        branch_table.add_row({
+            bname,
+            std::to_string(bres.rate_classes),
+            len_ss.str(),
+            lrt_ss.str(),
+            un_p_ss.str(),
+            corr_p_ss.str(),
+            std::to_string(bres.sites_ebf_100),
+            sel_label
+        }, row_color);
+    }
+
+    std::cout << "\n" << Console::bold("  Tested Branches Summary:") << "\n\n";
+    branch_table.print();
+    std::cout << "\n";
+
+    std::ostringstream gtr_ss, base_ss, full_ss, time_ss;
+    gtr_ss << std::fixed << std::setprecision(2) << res.gtr_fit.log_likelihood << " (AICc: " << res.gtr_fit.aicc << ")";
+    base_ss << std::fixed << std::setprecision(2) << res.baseline_fit.log_likelihood << " (AICc: " << res.baseline_fit.aicc << ")";
+    full_ss << std::fixed << std::setprecision(2) << res.full_adaptive_fit.log_likelihood << " (AICc: " << res.full_adaptive_fit.aicc << ")";
+    time_ss << std::fixed << std::setprecision(2) << res.runtime_seconds << " s";
+
+    std::string conclusion;
+    bool is_sig = !res.positive_branches.empty();
+    if (is_sig) {
+        conclusion = "EPISODIC DIVERSIFYING SELECTION detected on " + std::to_string(res.positive_branches.size()) + 
+                     " branch(es) at Holm-Bonferroni p <= " + std::to_string(settings.p_threshold) + "!";
+    } else {
+        conclusion = "No branches detected to be under positive selection at Holm-Bonferroni p <= " + std::to_string(settings.p_threshold) + ".";
+    }
+
+    std::string json_desc = (cli.json_format == JSONFormat::Legacy) ? " [Legacy]" : " [Modern v3.0]";
+    std::vector<std::pair<std::string, std::string>> sum_items = {
+        {"Tested Branches", std::to_string(res.tested_branches.size()) + " (" + settings.test_branches + ")"},
+        {"Positively Selected Branches", 
+         (is_sig ? Console::success(std::to_string(res.positive_branches.size())) : "0") + 
+         " [Holm-Bonferroni p <= " + std::to_string(settings.p_threshold) + "]"},
+        {"Baseline MG94xREV Log-L", base_ss.str()},
+        {"Full Adaptive aBSREL Log-L", full_ss.str()},
+        {"Nucleotide GTR Log-L", gtr_ss.str()},
+        {"JSON Output File", cli.output_file + json_desc},
+        {"Total Execution Time", time_ss.str()}
+    };
+
+    Panel::print_summary_card("aBSREL Lineage Selection Analysis Summary", sum_items, conclusion, is_sig);
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double total_runtime = std::chrono::duration<double>(end_time - start_time).count();
+
+    Provenance prov = build_cli_provenance(cli, cli_cmd, start_iso, total_runtime, {
+        {"branches", settings.test_branches},
+        {"pvalue", std::to_string(settings.p_threshold)},
+        {"max_rates", std::to_string(settings.max_rate_classes)}
+    });
+
+    // Save JSON (and optional HTML)
+    try {
+        res.save_json(cli.output_file, tree, aln, cli.json_format, prov);
+        std::string fmt_desc = (cli.json_format == JSONFormat::Legacy) ? "Legacy Datamonkey JSON" : "Modern HyPhy v3.0 JSON";
+        std::cout << Console::success("✔") << " " << Console::bold("Saved " + fmt_desc + " report to: ")
+                  << Console::brand(cli.output_file) << "\n\n";
+        if (!cli.html_file.empty()) {
+            hyphy::report::write_html_report(cli.output_file, cli.html_file);
+            std::cout << Console::success("✔") << " " << Console::bold("Saved HTML report to: ")
+                      << Console::brand(cli.html_file) << "\n\n";
+        }
+    } catch (const std::exception& e) {
+        std::cerr << Console::danger("Error: Failed to write output: ") << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
+}
+
+#ifndef HYPHY3_COMBINED_DRIVER
+int main(int argc, char* argv[]) {
+    try {
+        return run_absrel(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << Console::danger("Error: ") << e.what() << "\n";
+        return 1;
+    }
+}
+#endif

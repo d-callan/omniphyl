@@ -1,0 +1,18 @@
+{
+  "id": "daniellecallan/omniphyl-refiner-eval-pvivax",
+  "title": "omniphyl-refiner-eval-pvivax",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "daniellecallan/refiner-pvivax",
+    "daniellecallan/omniphyl-v6-ckpts",
+    "daniellecallan/omniphyl-refiner-multi",
+    "daniellecallan/refiner-trial-ckpts"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

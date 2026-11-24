@@ -1,0 +1,234 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/prime.v3.schema.json",
+  "title": "HyPhy 3 PRoperty Informed Models of Evolution (PRIME) Analysis Schema v3.0",
+  "description": "Standardized output schema for HyPhy 3 PRIME site-level biophysical property selection analyses.",
+  "type": "object",
+  "required": [
+    "$schema",
+    "schema_version",
+    "analysis",
+    "software",
+    "provenance",
+    "dataset",
+    "properties",
+    "phylogeny",
+    "model_fits",
+    "statistical_tests",
+    "site_results"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^3\\.[0-9]+\\.[0-9]+$"
+    },
+    "analysis": {
+      "type": "object",
+      "required": ["id", "name", "version"],
+      "properties": {
+        "id": { "type": "string", "enum": ["prime"] },
+        "name": { "type": "string" },
+        "type": { "type": "string" },
+        "version": { "type": "string" },
+        "authors": { "type": "string" },
+        "citation": { "type": "string" },
+        "contact": { "type": "string" }
+      }
+    },
+    "software": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "homepage": { "type": "string" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["invocation", "inputs", "execution"],
+      "properties": {
+        "invocation": {
+          "type": "object",
+          "required": ["cli_command"],
+          "properties": {
+            "cli_command": { "type": "string" },
+            "working_directory": { "type": "string" },
+            "arguments": { "type": "object" }
+          }
+        },
+        "inputs": {
+          "type": "object"
+        },
+        "execution": {
+          "type": "object",
+          "required": ["start_time", "end_time", "wall_time_seconds", "cpu_threads"],
+          "properties": {
+            "start_time": { "type": "string" },
+            "end_time": { "type": "string" },
+            "wall_time_seconds": { "type": "number", "minimum": 0 },
+            "cpu_threads": { "type": "integer", "minimum": 1 },
+            "hostname": { "type": "string" },
+            "os": { "type": "string" },
+            "compiler": { "type": "string" }
+          }
+        }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "required": ["taxa_count", "codon_sites", "nucleotide_sites", "unique_patterns", "taxa", "genetic_code"],
+      "properties": {
+        "taxa_count": { "type": "integer", "minimum": 1 },
+        "codon_sites": { "type": "integer", "minimum": 1 },
+        "nucleotide_sites": { "type": "integer", "minimum": 3 },
+        "unique_patterns": { "type": "integer", "minimum": 1 },
+        "taxa": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "genetic_code": {
+          "type": "object",
+          "required": ["id", "name", "sense_codons"],
+          "properties": {
+            "id": { "type": "string" },
+            "name": { "type": "string" },
+            "sense_codons": { "type": "integer" },
+            "stop_codons": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "properties": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["index", "name", "description", "mean", "std_dev"],
+        "properties": {
+          "index": { "type": "integer" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "mean": { "type": "number" },
+          "std_dev": { "type": "number" }
+        }
+      }
+    },
+    "phylogeny": {
+      "type": "object",
+      "required": ["newick", "nodes", "tree_lengths"],
+      "properties": {
+        "newick": { "type": "string" },
+        "nodes": { "type": "object" },
+        "tree_lengths": { "type": "object" }
+      }
+    },
+    "model_fits": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["log_likelihood", "aicc"],
+        "properties": {
+          "description": { "type": "string" },
+          "log_likelihood": { "type": "number" },
+          "aicc": { "type": "number" },
+          "alpha": { "type": "number" },
+          "beta": { "type": "number" },
+          "lambdas": {
+            "type": "array",
+            "items": { "type": "number" }
+          }
+        }
+      }
+    },
+    "statistical_tests": {
+      "type": "object",
+      "required": ["site_level_summary"],
+      "properties": {
+        "site_level_summary": {
+          "type": "object",
+          "required": [
+            "method",
+            "test_statistic",
+            "threshold",
+            "total_sites",
+            "invariant_sites",
+            "significant_sites",
+            "properties_count"
+          ],
+          "properties": {
+            "method": { "type": "string" },
+            "test_statistic": { "type": "string" },
+            "threshold": { "type": "number" },
+            "stage2_threshold": { "type": "number" },
+            "shrinkage_lambda": { "type": "number" },
+            "total_sites": { "type": "integer" },
+            "invariant_sites": { "type": "integer" },
+            "significant_sites": { "type": "integer" },
+            "properties_count": { "type": "integer" }
+          },
+          "additionalProperties": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "site_results": {
+      "type": "object",
+      "required": ["columns", "data"],
+      "properties": {
+        "columns": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["type", "description"],
+            "properties": {
+              "type": { "type": "string" },
+              "unit": { "type": "string" },
+              "description": { "type": "string" }
+            }
+          }
+        },
+        "data": {
+          "type": "object",
+          "required": [
+            "site",
+            "alpha",
+            "beta",
+            "fel_alpha",
+            "fel_beta",
+            "log_l_prime",
+            "log_l_fel",
+            "omnibus_lrt",
+            "omnibus_p_value",
+            "omnibus_q_value"
+          ],
+          "properties": {
+            "site": { "type": "array", "items": { "type": "integer" } },
+            "alpha": { "type": "array", "items": { "type": "number" } },
+            "beta": { "type": "array", "items": { "type": "number" } },
+            "fel_alpha": { "type": "array", "items": { "type": "number" } },
+            "fel_beta": { "type": "array", "items": { "type": "number" } },
+            "log_l_prime": { "type": "array", "items": { "type": "number" } },
+            "log_l_fel": { "type": "array", "items": { "type": "number" } },
+            "omnibus_lrt": { "type": "array", "items": { "type": "number" } },
+            "omnibus_p_value": { "type": "array", "items": { "type": "number" } },
+            "omnibus_q_value": { "type": "array", "items": { "type": "number" } },
+            "total_branch_length": { "type": "array", "items": { "type": "number" } },
+            "nonsynonymous_substitutions": { "type": "array", "items": { "type": "integer" } },
+            "unique_amino_acids": { "type": "array", "items": { "type": "integer" } },
+            "redundancy_ratio": { "type": "array", "items": { "type": "number" } }
+          },
+          "additionalProperties": {
+            "type": "array"
+          }
+        }
+      }
+    }
+  }
+}

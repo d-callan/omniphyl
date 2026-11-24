@@ -71,6 +71,10 @@ os.environ["FETCH_WORKERS"] = "6"
 # VEuPathDB only covers eukaryotic pathogens/vectors; skipping UCSC
 # lookups for the other ~6k accessions saves ~2 HTTP calls each
 os.environ["VEUPATH_GROUPS"] = "protozoa fungi invertebrate"
+# genome downloads are deleted right after slicing; anything still
+# in-flight at a timeout kill is dead weight in the output capture
+# (~4.4GB of a 5GB pull). Container /tmp is not captured.
+os.environ["OMNIPHYL_GENOMES_DIR"] = "/tmp/omniphyl-genomes"
 
 # resume: if a partial-corpus dataset is attached (output of a previous
 # run that hit Kaggle's 12h cap), seed it into the fetch workdir and set

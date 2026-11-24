@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Accent Gradients -->
+    <linearGradient id="cyanPurple" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="50%" stop-color="#818cf8"/>
+      <stop offset="100%" stop-color="#c084fc"/>
+    </linearGradient>
+    <linearGradient id="v3Accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="50%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#a855f7"/>
+    </linearGradient>
+    <linearGradient id="treeGrad" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#a855f7"/>
+    </linearGradient>
+
+    <!-- Glow Filter -->
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="4" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Centered Monkey AI Mascot (Transparent Backplate) -->
+  <g id="hyphy3-monkey-icon" transform="translate(256, 256) scale(1.8) translate(-150, -160)">
+    <!-- Ambient Head Glow Backplate -->
+    <circle cx="150" cy="155" r="95" fill="#38bdf8" fill-opacity="0.06" filter="url(#glow)"/>
+
+    <!-- Primate Outer Contour / Cranium & Ears -->
+    <path d="M 90 120 C 50 110 38 170 86 182" fill="none" stroke="url(#cyanPurple)" stroke-width="3.5" stroke-linecap="round"/>
+    <path d="M 210 120 C 250 110 262 170 214 182" fill="none" stroke="url(#cyanPurple)" stroke-width="3.5" stroke-linecap="round"/>
+    <path d="M 78 132 C 60 132 54 162 78 170" fill="none" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="3 3"/>
+    <path d="M 222 132 C 240 132 246 162 222 170" fill="none" stroke="#a855f7" stroke-width="1.5" stroke-dasharray="3 3"/>
+
+    <!-- Cranial Arch -->
+    <path d="M 90 120 C 90 64 210 64 210 120" fill="none" stroke="url(#cyanPurple)" stroke-width="3.5" stroke-linecap="round"/>
+
+    <!-- Heavy Primate Brow Ridge -->
+    <path d="M 88 134 Q 120 120 150 136 Q 180 120 212 134" fill="none" stroke="#818cf8" stroke-width="4.5" stroke-linecap="round"/>
+
+    <!-- Lower Jaw & Muzzle Boundary -->
+    <path d="M 86 182 C 84 230 116 256 150 256 C 184 256 216 230 214 182" fill="none" stroke="url(#cyanPurple)" stroke-width="3.5" stroke-linecap="round"/>
+    <path d="M 104 172 C 104 154 196 154 196 172 C 196 222 104 222 104 172 Z" fill="#0f172a" fill-opacity="0.85" stroke="#38bdf8" stroke-width="2"/>
+
+    <!-- Primate Nostrils & Mouth -->
+    <ellipse cx="141" cy="186" rx="3.5" ry="5.5" fill="#38bdf8" transform="rotate(-15 141 186)"/>
+    <ellipse cx="159" cy="186" rx="3.5" ry="5.5" fill="#38bdf8" transform="rotate(15 159 186)"/>
+    <path d="M 124 210 Q 150 218 176 210" fill="none" stroke="#818cf8" stroke-width="3" stroke-linecap="round"/>
+
+    <!-- Neural Optic Reticles (AI Sensors) -->
+    <g transform="translate(122, 147)">
+      <circle cx="0" cy="0" r="10" fill="#030712" stroke="#38bdf8" stroke-width="2"/>
+      <circle cx="0" cy="0" r="3.5" fill="#38bdf8"/>
+      <line x1="-14" y1="0" x2="-10" y2="0" stroke="#38bdf8" stroke-width="1.5"/>
+      <line x1="10" y1="0" x2="14" y2="0" stroke="#38bdf8" stroke-width="1.5"/>
+      <line x1="0" y1="-14" x2="0" y2="-10" stroke="#38bdf8" stroke-width="1.5"/>
+      <line x1="0" y1="10" x2="0" y2="14" stroke="#38bdf8" stroke-width="1.5"/>
+    </g>
+    <g transform="translate(178, 147)">
+      <circle cx="0" cy="0" r="10" fill="#030712" stroke="#c084fc" stroke-width="2"/>
+      <circle cx="0" cy="0" r="3.5" fill="#c084fc"/>
+      <line x1="-14" y1="0" x2="-10" y2="0" stroke="#c084fc" stroke-width="1.5"/>
+      <line x1="10" y1="0" x2="14" y2="0" stroke="#c084fc" stroke-width="1.5"/>
+      <line x1="0" y1="-14" x2="0" y2="-10" stroke="#c084fc" stroke-width="1.5"/>
+      <line x1="0" y1="10" x2="0" y2="14" stroke="#c084fc" stroke-width="1.5"/>
+    </g>
+
+    <!-- Cranial Phylogenetic Cladogram / Autograd Graph -->
+    <g id="phylo-graph" stroke-linecap="round" stroke-linejoin="round">
+      <!-- Root Trunk -->
+      <line x1="150" y1="128" x2="150" y2="106" stroke="url(#treeGrad)" stroke-width="3"/>
+      <!-- Level 1 Bifurcation -->
+      <line x1="124" y1="106" x2="176" y2="106" stroke="url(#treeGrad)" stroke-width="2.5"/>
+      <line x1="124" y1="106" x2="124" y2="90" stroke="url(#treeGrad)" stroke-width="2.5"/>
+      <line x1="176" y1="106" x2="176" y2="90" stroke="url(#treeGrad)" stroke-width="2.5"/>
+      <!-- Level 2 Sub-Clades -->
+      <line x1="110" y1="90" x2="138" y2="90" stroke="#38bdf8" stroke-width="2"/>
+      <line x1="162" y1="90" x2="190" y2="90" stroke="#c084fc" stroke-width="2"/>
+      <line x1="110" y1="90" x2="110" y2="76" stroke="#38bdf8" stroke-width="2"/>
+      <line x1="138" y1="90" x2="138" y2="76" stroke="#38bdf8" stroke-width="2"/>
+      <line x1="162" y1="90" x2="162" y2="76" stroke="#c084fc" stroke-width="2"/>
+      <line x1="190" y1="90" x2="190" y2="76" stroke="#c084fc" stroke-width="2"/>
+
+      <!-- Computational Nodes & Selection Leaves -->
+      <circle cx="150" cy="128" r="4.5" fill="#38bdf8" filter="url(#glow)"/>
+      <circle cx="150" cy="106" r="3.5" fill="#818cf8"/>
+      <circle cx="124" cy="90" r="3.5" fill="#38bdf8"/>
+      <circle cx="176" cy="90" r="3.5" fill="#c084fc"/>
+      <circle cx="110" cy="76" r="3" fill="#22d3ee"/>
+      <circle cx="138" cy="76" r="3" fill="#34d399"/>
+      <circle cx="162" cy="76" r="3" fill="#fbbf24"/>
+      <circle cx="190" cy="76" r="3" fill="#f43f5e"/>
+
+      <!-- Reverse Adjoint Gradient Backprop Indicator -->
+      <path d="M 194 80 L 180 94 L 154 110" fill="none" stroke="#f43f5e" stroke-width="1.2" stroke-dasharray="2 2"/>
+    </g>
+  </g>
+</svg>

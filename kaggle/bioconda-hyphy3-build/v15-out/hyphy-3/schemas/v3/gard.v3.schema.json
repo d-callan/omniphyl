@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/gard.v3.schema.json",
+  "title": "HyPhy 3 Genetic Algorithm for Recombination Detection (GARD) Analysis Schema v3.0",
+  "description": "Standardized output schema for HyPhy 3 GARD recombination screening and phylogenetic incongruence analyses.",
+  "type": "object",
+  "required": [
+    "$schema",
+    "schema_version",
+    "analysis",
+    "software",
+    "dataset",
+    "baseline",
+    "model_selection",
+    "partitions",
+    "topology_test",
+    "site_breakpoint_support"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^3\\.[0-9]+\\.[0-9]+$"
+    },
+    "analysis": {
+      "type": "object",
+      "required": ["id", "name", "version"],
+      "properties": {
+        "id": { "type": "string", "enum": ["gard"] },
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "authors": { "type": "string" },
+        "citation": { "type": "string" },
+        "contact": { "type": "string" }
+      }
+    },
+    "software": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "homepage": { "type": "string" }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "required": ["file", "taxa_count", "sites_count", "variable_sites_count", "potential_breakpoints", "minimum_partition_size"],
+      "properties": {
+        "file": { "type": "string" },
+        "taxa_count": { "type": "integer", "minimum": 3 },
+        "sites_count": { "type": "integer", "minimum": 1 },
+        "variable_sites_count": { "type": "integer", "minimum": 0 },
+        "potential_breakpoints": { "type": "integer", "minimum": 0 },
+        "minimum_partition_size": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "baseline": {
+      "type": "object",
+      "required": ["log_likelihood", "aicc", "tree"],
+      "properties": {
+        "log_likelihood": { "type": "number" },
+        "aicc": { "type": "number" },
+        "tree": { "type": "string" },
+        "rates": { "type": "object" },
+        "frequencies": { "type": "object" }
+      }
+    },
+    "model_selection": {
+      "type": "object",
+      "required": ["best_model_breakpoints", "best_model_aicc", "best_model_log_likelihood", "improvements"],
+      "properties": {
+        "best_model_breakpoints": {
+          "type": "array",
+          "items": { "type": "integer" }
+        },
+        "best_model_aicc": { "type": "number" },
+        "best_model_log_likelihood": { "type": "number" },
+        "improvements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["breakpoints_count", "delta_aicc"],
+            "properties": {
+              "breakpoints_count": { "type": "integer" },
+              "delta_aicc": { "type": "number" }
+            }
+          }
+        }
+      }
+    },
+    "partitions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["partition_index", "start_site", "end_site", "log_likelihood", "tree"],
+        "properties": {
+          "partition_index": { "type": "integer" },
+          "start_site": { "type": "integer" },
+          "end_site": { "type": "integer" },
+          "log_likelihood": { "type": "number" },
+          "tree": { "type": "string" }
+        }
+      }
+    },
+    "topology_test": {
+      "type": "object",
+      "required": ["single_tree_aicc", "topological_incongruence_supported", "delta_aicc_topology"],
+      "properties": {
+        "single_tree_aicc": { "type": "number" },
+        "topological_incongruence_supported": { "type": "boolean" },
+        "delta_aicc_topology": { "type": "number" }
+      }
+    },
+    "site_breakpoint_support": {
+      "type": "object",
+      "additionalProperties": { "type": "number" }
+    },
+    "total_models_evaluated": { "type": "integer", "minimum": 1 },
+    "time_elapsed": { "type": "number", "minimum": 0.0 }
+  }
+}

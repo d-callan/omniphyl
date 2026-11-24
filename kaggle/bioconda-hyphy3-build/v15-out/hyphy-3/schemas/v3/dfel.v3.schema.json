@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/veg/hyphy-3/main/schemas/v3/dfel.v3.schema.json",
+  "title": "HyPhy 3 Directional Fixed Effects Likelihood (dFEL) Analysis Schema v3.0",
+  "description": "Standardized output schema for HyPhy 3 Directional FEL site-level selection analyses under non-stationary composition dynamics.",
+  "type": "object",
+  "required": [
+    "$schema",
+    "schema_version",
+    "analysis",
+    "software",
+    "provenance",
+    "dataset",
+    "phylogeny",
+    "compositional_heterogeneity",
+    "root_selection",
+    "directional_model",
+    "model_fits",
+    "site_results"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "format": "uri"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^3\\.[0-9]+\\.[0-9]+$"
+    },
+    "analysis": {
+      "type": "object",
+      "required": ["id", "name", "version", "category", "description"],
+      "properties": {
+        "id": { "type": "string", "enum": ["dfel"] },
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "category": { "type": "string" },
+        "description": { "type": "string" },
+        "settings": { "type": "object" }
+      }
+    },
+    "software": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "citation": { "type": "string" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["created_at"],
+      "properties": {
+        "created_at": { "type": "string" }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "required": ["file", "taxa_count", "codon_sites", "patterns_count", "genetic_code"],
+      "properties": {
+        "file": { "type": "string" },
+        "taxa_count": { "type": "integer" },
+        "codon_sites": { "type": "integer" },
+        "patterns_count": { "type": "integer" },
+        "genetic_code": { "type": "string" }
+      }
+    },
+    "phylogeny": {
+      "type": "object",
+      "required": ["rooted", "root_branch", "tree_length"],
+      "properties": {
+        "rooted": { "type": "boolean" },
+        "root_branch": { "type": "string" },
+        "root_log_likelihood": { "type": "number" },
+        "root_weight": { "type": "number" },
+        "tree_length": { "type": "number" },
+        "newick": { "type": "string" }
+      }
+    },
+    "compositional_heterogeneity": {
+      "type": "object",
+      "required": ["is_heterogeneous", "overall", "codon_position_1", "codon_position_2", "codon_position_3", "taxa"],
+      "properties": {
+        "is_heterogeneous": { "type": "boolean" },
+        "overall": {
+          "type": "object",
+          "required": ["chi2", "df", "p_value"],
+          "properties": {
+            "chi2": { "type": "number" },
+            "df": { "type": "integer" },
+            "p_value": { "type": "number" }
+          }
+        },
+        "codon_position_1": {
+          "type": "object",
+          "required": ["chi2", "df", "p_value"],
+          "properties": {
+            "chi2": { "type": "number" },
+            "df": { "type": "integer" },
+            "p_value": { "type": "number" }
+          }
+        },
+        "codon_position_2": {
+          "type": "object",
+          "required": ["chi2", "df", "p_value"],
+          "properties": {
+            "chi2": { "type": "number" },
+            "df": { "type": "integer" },
+            "p_value": { "type": "number" }
+          }
+        },
+        "codon_position_3": {
+          "type": "object",
+          "required": ["chi2", "df", "p_value"],
+          "properties": {
+            "chi2": { "type": "number" },
+            "df": { "type": "integer" },
+            "p_value": { "type": "number" }
+          }
+        },
+        "taxa": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["taxon", "gc_overall", "gc_cp3"],
+            "properties": {
+              "taxon": { "type": "string" },
+              "gc_overall": { "type": "number" },
+              "gc_cp3": { "type": "number" }
+            }
+          }
+        }
+      }
+    },
+    "root_selection": {
+      "type": "object",
+      "required": ["candidates"],
+      "properties": {
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["rank", "branch", "is_terminal", "log_likelihood", "delta_log_l", "weight"],
+            "properties": {
+              "rank": { "type": "integer" },
+              "branch": { "type": "string" },
+              "is_terminal": { "type": "boolean" },
+              "log_likelihood": { "type": "number" },
+              "delta_log_l": { "type": "number" },
+              "weight": { "type": "number" }
+            }
+          }
+        }
+      }
+    },
+    "directional_model": {
+      "type": "object",
+      "required": ["regimes"],
+      "properties": {
+        "regimes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "name", "psi", "mean_gc", "branch_count"],
+            "properties": {
+              "id": { "type": "integer" },
+              "name": { "type": "string" },
+              "psi": { "type": "number" },
+              "mean_gc": { "type": "number" },
+              "branch_count": { "type": "integer" }
+            }
+          }
+        }
+      }
+    },
+    "model_fits": {
+      "type": "object",
+      "required": ["gtr", "directional_mg94"],
+      "properties": {
+        "gtr": {
+          "type": "object",
+          "required": ["log_likelihood", "aicc"],
+          "properties": {
+            "log_likelihood": { "type": "number" },
+            "aicc": { "type": "number" }
+          }
+        },
+        "directional_mg94": {
+          "type": "object",
+          "required": ["log_likelihood", "aicc"],
+          "properties": {
+            "log_likelihood": { "type": "number" },
+            "aicc": { "type": "number" }
+          }
+        }
+      }
+    },
+    "site_results": {
+      "type": "object",
+      "required": ["data"],
+      "properties": {
+        "data": {
+          "type": "object",
+          "required": ["site", "alpha", "beta", "alpha_null", "lrt", "p_value", "classification", "substitutions"],
+          "properties": {
+            "site": { "type": "array", "items": { "type": "integer" } },
+            "alpha": { "type": "array", "items": { "type": "number" } },
+            "beta": { "type": "array", "items": { "type": "number" } },
+            "alpha_null": { "type": "array", "items": { "type": "number" } },
+            "lrt": { "type": "array", "items": { "type": "number" } },
+            "p_value": { "type": "array", "items": { "type": "number" } },
+            "classification": { "type": "array", "items": { "type": "string" } },
+            "substitutions": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    }
+  }
+}

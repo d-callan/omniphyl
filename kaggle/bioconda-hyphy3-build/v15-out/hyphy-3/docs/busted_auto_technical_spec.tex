@@ -1,0 +1,193 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,amsthm,bm}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    urlcolor=blue!70!black,
+    citecolor=blue!70!black
+}
+
+\newcommand{\BUSTED}{\texttt{BUSTED}\xspace}
+\newcommand{\HyPhy}{\textsc{HyPhy}\xspace}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\title{\textbf{Technical Specification: \texttt{BUSTED --auto} and the Saturation Error Sink (\texttt{--error-sink}) in \textsc{HyPhy}~3}}
+\author{Sergei L.\ Kosakovsky Pond\\
+\small Institute for Genomics and Evolutionary Medicine, Temple University, Philadelphia, PA, USA\\
+\small \texttt{github.com/veg/hyphy-3}}
+\date{October 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\noindent The Branch-Site Unrestricted Statistical Test for Episodic Diversification (\texttt{BUSTED}) tests whether a gene has experienced positive selection on at least one site and at least one branch. Over time, \texttt{BUSTED} has accumulated several optional model extensions: synonymous rate variation (\texttt{--srv}, $M \in \{1, 2, 3\}$), multi-nucleotide substitutions (\texttt{--multiple-hits}, $\delta$ and $\psi$), an alignment error sink (\texttt{--error-sink}), and a variable number of non-synonymous rate classes ($K \in \{1, 2, 3\}$). Running the full Cartesian grid of $2 \times 3 \times 3 \times 2 = 36$ model pairs is computationally wasteful and statistically poorly calibrated. Here we specify two additions to \textsc{HyPhy}~3. First, we introduce a parameter-free Huber $\epsilon$-contaminated saturation replacement kernel (\texttt{--error-sink}) that quarantines alignment and sequencing artifacts in $O(S)$ time per branch-site. Second, we define a four-gate automatic model selector (\texttt{--auto}) that chooses the active model components from a single baseline fit using branch-site surprisal, error-quarantined tangent scores, Neyman-Scott synonymous overdispersion, and constrained-null AIC$_c$ pruning.
+\end{abstract}
+
+\section{Problem Statement}
+
+A general \texttt{BUSTED} analysis includes four discrete model configuration choices:
+\begin{enumerate}[nosep]
+    \item \textbf{Error sink} ($E \in \{\text{Off}, \text{On}\}$): whether to include a mixture component that absorbs non-biological alignment or sequencing errors.
+    \item \textbf{Multi-nucleotide hits} ($H \in \{\text{None}, \text{Double}, \text{Double+Triple}\}$): whether to allow instantaneous 2-nucleotide ($\delta$) and 3-nucleotide ($\psi$) codon substitutions.
+    \item \textbf{Synonymous rate variation} ($M \in \{1, 2, 3\}$): the number of discrete site-to-site synonymous rate categories $\alpha_m$.
+    \item \textbf{Non-synonymous rate classes} ($K \in \{2, 3\}$): the number of discrete branch-site $\omega_k$ categories.
+\end{enumerate}
+Two statistical failure modes occur when these components are enabled manually or selected by naive AIC$_c$ grid search:
+\begin{itemize}[nosep]
+    \item \textbf{Confounding between alignment errors and multi-nucleotide hits:} A local misalignment or frameshift introduces clusters of 2-nt and 3-nt codon differences on a single short branch ($t_b \ll 0.05$). Under standard \texttt{BUSTED}, these changes force $\hat{\omega}_K \gg 100$ and cause false-positive selection calls. Under \texttt{BUSTED-MH}, the same artifact inflates $\hat{\delta}$ and $\hat{\psi}$ across the entire tree.
+    \item \textbf{Boundary competition between $\omega_K$ and the error sink:} On a short branch of length $t_b \approx 10^{-3}$, an unconstrained rate class with $\omega_K = 2000$ yields $\exp(\bm{Q}(\omega_K) t_b) \approx \bm{1}\bm{\pi}^T$, which is numerically indistinguishable from a saturation replacement kernel.
+\end{itemize}
+
+\section{Option A: The Huber $\epsilon$-Contaminated Saturation Error Sink}
+
+\subsection{Formulation of the Replacement Kernel}
+
+In \textsc{HyPhy}~2.5, \texttt{--error-sink} added a fourth CTMC rate class with $\omega_{\text{sink}} \in [100, 10^{10}]$ (lower bound set by \texttt{--error-sink-bound}, default $100$, initialized on $[100, 5000]$) and weight $p_{\text{sink}} \le 0.01$, while restricting the biological positive-selection rate class to $\omega_K \in [1, 100]$. That CTMC formulation had three defects. First, its transition probabilities depended on branch length $t_b$, so it failed to absorb errors on terminal branches of length $t_b \to 0$. Second, it only increased single-nucleotide non-synonymous rates and could not absorb 2-nt or 3-nt frameshift codons in one step unless $\delta, \psi > 0$. Third, it required an extra $61 \times 61$ matrix exponential per branch.
+
+In \textsc{HyPhy}~3, we replace the $\omega_{\text{sink}} \in [100, 10^{10}]$ CTMC rate class with an exact branch-length-independent off-diagonal replacement kernel $\bm{P}_{\text{sink}} \in \mathbb{R}^{S \times S}$ ($S = 61$ sense codons):
+\begin{equation}
+    P_{\text{sink}}(i, j) = \begin{cases}
+    0 & \text{if } i = j, \\
+    \dfrac{\pi_j}{1 - \pi_i} & \text{if } i \neq j,
+    \end{cases}
+    \label{eq:psink}
+\end{equation}
+where $\bm{\pi} = (\pi_1, \dots, \pi_S)$ is the empirical $F3\times 4$ codon equilibrium distribution ($\sum_{j=1}^S \pi_j = 1$). Every row of $\bm{P}_{\text{sink}}$ is non-negative and sums to 1. Under $\bm{P}_{\text{sink}}$, a corrupted codon $i$ is replaced by a distinct codon $j \neq i$ drawn from the background codon distribution $\bm{\pi}$, independent of the branch length $t_b$ and independent of the Hamming distance $d(i, j) \in \{1, 2, 3\}$.
+
+On any tested branch $b$ of length $t_b$, the effective transition probability matrix for synonymous rate class $m \in \{1, \dots, M\}$ and non-synonymous rate class $k \in \{1, \dots, K\}$ is the Huber $\epsilon$-contaminated mixture:
+\begin{equation}
+    \tilde{\bm{P}}_b(m, k) = (1 - \epsilon_{\text{sink}}) \bm{P}_{\text{bio}}(t_b \mid \alpha_m, \omega_k) + \epsilon_{\text{sink}} \bm{P}_{\text{sink}}.
+    \label{eq:huber}
+\end{equation}
+Here $\bm{P}_{\text{bio}}(t_b \mid \alpha_m, \omega_k) = \exp(\alpha_m t_b \bm{Q}(1, \omega_k))$ is the biological transition matrix, and $\epsilon_{\text{sink}} \in [0, \epsilon_{\max}]$ ($\epsilon_{\max} = 0.01$ by default) is the alignment-wide error proportion.
+
+\subsection{Zero-Matrix-Exponential $O(S)$ Bilinear Evaluation}
+
+Because $\bm{P}_{\text{sink}}$ is a rank-1 matrix minus its diagonal, evaluating the branch-site conditional likelihood under $\bm{P}_{\text{sink}}$ requires no matrix exponential and no $O(S^2)$ matrix-vector multiplication. Given the post-order child conditional likelihood vector $\bm{d} = D_{v,p} \in \mathbb{R}^S$ and the pre-order outside (ancestral complement) vector $\bm{u} = V_{v,p} \in \mathbb{R}^S$ at branch $b$ and pattern $p$, first compute the scalar dot product:
+\begin{equation}
+    S_{\pi}(\bm{d}) = \sum_{j=1}^S \pi_j d_j = \bm{\pi}^T \bm{d}.
+\end{equation}
+The action of $\bm{P}_{\text{sink}}$ on $\bm{d}$ at ancestral state $i$ is:
+\begin{equation}
+    (\bm{P}_{\text{sink}} \bm{d})_i = \sum_{j \neq i} \frac{\pi_j d_j}{1 - \pi_i} = \frac{S_{\pi}(\bm{d}) - \pi_i d_i}{1 - \pi_i},
+\end{equation}
+and the complete bilinear form across branch $b$ is evaluated in $O(S)$ operations:
+\begin{equation}
+    L_{b,p}^{\text{sink}} = \bm{u}^T \bm{P}_{\text{sink}} \bm{d} = \sum_{i=1}^S u_i \frac{S_{\pi}(\bm{d}) - \pi_i d_i}{1 - \pi_i}.
+    \label{eq:bilinear}
+\end{equation}
+
+\subsection{EM Responsibility Update and $\omega_K$ Upper-Bound Separation}
+
+Let $L_{b,p}^{\text{bio}} = \bm{u}^T \left(\sum_{m,k} q_m p_k \bm{P}_{\text{bio}}(t_b \mid \alpha_m, \omega_k)\right) \bm{d}$ denote the biological marginal likelihood of pattern $p$ across branch $b$, and let $L_p = (1 - \epsilon_{\text{sink}}) L_{b,p}^{\text{bio}} + \epsilon_{\text{sink}} L_{b,p}^{\text{sink}}$ denote the total pattern likelihood. By Bayes' rule, the posterior responsibility that branch-site $(b, p)$ was generated by the error sink is:
+\begin{equation}
+    r_{b,p}^{\text{sink}} = \Pr(\text{sink} \mid b, p) = \frac{\epsilon_{\text{sink}} L_{b,p}^{\text{sink}}}{(1 - \epsilon_{\text{sink}}) L_{b,p}^{\text{bio}} + \epsilon_{\text{sink}} L_{b,p}^{\text{sink}}}.
+    \label{eq:resp}
+\end{equation}
+In each Expectation-Maximization (EM) step, the maximum-likelihood update for $\epsilon_{\text{sink}}$ across all tested branches $\mathcal{B}_{\text{test}}$ ($|\mathcal{B}_{\text{test}}| = B_{\text{test}}$) and codon sites $C = \sum_{p=1}^P w_p$ is:
+\begin{equation}
+    \epsilon_{\text{sink}}^{\text{new}} = \text{clip}\left( \frac{1}{B_{\text{test}} C} \sum_{b \in \mathcal{B}_{\text{test}}} \sum_{p=1}^P w_p r_{b,p}^{\text{sink}}, \; 10^{-7}, \; \epsilon_{\max} \right).
+    \label{eq:em_eps}
+\end{equation}
+To prevent the biological positive-selection rate class $\omega_K$ from degenerating into an extreme saturation kernel ($\omega_K \le 10^4$, the default \textsc{HyPhy}~3 upper bound when \texttt{--error-sink} is inactive, which is tighter than \textsc{HyPhy}~2.5's \texttt{terms.range\_gte1} upper bound of $10^{10}$) on short branches and competing with $\bm{P}_{\text{sink}}$, \textsc{HyPhy}~3 matches \textsc{HyPhy}~2.5's error-sink positive-selection bound by restricting $\omega_K \in [1, 100]$ whenever \texttt{--error-sink} is active. Any instantaneous saturation jump on a short branch is therefore routed into $\bm{P}_{\text{sink}}$ under both the Alternative and Null models while preserving exact, unweighted codon site log-likelihoods.
+
+For each branch-site $(b, s)$, \textsc{HyPhy}~3 reports the posterior error probability $r_{b,s}^{\text{sink}}$ and the Empirical Bayes Factor:
+\begin{equation}
+    \text{BF}_{b,s}^{\text{sink}} = \frac{r_{b,s}^{\text{sink}} / (1 - r_{b,s}^{\text{sink}})}{\epsilon_{\text{sink}} / (1 - \epsilon_{\text{sink}})} = \frac{L_{b,s}^{\text{sink}}}{L_{b,s}^{\text{bio}}}.
+\end{equation}
+Branch-sites with $\text{BF}_{b,s}^{\text{sink}} \ge 100.0$ (default \texttt{--error-sink-bf 100}) and $r_{b,s}^{\text{sink}} \ge 0.50$ are reported in the console summary and JSON output.
+
+\section{The \texttt{BUSTED --auto} 4-Gate Model Selection Pipeline}
+
+Instead of fitting all 36 combinations of $(E, H, M, K)$, \texttt{BUSTED --auto} executes a single fast baseline fit ($K=2, M=1, \delta=0, \psi=0, \epsilon_{\text{sink}}=0$) followed by a single Inside-Outside pass that caches the subtree vectors $D_{v,p}$ and ancestral complement vectors $V_{v,p}$ across all branches and patterns. It then evaluates four sequential diagnostic gates.
+
+\subsection{Gate 1: Error Sink Activation via Branch-Site Surprisal and Spatial Adjacency}
+
+At every tested branch $b$ and site $s$ (with pattern $p(s)$), Gate 1 computes the log-2 surprisal gain (in bits) of replacing the biological transition kernel with the saturation kernel $\bm{P}_{\text{sink}}$:
+\begin{equation}
+    \Delta I_{b,s}^{\text{sink}} = \log_2 \left( \frac{L_{b,p(s)}^{\text{sink}}}{L_{b,p(s)}^{\text{bio}}} \right) \quad \text{bits}.
+\end{equation}
+Under a well-specified single-hit biological model, $\Delta I_{b,s}^{\text{sink}} < 0$ at conserved sites and rarely exceeds $8$ bits at rapidly evolving sites. A 2-nt or 3-nt misalignment on a branch of length $t_b = 0.002$ has $L_{b,s}^{\text{bio}} \propto t_b^2$ or $t_b^3$, yielding $\Delta I_{b,s}^{\text{sink}} \in [13, 35]$ bits. Gate 1 also counts spatially adjacent outlier pairs on the same branch:
+\begin{equation}
+    N_{\text{adj}} = \sum_{b \in \mathcal{B}_{\text{test}}} \sum_{s=1}^{C-1} \mathbb{I}\left(\Delta I_{b,s}^{\text{sink}} > 8.0 \text{ and } \Delta I_{b,s+1}^{\text{sink}} > 8.0\right),
+\end{equation}
+which detects multi-codon indels and local frameshifts.
+\begin{itemize}[nosep]
+    \item \textbf{Screening rule:} If $\max_{b,s} \Delta I_{b,s}^{\text{sink}} \le 13.0$ bits and $N_{\text{adj}} = 0$, the alignment has no saturation anomalies; \texttt{--error-sink} is turned \textbf{OFF} ($\epsilon_{\text{sink}} = 0$) in zero extra tree passes.
+    \item \textbf{Confirmation probe:} Otherwise, Gate 1 evaluates $\epsilon_{\text{sink}} \in \{0.001, 0.003, 0.008\}$ followed by an EM update and activates \texttt{--error-sink} if and only if $\Delta \ell_{\text{sink}} > 2.2$ and either $\max_{b,s} \Delta I_{b,s}^{\text{sink}} \ge 13.0$ bits or ($N_{\text{adj}} \ge 1$ and $\max_{b,s} \Delta I_{b,s}^{\text{sink}} \ge 8.0$ bits).
+\end{itemize}
+
+\subsection{Gate 2: Error-Quarantined Multi-Hit Score Test ($\delta, \psi$)}
+
+To prevent alignment artifacts from triggering multi-nucleotide substitution parameters, Gate 2 weights each branch-site by its non-error probability $1 - r_{b,p}^{\text{sink}}$ from Gate 1. Let $\dot{\bm{Q}}_\delta = \left.\partial \bm{Q} / \partial \delta\right|_{\delta=0}$ and $\dot{\bm{Q}}_\psi = \left.\partial \bm{Q} / \partial \psi\right|_{\psi=0}$ denote the tangent generators for 2-nucleotide ($d(i,j)=2$) and 3-nucleotide ($d(i,j)=3$) transitions. Using the first-order short-branch tangent approximation $\partial \bm{P}_b / \partial \delta \approx t_b \dot{\bm{Q}}_\delta$, the error-quarantined positive tangent scores are:
+\begin{align}
+    S_\delta &= \sum_{b \in \mathcal{B}_{\text{test}}} \sum_{p=1}^P w_p (1 - r_{b,p}^{\text{sink}}) \frac{t_b \, \bm{u}_{b,p}^T \dot{\bm{Q}}_\delta^+ \bm{d}_{b,p}}{L_{b,p}}, \\
+    S_\psi   &= \sum_{b \in \mathcal{B}_{\text{test}}} \sum_{p=1}^P w_p (1 - r_{b,p}^{\text{sink}}) \frac{t_b \, \bm{u}_{b,p}^T \dot{\bm{Q}}_\psi^+ \bm{d}_{b,p}}{L_{b,p}},
+\end{align}
+where $\dot{\bm{Q}}_\delta^+$ and $\dot{\bm{Q}}_\psi^+$ contain the off-diagonal 2-hit and 3-hit rates.
+\begin{itemize}[nosep]
+    \item \textbf{Screening rule:} If $S_\delta \le 0.15$, multi-hit parameters are set to \texttt{None} ($\delta = \psi = 0$) immediately.
+    \item \textbf{Confirmation probe:} If $S_\delta > 0.15$, Gate 2 evaluates a coordinate probe for $\delta \in \{0.06, 0.20\}$ with $\epsilon_{\text{sink}}$ fixed from Gate 1. It enables \texttt{Double} only if $\Delta \ell_\delta > 2.2$, and subsequently enables \texttt{Double+Triple} only if $S_\psi > 0.05$ and $\Delta \ell_\psi > 2.2$.
+\end{itemize}
+
+\subsection{Gate 3: Synonymous Rate Variation ($M$) via Neyman-Scott Overdispersion and Rate Optimization}
+
+To test whether a single synonymous rate ($M=1$) is sufficient or whether site-to-site synonymous rate variation ($M \in \{2, 3\}$) is required, Gate 3 evaluates the empirical Neyman-Scott overdispersion $Z$-statistic across patterns:
+\begin{equation}
+    Z_{\text{SRV}} = \frac{\sum_{p=1}^P w_p (u_p^2 - v_p)}{\sqrt{2 \sum_{p=1}^P w_p v_p^2}},
+\end{equation}
+where $u_p$ and $v_p$ are the pattern synonymous score and Fisher information, followed by SQUAREM weight updates and Nelder-Mead / Brent optimization of the unit-mean synonymous rates $\alpha_m$ ($\sum_m q_m \alpha_m = 1$) for $M=3$ and $M=2$. Gate 3 selects $M=3$ if $\Delta \ell_{\text{SRV},3} > 4.5$ (or $Z_{\text{SRV}} \ge 2.0$ with $\Delta \ell_{\text{SRV},3} > 3.0$) and $\min_m q_m \ge 0.02$, or $M=2$ if $\Delta \ell_{\text{SRV},2} > 2.2$ (or $Z_{\text{SRV}} \ge 1.65$ with $\Delta \ell_{\text{SRV},2} > 1.5$) and $\min_m q_m \ge 0.02$; otherwise $M=1$.
+
+\subsection{Gate 4: Non-Synonymous Rate Classes ($K$) via Constrained-Null AIC$_c$ Step-Up and Collapse Pruning}
+
+Using the selected $(E, H, M)$ configuration, Gate 4 runs step-up $\text{AIC}_c$ model selection (`select\_optimal\_k`, requiring $\Delta \text{AIC}_c > 2.0$ per added rate class) under the Constrained Null model ($\omega_K = 1.0$) before branch-length refinement. Because selecting $K$ under the Null model does not inspect the positive selection parameter $\omega_K > 1$, it preserves the asymptotic $\frac{1}{2}\chi^2_0 + \frac{1}{2}\chi^2_2$ distribution of the final Likelihood Ratio Test. Gate 4 retains $K=3$ if and only if $\text{AIC}_c(\text{Null}, K=3) < \text{AIC}_c(\text{Null}, K=2) - 2.0$, $|\hat{\omega}_2 - \hat{\omega}_1| \ge 0.025$, and $\min(\hat{p}_1, \hat{p}_2) \ge 0.015$; otherwise it selects $K=2$. Finally, \textsc{HyPhy}~3 performs full joint optimization of the Unconstrained Alternative and Constrained Null models for the single winning configuration $(E^*, H^*, M^*, K^*)$.
+
+\section{Verification and Empirical Benchmarks}
+
+Table~\ref{tab:validation} summarizes the behavior of Standard \texttt{BUSTED}, \texttt{BUSTED-E} (\texttt{--error-sink}), and \texttt{BUSTED --auto} across two validation benchmarks in \texttt{tests/test\_busted.cpp}:
+\begin{enumerate}[nosep]
+    \item \textbf{Clean empirical alignment (\textit{Drosophila Adh}, 23 taxa, 254 codons):} Gate 1 finds a maximum branch-site surprisal of $9.42$ bits ($< 10.0$ bits) and leaves the Error Sink \textbf{OFF}. Gate 2 finds zero likelihood improvement from double hits ($\Delta \ell_\delta = 0$) and keeps Multi-Hits set to \textbf{None}. Gate 3 detects strong synonymous rate overdispersion ($Z_{\text{SRV}} = 6.91$, $\Delta \ell_{\text{SRV}} = +36.01$) and enables \textbf{SRV ($M=3$)}. Gate 4 prunes the collapsed third background class and selects \textbf{$K=2$}, detecting episodic positive selection with $\text{LRT} = 25.70$ ($p = 1.31 \times 10^{-6}$).
+    \item \textbf{Purifying alignment with two 3-nt misalignment artifacts (6 taxa, 100 codons, 2 corrupted codons on branch \texttt{T1} of length $t_b = 0.002$):} Standard \texttt{BUSTED} suffers a severe false positive ($\hat{\omega}_3 = 2000$, $\text{LRT} = 16.65$, $p = 1.21 \times 10^{-4}$). Under \texttt{BUSTED --auto}, Gate 1 detects a $19.19$-bit surprisal spike ($\Delta \ell_{\text{sink}} = +5.55$) and turns the Error Sink \textbf{ON} ($\hat{\epsilon}_{\text{sink}} = 0.00226$ vs.\ true $2/900 = 0.00222$). Because Gate 2 weights the multi-hit score by $(1 - r_{b,s}^{\text{sink}})$, the two 3-nt errors are quarantined ($S_\delta = 0.058 < 1.5$), keeping Multi-Hits \textbf{None}. Both corrupted branch-sites (\texttt{T1} codon 10, $\text{BF} = 1.06 \times 10^6$; \texttt{T1} codon 50, $\text{BF} = 1.38 \times 10^5$) are flagged, and the false positive is eliminated ($\text{LRT} = 0.0$, $p = 0.50$).
+\end{enumerate}
+
+\begin{table}[htbp]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\caption{Validation of \texttt{BUSTED}, \texttt{BUSTED-E} (\texttt{--error-sink}), and \texttt{BUSTED --auto} across clean and error-contaminated alignments.}
+\label{tab:validation}
+\begin{tabularx}{\textwidth}{llcccccY}
+\toprule
+Dataset & Method & Sink ($E$) & MH ($H$) & SRV ($M$) & $K$ & LRT ($p$-value) & Diagnostic Outcome \\
+\midrule
+\textit{Drosophila Adh} & Standard \texttt{BUSTED} & Off & None & $1$ & $3$ & $33.75$ ($2.3 \times 10^{-8}$) & Baseline fit ($\ln L = -4703.29$). \\
+(23 taxa, 254 cod.) & \texttt{BUSTED-S} & Off & None & $3$ & $3$ & $16.69$ ($1.2 \times 10^{-4}$) & Manual SRV ($\ln L = -4687.58$). \\
+ & \textbf{\texttt{BUSTED --auto}} & \textbf{Off} & \textbf{None} & \textbf{3} & \textbf{2} & \textbf{25.70} ($1.3 \times 10^{-6}$) & Gate 3 enables SRV ($Z=6.91$, $\Delta\ell=+36.0$); Gate 4 prunes collapsed $K=3 \to 2$. \\
+\midrule
+Purifying + 2 Errors & Standard \texttt{BUSTED} & Off & None & $1$ & $3$ & $16.65$ ($1.2 \times 10^{-4}$) & \textbf{False positive} ($\hat{\omega}_3 = 2000$ forced by two 3-nt errors on $t_{\text{T1}} = 0.002$). \\
+(6 taxa, 100 cod.) & \texttt{BUSTED-E} & On & None & $1$ & $3$ & $0.10$ ($0.476$) & Quarantines codons 10 \& 50 on \texttt{T1} ($\hat{\epsilon}_{\text{sink}} = 0.00226$). \\
+ & \textbf{\texttt{BUSTED --auto}} & \textbf{On} & \textbf{None} & \textbf{1} & \textbf{2} & \textbf{0.00} ($0.500$) & Gate 1 activates Sink ($19.2$ bits, $\Delta\ell=+5.55$); Gate 2 quarantines MH ($S_\delta=0.058$). \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Command-Line and JSON Interface}
+
+Both \texttt{BUSTED --auto} and \texttt{--error-sink} are available in the \textsc{HyPhy}~3 command-line interface.
+\begin{itemize}[nosep]
+    \item \textbf{Full automatic 4-gate model selection (recommended default):} \texttt{hyphy3 busted --alignment gene.nex --auto --output gene.BUSTED.json}.
+    \item \textbf{Explicit saturation error sink with custom Bayes factor threshold:} \texttt{hyphy3 busted --alignment gene.nex --error-sink --error-sink-bf 20.0}.
+\end{itemize}
+The modern JSON output records the 4-gate diagnostic metrics under \texttt{"auto\_model\_selection"} and any flagged branch-site error events under \texttt{"error\_sink\_diagnostics"}.
+
+\end{document}

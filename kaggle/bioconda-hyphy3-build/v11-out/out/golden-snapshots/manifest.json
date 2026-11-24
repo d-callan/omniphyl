@@ -1,0 +1,78 @@
+{
+    "version": 1,
+    "description": "Golden-output regression cases for the hyphy3 CLI. Each case runs `hyphy3 <subcommand> <args>` with --output pointed at a temp file; the emitted modern (v3) JSON is canonicalized (keys sorted, floats rounded, volatile fields masked) and compared against the committed snapshot tests/golden/<name>.json. Paths in args are relative to the repository root. 'tier' controls which runs include the case: fast cases run in regular CI, slow cases run in the 'deep' tier (nightly / full-ci PRs). 'source' records the provenance of input data per project data-handling rules.",
+    "cases": [
+        {
+            "name": "fel_cd2",
+            "subcommand": "fel",
+            "args": ["--alignment", "benchmarks/data/cd2.fna", "--tree", "benchmarks/data/cd2.nwk", "--branches", "All", "--pvalue", "0.1", "--threads", "4"],
+            "schema": "fel.v3.schema.json",
+            "tier": "fast",
+            "source": "CD2 codon alignment + {Group1-4}-tagged tree, HyPhy benchmark data (benchmarks/data/cd2.fna, cd2.nwk)"
+        },
+        {
+            "name": "meme_cd2",
+            "subcommand": "meme",
+            "args": ["--alignment", "benchmarks/data/cd2.fna", "--tree", "benchmarks/data/cd2.nwk", "--branches", "All", "--pvalue", "0.1", "--threads", "4"],
+            "schema": "meme.v3.schema.json",
+            "tier": "fast",
+            "source": "CD2 codon alignment + tagged tree (benchmarks/data/cd2.fna, cd2.nwk)"
+        },
+        {
+            "name": "slac_cd2",
+            "subcommand": "slac",
+            "args": ["--alignment", "benchmarks/data/cd2.fna", "--tree", "benchmarks/data/cd2.nwk", "--branches", "All", "--samples", "0", "--pvalue", "0.1", "--threads", "4"],
+            "schema": "slac.v3.schema.json",
+            "tier": "fast",
+            "source": "CD2 codon alignment + tagged tree (benchmarks/data/cd2.fna, cd2.nwk); --samples 0 disables stochastic ancestral-state confidence-interval sampling for determinism"
+        },
+        {
+            "name": "busted_cd2",
+            "subcommand": "busted",
+            "args": ["--alignment", "benchmarks/data/cd2.fna", "--tree", "benchmarks/data/cd2.nwk", "--branches", "All", "--pvalue", "0.05", "--threads", "4"],
+            "schema": "busted.v3.schema.json",
+            "tier": "slow",
+            "source": "CD2 codon alignment + tagged tree (benchmarks/data/cd2.fna, cd2.nwk)"
+        },
+        {
+            "name": "absrel_cd2",
+            "subcommand": "absrel",
+            "args": ["--alignment", "benchmarks/data/cd2.fna", "--tree", "benchmarks/data/cd2.nwk", "--branches", "All", "--threads", "4"],
+            "schema": "absrel.v3.schema.json",
+            "tier": "slow",
+            "source": "CD2 codon alignment + tagged tree (benchmarks/data/cd2.fna, cd2.nwk)"
+        },
+        {
+            "name": "relax_cd2",
+            "subcommand": "relax",
+            "args": ["--alignment", "benchmarks/data/cd2.fna", "--tree", "benchmarks/data/cd2.nwk", "--test", "Group1", "--reference", "Group2", "--threads", "4"],
+            "schema": "relax.v3.schema.json",
+            "tier": "slow",
+            "source": "CD2 codon alignment + {Group1-4}-tagged tree (benchmarks/data/cd2.fna, cd2.nwk); --reference is required because the tree carries multiple tag groups"
+        },
+        {
+            "name": "contrast_fel_cd2",
+            "subcommand": "contrast-fel",
+            "args": ["--alignment", "benchmarks/data/cd2.fna", "--tree", "benchmarks/data/cd2.nwk", "--branches", "Group1,Group2", "--threads", "4"],
+            "schema": "contrast_fel.v3.schema.json",
+            "tier": "slow",
+            "source": "CD2 codon alignment + {Group1-4}-tagged tree (benchmarks/data/cd2.fna, cd2.nwk)"
+        },
+        {
+            "name": "joint_align_cd2",
+            "subcommand": "joint-align",
+            "args": ["--alignment", "benchmarks/data/cd2.fna", "--tree", "benchmarks/data/cd2.nwk", "--threads", "4"],
+            "schema": null,
+            "tier": "slow",
+            "source": "CD2 codon alignment + tagged tree (benchmarks/data/cd2.fna, cd2.nwk); covers joint_align.hpp which is a refactor target"
+        },
+        {
+            "name": "characterize_cd2",
+            "subcommand": "characterize",
+            "args": ["--alignment", "benchmarks/data/cd2.fna", "--threads", "4"],
+            "schema": "characterize.v3.schema.json",
+            "tier": "slow",
+            "source": "CD2 codon alignment (benchmarks/data/cd2.fna); covers characterize.hpp which is a refactor target"
+        }
+    ]
+}

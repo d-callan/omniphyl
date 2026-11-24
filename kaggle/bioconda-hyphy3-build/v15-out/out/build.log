@@ -1,0 +1,1089 @@
+PREFIX=/kaggle/working/miniforge
+Unpacking bootstrapper...
+Unpacking payload...
+Extracting ca-certificates-2026.10.23-hbd8a1cb_0.conda
+Extracting libgomp-16.2.0-he0feb66_7.conda
+Extracting libzlib-1.3.2-h25fd6f3_3.conda
+Extracting nlohmann_json-abi-3.12.0-h0f90c79_2.conda
+Extracting pybind11-abi-11-hc364b38_1.conda
+Extracting python_abi-3.14-9_cp314.conda
+Extracting tzdata-2026e-h5d301ff_0.conda
+Extracting _openmp_mutex-4.5-20_gnu.conda
+Extracting zstd-1.5.7-hb78ec9c_7.conda
+Extracting ld_impl_linux-64-2.46.1-default_hbd61a6d_103.conda
+Extracting libgcc-16.2.0-ha9f2e26_7.conda
+Extracting bzip2-1.0.8-hda65f42_10.conda
+Extracting c-ares-1.34.9-hebe6cf0_0.conda
+Extracting keyutils-1.6.3-h7cc23a3_1.conda
+Extracting libev-4.33-h280c20c_3.conda
+Extracting libexpat-2.9.0-hd2095e1_0.conda
+Extracting libffi-3.7.0-h81df57d_1.conda
+Extracting libiconv-1.18-h0cb94f2_3.conda
+Extracting liblzma-5.8.3-hb03c661_1.conda
+Extracting libmpdec-4.0.0-hb03c661_2.conda
+Extracting libpython-3.14.10-hd51c5da_100_cp314.conda
+Extracting libstdcxx-16.2.0-h934c35e_7.conda
+Extracting libuuid-2.42.4-hcfc3c73_1.conda
+Extracting lzo-2.10-hebe6cf0_1003.conda
+Extracting ncurses-6.6-hdb14827_1.conda
+Extracting openssl-3.6.5-h781a0a9_0.conda
+Extracting reproc-14.2.8.post0-hee9eb32_0.conda
+Extracting tk-8.6.13-noxft_h1df4ec4_4.conda
+Extracting cpp-expected-1.3.1-h171cf75_1.conda
+Extracting fmt-12.1.0-h76c4fd7_1.conda
+Extracting icu-78.3-py310h44b86e0_2.conda
+Extracting libedit-3.1.20260512-pl5321h373387f_0.conda
+Extracting libmsgpack-c-6.1.0-h54a6638_7.conda
+Extracting libnghttp2-1.71.0-hc5e5977_0.conda
+Extracting libsolv-0.7.41-h72ddc62_0.conda
+Extracting libssh2-1.11.1-h6154650_1.conda
+Extracting lz4-c-1.10.0-hee9eb32_2.conda
+Extracting readline-8.3-hd6e31c0_1.conda
+Extracting reproc-cpp-14.2.8.post0-h1c70be6_0.conda
+Extracting simdjson-5.0.6-h4dbf13b_0.conda
+Extracting yaml-cpp-0.8.0-h54a6638_1.conda
+Extracting krb5-1.22.2-hbc21106_2.conda
+Extracting libpsl-0.23.1-hd9e3e90_1.conda
+Extracting libsqlite-3.54.1-h13e7031_0.conda
+Extracting libxml2-16-2.15.4-hf3af7cc_1.conda
+Extracting spdlog-1.17.0-hb6aa676_2.conda
+Extracting libcurl-8.23.0-ha042cf0_0.conda
+Extracting libxml2-2.15.4-h7df9aa5_1.conda
+Extracting python-3.14.10-hcd007b5_100_cp314.conda
+Extracting libarchive-3.8.11-gpl_h3152399_100.conda
+Extracting tomli-2.5.0-pyh5ded981_0.conda
+Extracting tomli-w-1.2.0-pyhd8ed1ab_0.conda
+Extracting libmamba-2.9.0-py314h6ba947b_3.conda
+Extracting menuinst-2.5.2-pyhba3e0a1_4.conda
+Extracting archspec-0.2.6-pyhd8ed1ab_0.conda
+Extracting backports.zstd-1.8.0-py314h723298c_1.conda
+Extracting boltons-26.2.0-pyhd8ed1ab_0.conda
+Extracting brotli-python-1.2.1-py314hcd2bdb6_0.conda
+Extracting cached_property-2.0.1-pyhcf101f3_0.conda
+Extracting certifi-2026.10.23-pyhd8ed1ab_3.conda
+Extracting colorama-0.4.6-pyhd8ed1ab_1.conda
+Extracting cpython-3.14.10-py314hd8ed1ab_100.conda
+Extracting distro-1.9.0-pyhd8ed1ab_1.conda
+Extracting frozendict-2.5.0-pyhb5810a6_0.conda
+Extracting hpack-4.2.0-pyhd8ed1ab_0.conda
+Extracting hyperframe-6.1.0-pyhd8ed1ab_0.conda
+Extracting idna-3.20-pyh5ded981_0.conda
+Extracting libmamba-spdlog-2.9.0-h340cb06_3.conda
+Extracting mamba-2.9.0-h323ee07_3.conda
+Extracting markupsafe-3.0.4-py314h93e9acf_4.conda
+Extracting msgpack-python-1.2.4-py314h5383ef5_0.conda
+Extracting packaging-26.3-pyhc364b38_0.conda
+Extracting pip-26.2.2-pyh145f28c_2.conda
+Extracting platformdirs-4.14.5-pyh5ded981_0.conda
+Extracting pluggy-1.7.0-pyh5ded981_0.conda
+Extracting pycosat-0.6.6-py314h89acca1_6.conda
+Extracting pyproject_hooks-1.3.3-pyhd8ed1ab_0.conda
+Extracting pysocks-1.7.1-pyha55dd90_7.conda
+Extracting python-installer-1.1.0-pyhe730653_0.conda
+Extracting ruamel.yaml.clib-0.2.15-py314hfe1a184_5.conda
+Extracting setuptools-84.2.1-pyhe730653_0.conda
+Extracting tqdm-4.70.1-pyhfa0c392_0.conda
+Extracting truststore-0.10.5-pyh5ded981_0.conda
+Extracting typing_extensions-4.16.0-pyhcf101f3_0.conda
+Extracting zipp-4.1.2-pyh5ded981_0.conda
+Extracting anyio-4.16.0-pyh5ded981_1.conda
+Extracting cached-property-2.0.1-pyhcf101f3_0.conda
+Extracting conda-package-streaming-0.13.0-pyhd8ed1ab_0.conda
+Extracting h11-0.16.0-pyhcf101f3_1.conda
+Extracting h2-4.4.1-pyhcf101f3_0.conda
+Extracting importlib-metadata-10.0.0-pyh5ded981_0.conda
+Extracting jinja2-3.1.6-pyhcf101f3_1.conda
+Extracting libmambapy-2.9.0-py314h6226ee1_3.conda
+Extracting python-gil-3.14.10-h4df99d1_100.conda
+Extracting ruamel.yaml-0.19.1-pyhcf101f3_0.conda
+Extracting typing-extensions-4.16.0-h69aa097_0.conda
+Extracting typing-inspection-0.4.5-pyh5ded981_0.conda
+Extracting _python_abi3_support-1.0-hd8ed1ab_3.conda
+Extracting annotated-types-0.8.0-pyhd8ed1ab_0.conda
+Extracting conda-libmamba-solver-26.10.0-pyh5ded981_0.conda
+Extracting httpcore2-2.16.0-pyh5ded981_0.conda
+Extracting pydantic-core-2.50.4-py314h7e8cd81_0.conda
+Extracting python-build-1.6.1-pyhc364b38_0.conda
+Extracting urllib3-2.8.0-pyhd8ed1ab_0.conda
+Extracting charset-normalizer-3.5.2-h1114479_0.conda
+Extracting httpx2-2.16.0-pyh4fe4dc5_0.conda
+Extracting py-rattler-0.28.1-py311hc91d8b8_0.conda
+Extracting pydantic-2.14.3-pyh5ded981_0.conda
+Extracting requests-2.34.2-pyhcf101f3_0.conda
+Extracting conda-package-handling-2.6.0-pyh5ded981_0.conda
+Extracting unearth-0.19.0-pyhd8ed1ab_0.conda
+Extracting conda-index-0.13.0-pyh5ded981_0.conda
+Extracting conda-pypi-0.13.0-pyh5ded981_1.conda
+Extracting conda-lockfiles-0.2.2-pyhd8ed1ab_0.conda
+Extracting conda-rattler-solver-26.10.2-pyh5ded981_0.conda
+Extracting conda-26.9.4-py314h9e666f3_0.conda
+Extracting conda-self-0.3.0-pyhd8ed1ab_0.conda
+
+Installing base environment...
+
+Transaction
+
+  Prefix: /kaggle/working/miniforge
+
+  Updating specs:
+
+   - ca-certificates==2026.10.23=hbd8a1cb_0
+   - libgomp==16.2.0=he0feb66_7
+   - libzlib==1.3.2=h25fd6f3_3
+   - nlohmann_json-abi==3.12.0=h0f90c79_2
+   - pybind11-abi==11=hc364b38_1
+   - python_abi==3.14=9_cp314
+   - tzdata==2026e=h5d301ff_0
+   - _openmp_mutex==4.5=20_gnu
+   - zstd==1.5.7=hb78ec9c_7
+   - ld_impl_linux-64==2.46.1=default_hbd61a6d_103
+   - libgcc==16.2.0=ha9f2e26_7
+   - bzip2==1.0.8=hda65f42_10
+   - c-ares==1.34.9=hebe6cf0_0
+   - keyutils==1.6.3=h7cc23a3_1
+   - libev==4.33=h280c20c_3
+   - libexpat==2.9.0=hd2095e1_0
+   - libffi==3.7.0=h81df57d_1
+   - libiconv==1.18=h0cb94f2_3
+   - liblzma==5.8.3=hb03c661_1
+   - libmpdec==4.0.0=hb03c661_2
+   - libpython==3.14.10=hd51c5da_100_cp314
+   - libstdcxx==16.2.0=h934c35e_7
+   - libuuid==2.42.4=hcfc3c73_1
+   - lzo==2.10=hebe6cf0_1003
+   - ncurses==6.6=hdb14827_1
+   - openssl==3.6.5=h781a0a9_0
+   - reproc==14.2.8.post0=hee9eb32_0
+   - tk==8.6.13=noxft_h1df4ec4_4
+   - cpp-expected==1.3.1=h171cf75_1
+   - fmt==12.1.0=h76c4fd7_1
+   - icu==78.3=py310h44b86e0_2
+   - libedit==3.1.20260512=pl5321h373387f_0
+   - libmsgpack-c==6.1.0=h54a6638_7
+   - libnghttp2==1.71.0=hc5e5977_0
+   - libsolv==0.7.41=h72ddc62_0
+   - libssh2==1.11.1=h6154650_1
+   - lz4-c==1.10.0=hee9eb32_2
+   - readline==8.3=hd6e31c0_1
+   - reproc-cpp==14.2.8.post0=h1c70be6_0
+   - simdjson==5.0.6=h4dbf13b_0
+   - yaml-cpp==0.8.0=h54a6638_1
+   - krb5==1.22.2=hbc21106_2
+   - libpsl==0.23.1=hd9e3e90_1
+   - libsqlite==3.54.1=h13e7031_0
+   - libxml2-16==2.15.4=hf3af7cc_1
+   - spdlog==1.17.0=hb6aa676_2
+   - libcurl==8.23.0=ha042cf0_0
+   - libxml2==2.15.4=h7df9aa5_1
+   - python==3.14.10=hcd007b5_100_cp314
+   - libarchive==3.8.11=gpl_h3152399_100
+   - tomli==2.5.0=pyh5ded981_0
+   - tomli-w==1.2.0=pyhd8ed1ab_0
+   - libmamba==2.9.0=py314h6ba947b_3
+   - menuinst==2.5.2=pyhba3e0a1_4
+   - archspec==0.2.6=pyhd8ed1ab_0
+   - backports.zstd==1.8.0=py314h723298c_1
+   - boltons==26.2.0=pyhd8ed1ab_0
+   - brotli-python==1.2.1=py314hcd2bdb6_0
+   - cached_property==2.0.1=pyhcf101f3_0
+   - certifi==2026.10.23=pyhd8ed1ab_3
+   - colorama==0.4.6=pyhd8ed1ab_1
+   - cpython==3.14.10=py314hd8ed1ab_100
+   - distro==1.9.0=pyhd8ed1ab_1
+   - frozendict==2.5.0=pyhb5810a6_0
+   - hpack==4.2.0=pyhd8ed1ab_0
+   - hyperframe==6.1.0=pyhd8ed1ab_0
+   - idna==3.20=pyh5ded981_0
+   - libmamba-spdlog==2.9.0=h340cb06_3
+   - mamba==2.9.0=h323ee07_3
+   - markupsafe==3.0.4=py314h93e9acf_4
+   - msgpack-python==1.2.4=py314h5383ef5_0
+   - packaging==26.3=pyhc364b38_0
+   - pip==26.2.2=pyh145f28c_2
+   - platformdirs==4.14.5=pyh5ded981_0
+   - pluggy==1.7.0=pyh5ded981_0
+   - pycosat==0.6.6=py314h89acca1_6
+   - pyproject_hooks==1.3.3=pyhd8ed1ab_0
+   - pysocks==1.7.1=pyha55dd90_7
+   - python-installer==1.1.0=pyhe730653_0
+   - ruamel.yaml.clib==0.2.15=py314hfe1a184_5
+   - setuptools==84.2.1=pyhe730653_0
+   - tqdm==4.70.1=pyhfa0c392_0
+   - truststore==0.10.5=pyh5ded981_0
+   - typing_extensions==4.16.0=pyhcf101f3_0
+   - zipp==4.1.2=pyh5ded981_0
+   - anyio==4.16.0=pyh5ded981_1
+   - cached-property==2.0.1=pyhcf101f3_0
+   - conda-package-streaming==0.13.0=pyhd8ed1ab_0
+   - h11==0.16.0=pyhcf101f3_1
+   - h2==4.4.1=pyhcf101f3_0
+   - importlib-metadata==10.0.0=pyh5ded981_0
+   - jinja2==3.1.6=pyhcf101f3_1
+   - libmambapy==2.9.0=py314h6226ee1_3
+   - python-gil==3.14.10=h4df99d1_100
+   - ruamel.yaml==0.19.1=pyhcf101f3_0
+   - typing-extensions==4.16.0=h69aa097_0
+   - typing-inspection==0.4.5=pyh5ded981_0
+   - _python_abi3_support==1.0=hd8ed1ab_3
+   - annotated-types==0.8.0=pyhd8ed1ab_0
+   - conda-libmamba-solver==26.10.0=pyh5ded981_0
+   - httpcore2==2.16.0=pyh5ded981_0
+   - pydantic-core==2.50.4=py314h7e8cd81_0
+   - python-build==1.6.1=pyhc364b38_0
+   - urllib3==2.8.0=pyhd8ed1ab_0
+   - charset-normalizer==3.5.2=h1114479_0
+   - httpx2==2.16.0=pyh4fe4dc5_0
+   - py-rattler==0.28.1=py311hc91d8b8_0
+   - pydantic==2.14.3=pyh5ded981_0
+   - requests==2.34.2=pyhcf101f3_0
+   - conda-package-handling==2.6.0=pyh5ded981_0
+   - unearth==0.19.0=pyhd8ed1ab_0
+   - conda-index==0.13.0=pyh5ded981_0
+   - conda-pypi==0.13.0=pyh5ded981_1
+   - conda-lockfiles==0.2.2=pyhd8ed1ab_0
+   - conda-rattler-solver==26.10.2=pyh5ded981_0
+   - conda==26.9.4=py314h9e666f3_0
+   - conda-self==0.3.0=pyhd8ed1ab_0
+
+
+  Package                         Version  Build                 Channel         Size
+───────────────────────────────────────────────────────────────────────────────────────
+  Install:
+───────────────────────────────────────────────────────────────────────────────────────
+
+  + _openmp_mutex                     4.5  20_gnu                conda-forge         
+  + _python_abi3_support              1.0  hd8ed1ab_3            conda-forge         
+  + annotated-types                 0.8.0  pyhd8ed1ab_0          conda-forge         
+  + anyio                          4.16.0  pyh5ded981_1          conda-forge         
+  + archspec                        0.2.6  pyhd8ed1ab_0          conda-forge         
+  + backports.zstd                  1.8.0  py314h723298c_1       conda-forge         
+  + boltons                        26.2.0  pyhd8ed1ab_0          conda-forge         
+  + brotli-python                   1.2.1  py314hcd2bdb6_0       conda-forge         
+  + bzip2                           1.0.8  hda65f42_10           conda-forge         
+  + c-ares                         1.34.9  hebe6cf0_0            conda-forge         
+  + ca-certificates            2026.10.23  hbd8a1cb_0            conda-forge         
+  + cached-property                 2.0.1  pyhcf101f3_0          conda-forge         
+  + cached_property                 2.0.1  pyhcf101f3_0          conda-forge         
+  + certifi                    2026.10.23  pyhd8ed1ab_3          conda-forge         
+  + charset-normalizer              3.5.2  h1114479_0            conda-forge         
+  + colorama                        0.4.6  pyhd8ed1ab_1          conda-forge         
+  + conda                          26.9.4  py314h9e666f3_0       conda-forge         
+  + conda-index                    0.13.0  pyh5ded981_0          conda-forge         
+  + conda-libmamba-solver         26.10.0  pyh5ded981_0          conda-forge         
+  + conda-lockfiles                 0.2.2  pyhd8ed1ab_0          conda-forge         
+  + conda-package-handling          2.6.0  pyh5ded981_0          conda-forge         
+  + conda-package-streaming        0.13.0  pyhd8ed1ab_0          conda-forge         
+  + conda-pypi                     0.13.0  pyh5ded981_1          conda-forge         
+  + conda-rattler-solver          26.10.2  pyh5ded981_0          conda-forge         
+  + conda-self                      0.3.0  pyhd8ed1ab_0          conda-forge         
+  + cpp-expected                    1.3.1  h171cf75_1            conda-forge         
+  + cpython                       3.14.10  py314hd8ed1ab_100     conda-forge         
+  + distro                          1.9.0  pyhd8ed1ab_1          conda-forge         
+  + fmt                            12.1.0  h76c4fd7_1            conda-forge         
+  + frozendict                      2.5.0  pyhb5810a6_0          conda-forge         
+  + h11                            0.16.0  pyhcf101f3_1          conda-forge         
+  + h2                              4.4.1  pyhcf101f3_0          conda-forge         
+  + hpack                           4.2.0  pyhd8ed1ab_0          conda-forge         
+  + httpcore2                      2.16.0  pyh5ded981_0          conda-forge         
+  + httpx2                         2.16.0  pyh4fe4dc5_0          conda-forge         
+  + hyperframe                      6.1.0  pyhd8ed1ab_0          conda-forge         
+  + icu                              78.3  py310h44b86e0_2       conda-forge         
+  + idna                             3.20  pyh5ded981_0          conda-forge         
+  + importlib-metadata             10.0.0  pyh5ded981_0          conda-forge         
+  + jinja2                          3.1.6  pyhcf101f3_1          conda-forge         
+  + keyutils                        1.6.3  h7cc23a3_1            conda-forge         
+  + krb5                           1.22.2  hbc21106_2            conda-forge         
+  + ld_impl_linux-64               2.46.1  default_hbd61a6d_103  conda-forge         
+  + libarchive                     3.8.11  gpl_h3152399_100      conda-forge         
+  + libcurl                        8.23.0  ha042cf0_0            conda-forge         
+  + libedit                  3.1.20260512  pl5321h373387f_0      conda-forge         
+  + libev                            4.33  h280c20c_3            conda-forge         
+  + libexpat                        2.9.0  hd2095e1_0            conda-forge         
+  + libffi                          3.7.0  h81df57d_1            conda-forge         
+  + libgcc                         16.2.0  ha9f2e26_7            conda-forge         
+  + libgomp                        16.2.0  he0feb66_7            conda-forge         
+  + libiconv                         1.18  h0cb94f2_3            conda-forge         
+  + liblzma                         5.8.3  hb03c661_1            conda-forge         
+  + libmamba                        2.9.0  py314h6ba947b_3       conda-forge         
+  + libmamba-spdlog                 2.9.0  h340cb06_3            conda-forge         
+  + libmambapy                      2.9.0  py314h6226ee1_3       conda-forge         
+  + libmpdec                        4.0.0  hb03c661_2            conda-forge         
+  + libmsgpack-c                    6.1.0  h54a6638_7            conda-forge         
+  + libnghttp2                     1.71.0  hc5e5977_0            conda-forge         
+  + libpsl                         0.23.1  hd9e3e90_1            conda-forge         
+  + libpython                     3.14.10  hd51c5da_100_cp314    conda-forge         
+  + libsolv                        0.7.41  h72ddc62_0            conda-forge         
+  + libsqlite                      3.54.1  h13e7031_0            conda-forge         
+  + libssh2                        1.11.1  h6154650_1            conda-forge         
+  + libstdcxx                      16.2.0  h934c35e_7            conda-forge         
+  + libuuid                        2.42.4  hcfc3c73_1            conda-forge         
+  + libxml2                        2.15.4  h7df9aa5_1            conda-forge         
+  + libxml2-16                     2.15.4  hf3af7cc_1            conda-forge         
+  + libzlib                         1.3.2  h25fd6f3_3            conda-forge         
+  + lz4-c                          1.10.0  hee9eb32_2            conda-forge         
+  + lzo                              2.10  hebe6cf0_1003         conda-forge         
+  + mamba                           2.9.0  h323ee07_3            conda-forge         
+  + markupsafe                      3.0.4  py314h93e9acf_4       conda-forge         
+  + menuinst                        2.5.2  pyhba3e0a1_4          conda-forge         
+  + msgpack-python                  1.2.4  py314h5383ef5_0       conda-forge         
+  + ncurses                           6.6  hdb14827_1            conda-forge         
+  + nlohmann_json-abi              3.12.0  h0f90c79_2            conda-forge         
+  + openssl                         3.6.5  h781a0a9_0            conda-forge         
+  + packaging                        26.3  pyhc364b38_0          conda-forge         
+  + pip                            26.2.2  pyh145f28c_2          conda-forge         
+  + platformdirs                   4.14.5  pyh5ded981_0          conda-forge         
+  + pluggy                          1.7.0  pyh5ded981_0          conda-forge         
+  + py-rattler                     0.28.1  py311hc91d8b8_0       conda-forge         
+  + pybind11-abi                       11  hc364b38_1            conda-forge         
+  + pycosat                         0.6.6  py314h89acca1_6       conda-forge         
+  + pydantic                       2.14.3  pyh5ded981_0          conda-forge         
+  + pydantic-core                  2.50.4  py314h7e8cd81_0       conda-forge         
+  + pyproject_hooks                 1.3.3  pyhd8ed1ab_0          conda-forge         
+  + pysocks                         1.7.1  pyha55dd90_7          conda-forge         
+  + python                        3.14.10  hcd007b5_100_cp314    conda-forge         
+  + python-build                    1.6.1  pyhc364b38_0          conda-forge         
+  + python-gil                    3.14.10  h4df99d1_100          conda-forge         
+  + python-installer                1.1.0  pyhe730653_0          conda-forge         
+  + python_abi                       3.14  9_cp314               conda-forge         
+  + readline                          8.3  hd6e31c0_1            conda-forge         
+  + reproc                   14.2.8.post0  hee9eb32_0            conda-forge         
+  + reproc-cpp               14.2.8.post0  h1c70be6_0            conda-forge         
+  + requests                       2.34.2  pyhcf101f3_0          conda-forge         
+  + ruamel.yaml                    0.19.1  pyhcf101f3_0          conda-forge         
+  + ruamel.yaml.clib               0.2.15  py314hfe1a184_5       conda-forge         
+  + setuptools                     84.2.1  pyhe730653_0          conda-forge         
+  + simdjson                        5.0.6  h4dbf13b_0            conda-forge         
+  + spdlog                         1.17.0  hb6aa676_2            conda-forge         
+  + tk                             8.6.13  noxft_h1df4ec4_4      conda-forge         
+  + tomli                           2.5.0  pyh5ded981_0          conda-forge         
+  + tomli-w                         1.2.0  pyhd8ed1ab_0          conda-forge         
+  + tqdm                           4.70.1  pyhfa0c392_0          conda-forge         
+  + truststore                     0.10.5  pyh5ded981_0          conda-forge         
+  + typing-extensions              4.16.0  h69aa097_0            conda-forge         
+  + typing-inspection               0.4.5  pyh5ded981_0          conda-forge         
+  + typing_extensions              4.16.0  pyhcf101f3_0          conda-forge         
+  + tzdata                          2026e  h5d301ff_0            conda-forge         
+  + unearth                        0.19.0  pyhd8ed1ab_0          conda-forge         
+  + urllib3                         2.8.0  pyhd8ed1ab_0          conda-forge         
+  + yaml-cpp                        0.8.0  h54a6638_1            conda-forge         
+  + zipp                            4.1.2  pyh5ded981_0          conda-forge         
+  + zstd                            1.5.7  hb78ec9c_7            conda-forge         
+
+  Summary:
+
+  Install: 117 packages
+
+  Total download: 0 B
+
+───────────────────────────────────────────────────────────────────────────────────────
+
+
+warning  libmamba Security Warning: This transaction includes executing package scripts (pre/post-link/unlink) if present. These scripts can contain arbitrary code. Please ensure you trust the package sources.
+
+Transaction starting
+Linking ca-certificates-2026.10.23-hbd8a1cb_0
+Linking libgomp-16.2.0-he0feb66_7
+Linking libzlib-1.3.2-h25fd6f3_3
+Linking nlohmann_json-abi-3.12.0-h0f90c79_2
+Linking pybind11-abi-11-hc364b38_1
+Linking python_abi-3.14-9_cp314
+Linking tzdata-2026e-h5d301ff_0
+Linking _openmp_mutex-4.5-20_gnu
+Linking zstd-1.5.7-hb78ec9c_7
+Linking ld_impl_linux-64-2.46.1-default_hbd61a6d_103
+Linking libgcc-16.2.0-ha9f2e26_7
+Linking bzip2-1.0.8-hda65f42_10
+Linking c-ares-1.34.9-hebe6cf0_0
+Linking keyutils-1.6.3-h7cc23a3_1
+Linking libev-4.33-h280c20c_3
+Linking libexpat-2.9.0-hd2095e1_0
+Linking libffi-3.7.0-h81df57d_1
+Linking libiconv-1.18-h0cb94f2_3
+Linking liblzma-5.8.3-hb03c661_1
+Linking libmpdec-4.0.0-hb03c661_2
+Linking libpython-3.14.10-hd51c5da_100_cp314
+Linking libstdcxx-16.2.0-h934c35e_7
+Linking libuuid-2.42.4-hcfc3c73_1
+Linking lzo-2.10-hebe6cf0_1003
+Linking ncurses-6.6-hdb14827_1
+Linking openssl-3.6.5-h781a0a9_0
+Linking reproc-14.2.8.post0-hee9eb32_0
+Linking tk-8.6.13-noxft_h1df4ec4_4
+Linking cpp-expected-1.3.1-h171cf75_1
+Linking fmt-12.1.0-h76c4fd7_1
+Linking icu-78.3-py310h44b86e0_2
+Linking libedit-3.1.20260512-pl5321h373387f_0
+Linking libmsgpack-c-6.1.0-h54a6638_7
+Linking libnghttp2-1.71.0-hc5e5977_0
+Linking libsolv-0.7.41-h72ddc62_0
+Linking libssh2-1.11.1-h6154650_1
+Linking lz4-c-1.10.0-hee9eb32_2
+Linking readline-8.3-hd6e31c0_1
+Linking reproc-cpp-14.2.8.post0-h1c70be6_0
+Linking simdjson-5.0.6-h4dbf13b_0
+Linking yaml-cpp-0.8.0-h54a6638_1
+Linking krb5-1.22.2-hbc21106_2
+Linking libpsl-0.23.1-hd9e3e90_1
+Linking libsqlite-3.54.1-h13e7031_0
+Linking libxml2-16-2.15.4-hf3af7cc_1
+Linking spdlog-1.17.0-hb6aa676_2
+Linking libcurl-8.23.0-ha042cf0_0
+Linking libxml2-2.15.4-h7df9aa5_1
+Linking python-3.14.10-hcd007b5_100_cp314
+Linking libarchive-3.8.11-gpl_h3152399_100
+Linking tomli-2.5.0-pyh5ded981_0
+Linking tomli-w-1.2.0-pyhd8ed1ab_0
+Linking libmamba-2.9.0-py314h6ba947b_3
+Linking menuinst-2.5.2-pyhba3e0a1_4
+Linking archspec-0.2.6-pyhd8ed1ab_0
+Linking backports.zstd-1.8.0-py314h723298c_1
+Linking boltons-26.2.0-pyhd8ed1ab_0
+Linking brotli-python-1.2.1-py314hcd2bdb6_0
+Linking cached_property-2.0.1-pyhcf101f3_0
+Linking certifi-2026.10.23-pyhd8ed1ab_3
+Linking colorama-0.4.6-pyhd8ed1ab_1
+Linking cpython-3.14.10-py314hd8ed1ab_100
+Linking distro-1.9.0-pyhd8ed1ab_1
+Linking frozendict-2.5.0-pyhb5810a6_0
+Linking hpack-4.2.0-pyhd8ed1ab_0
+Linking hyperframe-6.1.0-pyhd8ed1ab_0
+Linking idna-3.20-pyh5ded981_0
+Linking libmamba-spdlog-2.9.0-h340cb06_3
+Linking mamba-2.9.0-h323ee07_3
+Linking markupsafe-3.0.4-py314h93e9acf_4
+Linking msgpack-python-1.2.4-py314h5383ef5_0
+Linking packaging-26.3-pyhc364b38_0
+Linking pip-26.2.2-pyh145f28c_2
+Linking platformdirs-4.14.5-pyh5ded981_0
+Linking pluggy-1.7.0-pyh5ded981_0
+Linking pycosat-0.6.6-py314h89acca1_6
+Linking pyproject_hooks-1.3.3-pyhd8ed1ab_0
+Linking pysocks-1.7.1-pyha55dd90_7
+Linking python-installer-1.1.0-pyhe730653_0
+Linking ruamel.yaml.clib-0.2.15-py314hfe1a184_5
+Linking setuptools-84.2.1-pyhe730653_0
+Linking tqdm-4.70.1-pyhfa0c392_0
+Linking truststore-0.10.5-pyh5ded981_0
+Linking typing_extensions-4.16.0-pyhcf101f3_0
+Linking zipp-4.1.2-pyh5ded981_0
+Linking anyio-4.16.0-pyh5ded981_1
+Linking cached-property-2.0.1-pyhcf101f3_0
+Linking conda-package-streaming-0.13.0-pyhd8ed1ab_0
+Linking h11-0.16.0-pyhcf101f3_1
+Linking h2-4.4.1-pyhcf101f3_0
+Linking importlib-metadata-10.0.0-pyh5ded981_0
+Linking jinja2-3.1.6-pyhcf101f3_1
+Linking libmambapy-2.9.0-py314h6226ee1_3
+Linking python-gil-3.14.10-h4df99d1_100
+Linking ruamel.yaml-0.19.1-pyhcf101f3_0
+Linking typing-extensions-4.16.0-h69aa097_0
+Linking typing-inspection-0.4.5-pyh5ded981_0
+Linking _python_abi3_support-1.0-hd8ed1ab_3
+Linking annotated-types-0.8.0-pyhd8ed1ab_0
+Linking conda-libmamba-solver-26.10.0-pyh5ded981_0
+Linking httpcore2-2.16.0-pyh5ded981_0
+Linking pydantic-core-2.50.4-py314h7e8cd81_0
+Linking python-build-1.6.1-pyhc364b38_0
+Linking urllib3-2.8.0-pyhd8ed1ab_0
+Linking charset-normalizer-3.5.2-h1114479_0
+Linking httpx2-2.16.0-pyh4fe4dc5_0
+Linking py-rattler-0.28.1-py311hc91d8b8_0
+Linking pydantic-2.14.3-pyh5ded981_0
+Linking requests-2.34.2-pyhcf101f3_0
+Linking conda-package-handling-2.6.0-pyh5ded981_0
+Linking unearth-0.19.0-pyhd8ed1ab_0
+Linking conda-index-0.13.0-pyh5ded981_0
+Linking conda-pypi-0.13.0-pyh5ded981_1
+Linking conda-lockfiles-0.2.2-pyhd8ed1ab_0
+Linking conda-rattler-solver-26.10.2-pyh5ded981_0
+Linking conda-26.9.4-py314h9e666f3_0
+Linking conda-self-0.3.0-pyhd8ed1ab_0
+
+Transaction finished
+
+installation finished.
+WARNING:
+    You currently have a PYTHONPATH environment variable set. This may cause
+    unexpected behavior when running the Python interpreter in Miniforge3.
+    For best results, please verify that your PYTHONPATH only points to
+    directories of packages that are compatible with the Python interpreter
+    in Miniforge3: /kaggle/working/miniforge
+Retrieving notices: ...working... done
+Channels:
+ - conda-forge
+Platform: linux-64
+Collecting package metadata (repodata.json): ...working... done
+Solving environment: ...working... done
+
+## Package Plan ##
+
+  environment location: /kaggle/working/miniforge/envs/h3
+
+  added / updated specs:
+    - cmake
+    - cxx-compiler
+    - jsonschema
+    - nanobind
+    - ninja
+    - python=3.12
+
+
+The following packages will be downloaded:
+
+    package                    |            build
+    ---------------------------|-----------------
+    attrs-26.1.0               |     pyhcf101f3_0          63 KB  conda-forge
+    binutils_impl_linux-64-2.46.1|default_hfdba357_103         3.5 MB  conda-forge
+    cmake-4.5.0                |       hff7ac6b_0        26.1 MB  conda-forge
+    conda-gcc-specs-15.3.0     |       h8846f6e_7          32 KB  conda-forge
+    cxx-compiler-2.0.0         |       hdab9b82_1           7 KB  conda-forge
+    gcc-15.3.0                 |       hc6a0c74_7          29 KB  conda-forge
+    gcc_impl_linux-64-15.3.0   |       h6ad849d_7        80.0 MB  conda-forge
+    gxx-15.3.0                 |       hc6a0c74_7          28 KB  conda-forge
+    gxx_impl_linux-64-15.3.0   |       h90d9265_7        16.2 MB  conda-forge
+    icu-79.1                   |  py314hb486520_0        13.9 MB  conda-forge
+    jsonschema-4.26.0          |     pyhcf101f3_1          80 KB  conda-forge
+    jsonschema-specifications-2025.9.1|     pyhcf101f3_0          19 KB  conda-forge
+    kernel-headers_linux-64-6.12.0|       he073ed8_6         1.5 MB  conda-forge
+    libgcc-devel_linux-64-15.3.0|     h2b852eb_107         2.9 MB  conda-forge
+    libnsl-2.0.1               |       hb9d3cd8_1          33 KB  conda-forge
+    libpsl-0.23.1              |       h7fe8442_2          71 KB  conda-forge
+    libpython-3.12.16          |ha57cdbe_0_cpython         8.4 MB  conda-forge
+    libsanitizer-15.3.0        |       h54950a5_7         7.7 MB  conda-forge
+    libsqlite-3.54.1           |       hf739112_1         962 KB  conda-forge
+    libstdcxx-devel_linux-64-15.3.0|     hb2c5482_107        19.7 MB  conda-forge
+    libuv-1.52.1               |       h280c20c_1         410 KB  conda-forge
+    libxcrypt-4.4.38           |       h280c20c_0         100 KB  conda-forge
+    nanobind-3.1.0             |     pyh5ded981_0         242 KB  conda-forge
+    ninja-1.13.2               |       h171cf75_1         182 KB  conda-forge
+    pip-26.2.2                 |     pyh8b19718_2         1.0 MB  conda-forge
+    python-3.12.16             |h5f976f7_0_cpython        21.9 MB  conda-forge
+    python_abi-3.12            |          9_cp312           7 KB  conda-forge
+    referencing-0.37.0         |     pyhcf101f3_0          51 KB  conda-forge
+    rhash-1.4.6                |       hb03c661_2         190 KB  conda-forge
+    rpds-py-2026.9.1           |  py312hc767a74_0         296 KB  conda-forge
+    sysroot_linux-64-2.39      |       hc4b9eeb_6        40.1 MB  conda-forge
+    wheel-0.48.0               |     pyhd8ed1ab_0          34 KB  conda-forge
+    ------------------------------------------------------------
+                                           Total:       245.7 MB
+
+The following NEW packages will be INSTALLED:
+
+  _openmp_mutex      conda-forge/linux-64::_openmp_mutex-4.5-20_gnu 
+  attrs              conda-forge/noarch::attrs-26.1.0-pyhcf101f3_0 
+  binutils_impl_lin~ conda-forge/linux-64::binutils_impl_linux-64-2.46.1-default_hfdba357_103 
+  bzip2              conda-forge/linux-64::bzip2-1.0.8-hda65f42_10 
+  c-ares             conda-forge/linux-64::c-ares-1.34.9-hebe6cf0_0 
+  ca-certificates    conda-forge/noarch::ca-certificates-2026.10.23-hbd8a1cb_0 
+  cmake              conda-forge/linux-64::cmake-4.5.0-hff7ac6b_0 
+  conda-gcc-specs    conda-forge/linux-64::conda-gcc-specs-15.3.0-h8846f6e_7 
+  cxx-compiler       conda-forge/linux-64::cxx-compiler-2.0.0-hdab9b82_1 
+  gcc                conda-forge/linux-64::gcc-15.3.0-hc6a0c74_7 
+  gcc_impl_linux-64  conda-forge/linux-64::gcc_impl_linux-64-15.3.0-h6ad849d_7 
+  gxx                conda-forge/linux-64::gxx-15.3.0-hc6a0c74_7 
+  gxx_impl_linux-64  conda-forge/linux-64::gxx_impl_linux-64-15.3.0-h90d9265_7 
+  icu                conda-forge/linux-64::icu-79.1-py314hb486520_0 
+  jsonschema         conda-forge/noarch::jsonschema-4.26.0-pyhcf101f3_1 
+  jsonschema-specif~ conda-forge/noarch::jsonschema-specifications-2025.9.1-pyhcf101f3_0 
+  kernel-headers_li~ conda-forge/noarch::kernel-headers_linux-64-6.12.0-he073ed8_6 
+  keyutils           conda-forge/linux-64::keyutils-1.6.3-h7cc23a3_1 
+  krb5               conda-forge/linux-64::krb5-1.22.2-hbc21106_2 
+  ld_impl_linux-64   conda-forge/linux-64::ld_impl_linux-64-2.46.1-default_hbd61a6d_103 
+  libcurl            conda-forge/linux-64::libcurl-8.23.0-ha042cf0_0 
+  libedit            conda-forge/linux-64::libedit-3.1.20260512-pl5321h373387f_0 
+  libev              conda-forge/linux-64::libev-4.33-h280c20c_3 
+  libexpat           conda-forge/linux-64::libexpat-2.9.0-hd2095e1_0 
+  libffi             conda-forge/linux-64::libffi-3.7.0-h81df57d_1 
+  libgcc             conda-forge/linux-64::libgcc-16.2.0-ha9f2e26_7 
+  libgcc-devel_linu~ conda-forge/noarch::libgcc-devel_linux-64-15.3.0-h2b852eb_107 
+  libgomp            conda-forge/linux-64::libgomp-16.2.0-he0feb66_7 
+  liblzma            conda-forge/linux-64::liblzma-5.8.3-hb03c661_1 
+  libnghttp2         conda-forge/linux-64::libnghttp2-1.71.0-hc5e5977_0 
+  libnsl             conda-forge/linux-64::libnsl-2.0.1-hb9d3cd8_1 
+  libpsl             conda-forge/linux-64::libpsl-0.23.1-h7fe8442_2 
+  libpython          conda-forge/linux-64::libpython-3.12.16-ha57cdbe_0_cpython 
+  libsanitizer       conda-forge/linux-64::libsanitizer-15.3.0-h54950a5_7 
+  libsqlite          conda-forge/linux-64::libsqlite-3.54.1-hf739112_1 
+  libssh2            conda-forge/linux-64::libssh2-1.11.1-h6154650_1 
+  libstdcxx          conda-forge/linux-64::libstdcxx-16.2.0-h934c35e_7 
+  libstdcxx-devel_l~ conda-forge/noarch::libstdcxx-devel_linux-64-15.3.0-hb2c5482_107 
+  libuuid            conda-forge/linux-64::libuuid-2.42.4-hcfc3c73_1 
+  libuv              conda-forge/linux-64::libuv-1.52.1-h280c20c_1 
+  libxcrypt          conda-forge/linux-64::libxcrypt-4.4.38-h280c20c_0 
+  libzlib            conda-forge/linux-64::libzlib-1.3.2-h25fd6f3_3 
+  nanobind           conda-forge/noarch::nanobind-3.1.0-pyh5ded981_0 
+  ncurses            conda-forge/linux-64::ncurses-6.6-hdb14827_1 
+  ninja              conda-forge/linux-64::ninja-1.13.2-h171cf75_1 
+  openssl            conda-forge/linux-64::openssl-3.6.5-h781a0a9_0 
+  packaging          conda-forge/noarch::packaging-26.3-pyhc364b38_0 
+  pip                conda-forge/noarch::pip-26.2.2-pyh8b19718_2 
+  python             conda-forge/linux-64::python-3.12.16-h5f976f7_0_cpython 
+  python_abi         conda-forge/noarch::python_abi-3.12-9_cp312 
+  readline           conda-forge/linux-64::readline-8.3-hd6e31c0_1 
+  referencing        conda-forge/noarch::referencing-0.37.0-pyhcf101f3_0 
+  rhash              conda-forge/linux-64::rhash-1.4.6-hb03c661_2 
+  rpds-py            conda-forge/linux-64::rpds-py-2026.9.1-py312hc767a74_0 
+  setuptools         conda-forge/noarch::setuptools-84.2.1-pyhe730653_0 
+  sysroot_linux-64   conda-forge/noarch::sysroot_linux-64-2.39-hc4b9eeb_6 
+  tk                 conda-forge/linux-64::tk-8.6.13-noxft_h1df4ec4_4 
+  typing_extensions  conda-forge/noarch::typing_extensions-4.16.0-pyhcf101f3_0 
+  tzdata             conda-forge/noarch::tzdata-2026e-h5d301ff_0 
+  wheel              conda-forge/noarch::wheel-0.48.0-pyhd8ed1ab_0 
+  zstd               conda-forge/linux-64::zstd-1.5.7-hb78ec9c_7 
+
+
+
+Downloading and Extracting Packages: ...working... done
+Preparing transaction: ...working... done
+Verifying transaction: ...working... done
+Executing transaction: ...working... WARNING conda.conda_pypi.main:notify_conda_pypi_tip(158): 
+  Did you know? You can install many PyPI packages with conda
+  using conda-pypi. Get started:
+    https://bit.ly/4xXYt0B
+
+done
+#
+# To activate this environment, use
+#
+#     $ conda activate h3
+#
+# To deactivate an active environment, use
+#
+#     $ conda deactivate
+
+Cloning into '/kaggle/working/hyphy-3'...
+Cloning into '/kaggle/working/eigen-src'...
+Note: switching to '3147391d946bb4b6c68edd901f2add6ac1f31f8c'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+0a81f4e551cbf0bfd0e7e46abc6cd36941d3cb56
+-- The CXX compiler identification is GNU 15.3.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /kaggle/working/miniforge/envs/h3/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found OpenMP_CXX: -fopenmp (found version "4.5")
+-- Found OpenMP: TRUE (found version "4.5")
+-- OpenMP CXX found: 4.5
+-- Found Python: /kaggle/working/miniforge/envs/h3/bin/python3.12 (found suitable version "3.12.16", minimum required is "3.8") found components: Interpreter Development.Module
+-- Performing Test NB_HAS_MTLS_GNU2
+-- Performing Test NB_HAS_MTLS_GNU2 - Success
+-- Building Python bindings with nanobind
+-- Configuring done (1.4s)
+-- Generating done (0.1s)
+CMake Warning (unused-cli):
+  Manually-specified variables were not used by the project:
+
+    Python3_EXECUTABLE
+
+
+-- Build files have been written to: /kaggle/working/hyphy-3/build
+ninja: Entering directory `build'
+[0/2] Re-checking globbed directories...
+[1/111] Embedding HTML results viewer
+-- Embedded 39 results viewer modules and 8 Ohmic viewer modules into /kaggle/working/hyphy-3/build/generated/hyphy/report/viewer_assets.hpp
+[2/111] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/nb_internals.cpp.o
+[3/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/cmake_pch.hxx.gch
+[4/111] Building CXX object CMakeFiles/hyphy3_pch.dir/cmake_pch.hxx.gch
+[5/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/absrel.cpp.o
+[6/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/busted.cpp.o
+[7/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/busted_impl.cpp.o
+[8/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/characterize_impl.cpp.o
+[9/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/contrast_fel.cpp.o
+[10/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/directional_fel.cpp.o
+[11/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/fel.cpp.o
+[12/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/fubar.cpp.o
+[13/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/gard.cpp.o
+[14/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/meme.cpp.o
+[15/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/mss.cpp.o
+[16/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/joint_align_impl.cpp.o
+[17/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/ohmic.cpp.o
+[18/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/prime.cpp.o
+[19/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/relax.cpp.o
+[20/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/slac.cpp.o
+[21/111] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/nb_func.cpp.o
+[22/111] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/nb_type.cpp.o
+[23/111] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/nb_enum.cpp.o
+[24/111] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/nb_ndarray.cpp.o
+[25/111] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/nb_static_property.cpp.o
+[26/111] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/nb_datetime.cpp.o
+[27/111] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/common.cpp.o
+[28/111] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/error.cpp.o
+[29/111] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/trampoline.cpp.o
+[30/111] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/implicit.cpp.o
+[31/111] Building CXX object CMakeFiles/hyphy3_pch.dir/src/pch.cpp.o
+[32/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy3.cpp.o
+[33/111] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/tree_engine.cpp.o
+[34/111] Linking CXX static library libhyphy3_emitters.a
+[35/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_fel.cpp.o
+[36/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_contrast_fel.cpp.o
+[37/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_meme.cpp.o
+[38/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_busted.cpp.o
+[39/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_relax.cpp.o
+[40/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_absrel.cpp.o
+[41/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_fubar.cpp.o
+[42/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_prime.cpp.o
+[43/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_gard.cpp.o
+[44/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_slac.cpp.o
+[45/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_dfel.cpp.o
+[46/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_mss.cpp.o
+[47/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_tree.cpp.o
+[48/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_ohmic.cpp.o
+[49/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_joint_align.cpp.o
+[50/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_characterize.cpp.o
+[51/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_report.cpp.o
+[52/111] Building CXX object CMakeFiles/hyphy3.dir/src/analyses/expcm_optimizer.cpp.o
+[53/111] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_expcm.cpp.o
+[54/111] Building CXX object CMakeFiles/hyphy3.dir/src/analyses/persite_optimizer.cpp.o
+[55/111] Building CXX object CMakeFiles/hyphy3-fel.dir/src/apps/hyphy_fel.cpp.o
+[56/111] Building CXX object CMakeFiles/hyphy3-contrast-fel.dir/src/apps/hyphy_contrast_fel.cpp.o
+[57/111] Building CXX object CMakeFiles/hyphy3-meme.dir/src/apps/hyphy_meme.cpp.o
+[58/111] Building CXX object CMakeFiles/hyphy3-busted.dir/src/apps/hyphy_busted.cpp.o
+[59/111] Building CXX object CMakeFiles/hyphy3-absrel.dir/src/apps/hyphy_absrel.cpp.o
+[60/111] Building CXX object CMakeFiles/hyphy3-relax.dir/src/apps/hyphy_relax.cpp.o
+[61/111] Building CXX object CMakeFiles/hyphy3-fubar.dir/src/apps/hyphy_fubar.cpp.o
+[62/111] Building CXX object CMakeFiles/hyphy3-prime.dir/src/apps/hyphy_prime.cpp.o
+[63/111] Building CXX object CMakeFiles/hyphy3-gard.dir/src/apps/hyphy_gard.cpp.o
+[64/111] Building CXX object CMakeFiles/hyphy3-slac.dir/src/apps/hyphy_slac.cpp.o
+[65/111] Building CXX object CMakeFiles/hyphy3-dfel.dir/src/apps/hyphy_dfel.cpp.o
+[66/111] Building CXX object CMakeFiles/hyphy3-mss.dir/src/apps/hyphy_mss.cpp.o
+[67/111] Building CXX object CMakeFiles/hyphy3-ohmic.dir/src/apps/hyphy_ohmic.cpp.o
+[68/111] Building CXX object CMakeFiles/hyphy3-tree.dir/src/apps/hyphy_tree.cpp.o
+[69/111] Building CXX object CMakeFiles/hyphy3-joint-align.dir/src/apps/hyphy_joint_align.cpp.o
+[70/111] Building CXX object CMakeFiles/hyphy3-characterize.dir/src/apps/hyphy_characterize.cpp.o
+[71/111] Building CXX object CMakeFiles/hyphy3-walrus.dir/src/apps/hyphy_characterize.cpp.o
+[72/111] Building CXX object CMakeFiles/hyphy3-expcm.dir/src/apps/hyphy_expcm_main.cpp.o
+[73/111] Building CXX object CMakeFiles/hyphy3-expcm.dir/src/apps/hyphy_expcm.cpp.o
+[74/111] Building CXX object CMakeFiles/hyphy3-expcm.dir/src/analyses/expcm_optimizer.cpp.o
+[75/111] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings.cpp.o
+[76/111] Building CXX object CMakeFiles/hyphy3-expcm.dir/src/analyses/persite_optimizer.cpp.o
+[77/111] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_core.cpp.o
+[78/111] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_fel.cpp.o
+[79/111] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_meme.cpp.o
+[80/111] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_busted.cpp.o
+[81/111] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_absrel.cpp.o
+[82/111] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_relax.cpp.o
+[83/111] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_fubar.cpp.o
+[84/111] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_prime.cpp.o
+[85/111] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_slac.cpp.o
+[86/111] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_gard.cpp.o
+[87/111] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_dfel.cpp.o
+[88/111] Linking CXX static library libnanobind-static.a
+[89/111] Linking CXX static library libhyphy3_pch.a
+[90/111] Linking CXX executable hyphy3
+[91/111] Linking CXX executable hyphy3-fel
+[92/111] Linking CXX executable hyphy3-contrast-fel
+[93/111] Linking CXX executable hyphy3-meme
+[94/111] Linking CXX executable hyphy3-busted
+[95/111] Linking CXX executable hyphy3-absrel
+[96/111] Linking CXX executable hyphy3-relax
+[97/111] Linking CXX executable hyphy3-fubar
+[98/111] Linking CXX executable hyphy3-prime
+[99/111] Linking CXX executable hyphy3-gard
+[100/111] Linking CXX executable hyphy3-slac
+[101/111] Linking CXX executable hyphy3-dfel
+[102/111] Linking CXX executable hyphy3-mss
+[103/111] Linking CXX executable hyphy3-ohmic
+[104/111] Linking CXX executable hyphy3-tree
+[105/111] Linking CXX executable hyphy3-joint-align
+[106/111] Linking CXX executable hyphy3-characterize
+[107/111] Linking CXX executable hyphy3-walrus
+[108/111] Linking CXX executable hyphy3-expcm
+[109/111] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_ohmic.cpp.o
+[110/111] Linking CXX shared module /kaggle/working/hyphy-3/python/_hyphy3.cpython-312-x86_64-linux-gnu.so
+log: build/.ninja_log
+edges:                  114
+cumulative edge time:   7605.6 s
+wall time (log span):   3810.7 s
+effective parallelism:  2.00x
+
+top 15 heaviest outputs:
+     180.7 s  CMakeFiles/hyphy3.dir/src/apps/hyphy_absrel.cpp.o
+     176.1 s  CMakeFiles/hyphy3.dir/src/apps/hyphy_meme.cpp.o
+     175.4 s  CMakeFiles/hyphy3.dir/src/apps/hyphy_relax.cpp.o
+     175.0 s  CMakeFiles/hyphy3-absrel.dir/src/apps/hyphy_absrel.cpp.o
+     170.5 s  CMakeFiles/hyphy3.dir/src/apps/hyphy_prime.cpp.o
+     170.4 s  CMakeFiles/hyphy3.dir/src/apps/hyphy_busted.cpp.o
+     169.9 s  CMakeFiles/hyphy3-prime.dir/src/apps/hyphy_prime.cpp.o
+     169.7 s  CMakeFiles/hyphy3-relax.dir/src/apps/hyphy_relax.cpp.o
+     169.0 s  CMakeFiles/hyphy3-gard.dir/src/apps/hyphy_gard.cpp.o
+     167.9 s  CMakeFiles/hyphy3.dir/src/apps/hyphy_gard.cpp.o
+     167.0 s  CMakeFiles/hyphy3-slac.dir/src/apps/hyphy_slac.cpp.o
+     166.6 s  CMakeFiles/hyphy3-meme.dir/src/apps/hyphy_meme.cpp.o
+     166.2 s  CMakeFiles/hyphy3_emitters.dir/src/analyses/joint_align_impl.cpp.o
+     165.4 s  CMakeFiles/hyphy3.dir/src/apps/hyphy_slac.cpp.o
+     165.3 s  CMakeFiles/hyphy3-contrast-fel.dir/src/apps/hyphy_contrast_fel.cpp.o
+
+time by app:
+    2657.8 s  hyphy3
+    1237.8 s  hyphy3_emitters
+     965.7 s  _hyphy3
+     196.5 s  hyphy3-expcm
+     175.0 s  hyphy3-absrel
+     169.9 s  hyphy3-prime
+     169.7 s  hyphy3-relax
+     169.0 s  hyphy3-gard
+     167.0 s  hyphy3-slac
+     166.6 s  hyphy3-meme
+     165.3 s  hyphy3-contrast-fel
+     165.1 s  hyphy3-fel
+     164.6 s  hyphy3-dfel
+     157.7 s  hyphy3-mss
+     156.9 s  hyphy3-fubar
+-- OpenMP CXX found: 4.5
+-- Building Python bindings with nanobind
+-- Configuring done (0.2s)
+-- Generating done (0.1s)
+-- Build files have been written to: /kaggle/working/hyphy-3/build
+ninja: Entering directory `build'
+[0/2] Re-checking globbed directories...
+[1/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/cmake_pch.hxx.gch
+[2/128] Building CXX object CMakeFiles/hyphy3_pch.dir/cmake_pch.hxx.gch
+[3/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/absrel.cpp.o
+[4/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/busted.cpp.o
+[5/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/busted_impl.cpp.o
+[6/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/characterize_impl.cpp.o
+[7/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/contrast_fel.cpp.o
+[8/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/directional_fel.cpp.o
+[9/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/fel.cpp.o
+[10/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/fubar.cpp.o
+[11/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/gard.cpp.o
+[12/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/meme.cpp.o
+[13/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/mss.cpp.o
+[14/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/joint_align_impl.cpp.o
+[15/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/ohmic.cpp.o
+[16/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/prime.cpp.o
+[17/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/relax.cpp.o
+[18/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/slac.cpp.o
+[19/128] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/nb_internals.cpp.o
+[20/128] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/nb_func.cpp.o
+[21/128] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/nb_type.cpp.o
+[22/128] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/nb_enum.cpp.o
+[23/128] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/nb_ndarray.cpp.o
+[24/128] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/nb_static_property.cpp.o
+[25/128] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/nb_datetime.cpp.o
+[26/128] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/common.cpp.o
+[27/128] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/error.cpp.o
+[28/128] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/trampoline.cpp.o
+[29/128] Building CXX object CMakeFiles/nanobind-static.dir/kaggle/working/miniforge/envs/h3/lib/python3.12/site-packages/nanobind/src/implicit.cpp.o
+[30/128] Building CXX object CMakeFiles/hyphy3_pch.dir/src/pch.cpp.o
+[31/128] Building CXX object CMakeFiles/hyphy3_emitters.dir/src/analyses/tree_engine.cpp.o
+[32/128] Linking CXX static library libhyphy3_emitters.a
+[33/128] Building CXX object CMakeFiles/hyphy_test_optimizer_bin.dir/tests/bin_optimizer.cpp.o
+[34/128] Building CXX object CMakeFiles/hyphy_test_optimizer_bin.dir/src/analyses/expcm_optimizer.cpp.o
+[35/128] Building CXX object CMakeFiles/hyphy_test_core_bin.dir/tests/bin_core.cpp.o
+[36/128] Building CXX object CMakeFiles/hyphy_test_optimizer_bin.dir/src/analyses/persite_optimizer.cpp.o
+[37/128] Building CXX object CMakeFiles/hyphy_cpp_autograd_test.dir/tests/test_cpp_autograd.cpp.o
+[38/128] Building CXX object CMakeFiles/hyphy_dfel_test.dir/tests/test_dfel.cpp.o
+[39/128] Building CXX object CMakeFiles/hyphy_test_analyses_bin.dir/tests/bin_analyses.cpp.o
+[40/128] Building CXX object CMakeFiles/hyphy_mss_test.dir/tests/test_mss.cpp.o
+[41/128] Building CXX object CMakeFiles/hyphy_joint_align_test.dir/tests/test_joint_align.cpp.o
+[42/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy3.cpp.o
+[43/128] Building CXX object CMakeFiles/hyphy_characterize_test.dir/tests/test_characterize.cpp.o
+[44/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_fel.cpp.o
+[45/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_contrast_fel.cpp.o
+[46/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_meme.cpp.o
+[47/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_busted.cpp.o
+[48/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_absrel.cpp.o
+[49/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_relax.cpp.o
+[50/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_fubar.cpp.o
+[51/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_prime.cpp.o
+[52/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_gard.cpp.o
+[53/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_slac.cpp.o
+[54/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_dfel.cpp.o
+[55/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_mss.cpp.o
+[56/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_ohmic.cpp.o
+[57/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_tree.cpp.o
+[58/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_joint_align.cpp.o
+[59/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_characterize.cpp.o
+[60/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_report.cpp.o
+[61/128] Building CXX object CMakeFiles/hyphy3.dir/src/apps/hyphy_expcm.cpp.o
+[62/128] Building CXX object CMakeFiles/hyphy3.dir/src/analyses/expcm_optimizer.cpp.o
+[63/128] Building CXX object CMakeFiles/hyphy3.dir/src/analyses/persite_optimizer.cpp.o
+[64/128] Building CXX object CMakeFiles/hyphy3-fel.dir/src/apps/hyphy_fel.cpp.o
+[65/128] Building CXX object CMakeFiles/hyphy3-contrast-fel.dir/src/apps/hyphy_contrast_fel.cpp.o
+[66/128] Building CXX object CMakeFiles/hyphy3-meme.dir/src/apps/hyphy_meme.cpp.o
+[67/128] Building CXX object CMakeFiles/hyphy3-busted.dir/src/apps/hyphy_busted.cpp.o
+[68/128] Building CXX object CMakeFiles/hyphy3-absrel.dir/src/apps/hyphy_absrel.cpp.o
+[69/128] Building CXX object CMakeFiles/hyphy3-relax.dir/src/apps/hyphy_relax.cpp.o
+[70/128] Building CXX object CMakeFiles/hyphy3-fubar.dir/src/apps/hyphy_fubar.cpp.o
+[71/128] Building CXX object CMakeFiles/hyphy3-prime.dir/src/apps/hyphy_prime.cpp.o
+[72/128] Building CXX object CMakeFiles/hyphy3-gard.dir/src/apps/hyphy_gard.cpp.o
+[73/128] Building CXX object CMakeFiles/hyphy3-slac.dir/src/apps/hyphy_slac.cpp.o
+[74/128] Building CXX object CMakeFiles/hyphy3-dfel.dir/src/apps/hyphy_dfel.cpp.o
+[75/128] Building CXX object CMakeFiles/hyphy3-mss.dir/src/apps/hyphy_mss.cpp.o
+[76/128] Building CXX object CMakeFiles/hyphy3-ohmic.dir/src/apps/hyphy_ohmic.cpp.o
+[77/128] Building CXX object CMakeFiles/hyphy3-tree.dir/src/apps/hyphy_tree.cpp.o
+[78/128] Building CXX object CMakeFiles/hyphy3-characterize.dir/src/apps/hyphy_characterize.cpp.o
+[79/128] Building CXX object CMakeFiles/hyphy3-joint-align.dir/src/apps/hyphy_joint_align.cpp.o
+[80/128] Building CXX object CMakeFiles/hyphy3-walrus.dir/src/apps/hyphy_characterize.cpp.o
+[81/128] Building CXX object CMakeFiles/hyphy3-expcm.dir/src/apps/hyphy_expcm_main.cpp.o
+[82/128] Building CXX object CMakeFiles/hyphy3-expcm.dir/src/apps/hyphy_expcm.cpp.o
+[83/128] Building CXX object CMakeFiles/hyphy3-expcm.dir/src/analyses/expcm_optimizer.cpp.o
+[84/128] Building CXX object CMakeFiles/hyphy3-expcm.dir/src/analyses/persite_optimizer.cpp.o
+[85/128] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings.cpp.o
+[86/128] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_core.cpp.o
+[87/128] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_fel.cpp.o
+[88/128] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_busted.cpp.o
+[89/128] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_meme.cpp.o
+[90/128] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_relax.cpp.o
+[91/128] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_absrel.cpp.o
+[92/128] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_fubar.cpp.o
+[93/128] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_prime.cpp.o
+[94/128] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_slac.cpp.o
+[95/128] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_gard.cpp.o
+[96/128] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_dfel.cpp.o
+[97/128] Linking CXX static library libnanobind-static.a
+[98/128] Linking CXX static library libhyphy3_pch.a
+[99/128] Linking CXX executable hyphy_test_core_bin
+[100/128] Linking CXX executable hyphy_test_optimizer_bin
+[101/128] Linking CXX executable hyphy_test_analyses_bin
+[102/128] Linking CXX executable hyphy_cpp_autograd_test
+[103/128] Linking CXX executable hyphy_dfel_test
+[104/128] Linking CXX executable hyphy_mss_test
+[105/128] Linking CXX executable hyphy_joint_align_test
+[106/128] Linking CXX executable hyphy_characterize_test
+[107/128] Linking CXX executable hyphy3
+[108/128] Linking CXX executable hyphy3-fel
+[109/128] Linking CXX executable hyphy3-contrast-fel
+[110/128] Linking CXX executable hyphy3-meme
+[111/128] Linking CXX executable hyphy3-busted
+[112/128] Linking CXX executable hyphy3-absrel
+[113/128] Linking CXX executable hyphy3-relax
+[114/128] Linking CXX executable hyphy3-fubar
+[115/128] Linking CXX executable hyphy3-prime
+[116/128] Linking CXX executable hyphy3-gard
+[117/128] Linking CXX executable hyphy3-slac
+[118/128] Linking CXX executable hyphy3-dfel
+[119/128] Linking CXX executable hyphy3-mss
+[120/128] Linking CXX executable hyphy3-ohmic
+[121/128] Linking CXX executable hyphy3-tree
+[122/128] Linking CXX executable hyphy3-joint-align
+[123/128] Linking CXX executable hyphy3-characterize
+[124/128] Linking CXX executable hyphy3-walrus
+[125/128] Linking CXX executable hyphy3-expcm
+[126/128] Building CXX object CMakeFiles/_hyphy3.dir/src/python/bindings_ohmic.cpp.o
+[127/128] Linking CXX shared module /kaggle/working/hyphy-3/python/_hyphy3.cpython-312-x86_64-linux-gnu.so
+[fel_cd2] hyphy3 fel --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches All --pvalue 0.1 --threads 4
+  schema: OK (fel.v3.schema.json)
+  FAIL: 1 difference(s) vs snapshot
+    $.provenance.execution.hostname: 'b9d801470d4c' != '3860775254be'
+[meme_cd2] hyphy3 meme --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches All --pvalue 0.1 --threads 4
+  schema: OK (meme.v3.schema.json)
+  FAIL: 1 difference(s) vs snapshot
+    $.provenance.execution.hostname: 'b9d801470d4c' != '3860775254be'
+[slac_cd2] hyphy3 slac --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches All --samples 0 --pvalue 0.1 --threads 4
+  schema: OK (slac.v3.schema.json)
+  FAIL: 1 difference(s) vs snapshot
+    $.provenance.execution.hostname: 'b9d801470d4c' != '3860775254be'
+[busted_cd2] hyphy3 busted --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches All --pvalue 0.05 --threads 4
+  schema: OK (busted.v3.schema.json)
+  FAIL: 1 difference(s) vs snapshot
+    $.provenance.execution.hostname: 'b9d801470d4c' != '3860775254be'
+[absrel_cd2] hyphy3 absrel --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches All --threads 4
+  schema: OK (absrel.v3.schema.json)
+  FAIL: 1 difference(s) vs snapshot
+    $.provenance.execution.hostname: 'b9d801470d4c' != '3860775254be'
+[relax_cd2] hyphy3 relax --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --test Group1 --reference Group2 --threads 4
+  schema: OK (relax.v3.schema.json)
+  FAIL: 1 difference(s) vs snapshot
+    $.provenance.execution.hostname: 'b9d801470d4c' != '3860775254be'
+[contrast_fel_cd2] hyphy3 contrast-fel --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches Group1,Group2 --threads 4
+  schema: OK (contrast_fel.v3.schema.json)
+  FAIL: 1 difference(s) vs snapshot
+    $.provenance.execution.hostname: 'b9d801470d4c' != '3860775254be'
+[joint_align_cd2] hyphy3 joint-align --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --threads 4
+  PASS
+[characterize_cd2] hyphy3 characterize --alignment benchmarks/data/cd2.fna --threads 4
+  schema: OK (characterize.v3.schema.json)
+  PASS
+
+2/9 case(s) checked cleanly
+[fel_cd2] hyphy3 fel --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches All --pvalue 0.1 --threads 4
+  schema: OK (fel.v3.schema.json)
+  recorded -> /kaggle/working/hyphy-3/tests/golden/fel_cd2.json
+[meme_cd2] hyphy3 meme --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches All --pvalue 0.1 --threads 4
+  schema: OK (meme.v3.schema.json)
+  recorded -> /kaggle/working/hyphy-3/tests/golden/meme_cd2.json
+[slac_cd2] hyphy3 slac --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches All --samples 0 --pvalue 0.1 --threads 4
+  schema: OK (slac.v3.schema.json)
+  recorded -> /kaggle/working/hyphy-3/tests/golden/slac_cd2.json
+[busted_cd2] hyphy3 busted --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches All --pvalue 0.05 --threads 4
+  schema: OK (busted.v3.schema.json)
+  recorded -> /kaggle/working/hyphy-3/tests/golden/busted_cd2.json
+[absrel_cd2] hyphy3 absrel --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches All --threads 4
+  schema: OK (absrel.v3.schema.json)
+  recorded -> /kaggle/working/hyphy-3/tests/golden/absrel_cd2.json
+[relax_cd2] hyphy3 relax --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --test Group1 --reference Group2 --threads 4
+  schema: OK (relax.v3.schema.json)
+  recorded -> /kaggle/working/hyphy-3/tests/golden/relax_cd2.json
+[contrast_fel_cd2] hyphy3 contrast-fel --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --branches Group1,Group2 --threads 4
+  schema: OK (contrast_fel.v3.schema.json)
+  recorded -> /kaggle/working/hyphy-3/tests/golden/contrast_fel_cd2.json
+[joint_align_cd2] hyphy3 joint-align --alignment benchmarks/data/cd2.fna --tree benchmarks/data/cd2.nwk --threads 4
+  recorded -> /kaggle/working/hyphy-3/tests/golden/joint_align_cd2.json
+[characterize_cd2] hyphy3 characterize --alignment benchmarks/data/cd2.fna --threads 4
+  schema: OK (characterize.v3.schema.json)
+  recorded -> /kaggle/working/hyphy-3/tests/golden/characterize_cd2.json
+
+9/9 case(s) recorded cleanly
+PASS no-args-usage
+PASS help
+PASS version
+PASS unknown-subcommand
+PASS help:fel
+PASS help:contrast-fel
+PASS help:meme
+PASS help:busted
+PASS help:absrel
+PASS help:relax
+PASS help:fubar
+PASS help:prime
+PASS help:gard
+PASS help:slac
+PASS help:dfel
+PASS help:mss
+PASS help:ohmic
+PASS help:tree
+PASS help:joint-align
+PASS help:expcm
+PASS help:report
+PASS help:characterize
+PASS unknown-arg
+PASS alias:hyphy3-fel
+PASS alias:hyphy-meme
+PASS alias:hyphy3-bogus
+
+0 failure(s)
+Test project /kaggle/working/hyphy-3/build
+    Start 33: GoldenOutputTest
+1/3 Test #33: GoldenOutputTest .................   Passed  106.59 sec
+    Start 34: GoldenOutputDeepTest
+2/3 Test #34: GoldenOutputDeepTest .............   Passed  740.87 sec
+    Start 35: CLISurfaceTest
+3/3 Test #35: CLISurfaceTest ...................   Passed    0.15 sec
+
+100% tests passed out of 3
+
+Label Time Summary:
+deep    = 740.87 sec*proc (1 test)
+
+Total Test time (real) = 847.62 sec
+               total        used        free      shared  buff/cache   available
+Mem:              31           0          23           0           7          30
+0a81f4e fix(tests): unbreak R4 merged TUs — standalone mains out, per-file symbol renames in
