@@ -190,7 +190,13 @@ else
         while :; do
             sleep 600
             for f in "$DATA"/*.fna "$DATA"/*.tsv "$DATA"/*.json; do
-                [ -f "$f" ] && cp -f "$f" "$f.snap"
+                [ -f "$f" ] || continue
+                cp -f "$f" "$f.snap"
+                # Kaggle's timeout capture drops *.tsv/*.json output
+                # files specifically (lost labels.tsv + labels.tsv.snap
+                # twice while .fna/.txt survived); the .snap.txt copy
+                # rides an extension it keeps.
+                case "$f" in *.tsv|*.json) cp -f "$f" "$f.snap.txt" ;; esac
             done
         done
     ) &
