@@ -52,13 +52,12 @@ CORP.mkdir(exist_ok=True)
 shutil.copy2(lab_src, CORP / "labels.tsv")
 
 MAP = next((p for p in (
-        Path(__file__).resolve().parent / "reannotate_map.tsv",
-        Path.cwd() / "reannotate_map.tsv",
+        WORK / "omniphyl/kaggle/tol-reannotate/reannotate_map.tsv",
         WORK / "reannotate_map.tsv",
         *Path("/kaggle/input").rglob("reannotate_map.tsv"))
         if p.exists()), None)
 if MAP is None:
-    raise SystemExit("reannotate_map.tsv not bundled with the kernel")
+    raise SystemExit("reannotate_map.tsv not found in the cloned repo")
 
 subprocess.run([
     sys.executable,
