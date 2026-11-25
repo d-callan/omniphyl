@@ -41,11 +41,19 @@ os.environ.setdefault("OMP_NUM_THREADS", "4")
 subprocess.run(["git", "clone", "--depth", "1", REPO,
                 str(WORK / "omniphyl")], check=True)
 
-# zip-mode dataset uploads mount as archives, not extracted files
+# zip-mode dataset uploads mount as archives, not extracted files;
+# corpus.packed additionally ships as a nested zip inside
 import zipfile
-for z in Path("/kaggle/input").rglob("*.zip"):
-    with zipfile.ZipFile(z) as zf:
-        zf.extractall(z.parent)
+_done = set()
+for _ in range(3):
+    zips = [z for z in Path("/kaggle/input").rglob("*.zip")
+            if z not in _done]
+    if not zips:
+        break
+    for z in zips:
+        _done.add(z)
+        with zipfile.ZipFile(z) as zf:
+            zf.extractall(z.parent)
 
 
 def find_one(pattern: str) -> Path:
