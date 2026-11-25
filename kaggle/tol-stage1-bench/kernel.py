@@ -42,23 +42,32 @@ subprocess.run(["git", "clone", "--depth", "1", REPO,
                 str(WORK / "omniphyl")], check=True)
 
 # zip-mode dataset uploads mount as archives, not extracted files;
-# corpus.packed additionally ships as a nested zip inside
+# corpus.packed additionally ships as a nested zip inside.
+# Extract into /kaggle/working -- writing into the /kaggle/input mount
+# silently drops files.
 import zipfile
+EXT = WORK / "_input_ext"
+EXT.mkdir(exist_ok=True)
 _done = set()
 for _ in range(3):
-    zips = [z for z in Path("/kaggle/input").rglob("*.zip")
+    zips = [z for z in list(Path("/kaggle/input").rglob("*.zip")) +
+                      list(EXT.rglob("*.zip"))
             if z not in _done]
     if not zips:
         break
     for z in zips:
         _done.add(z)
         with zipfile.ZipFile(z) as zf:
-            zf.extractall(z.parent)
+            zf.extractall(EXT / z.name.replace(".", "_"))
+
+ROOTS = [Path("/kaggle/input"), EXT]
 
 
 def find_one(pattern: str) -> Path:
-    hits = sorted(glob.glob(f"/kaggle/input/**/{pattern}",
-                            recursive=True))
+    hits = sorted(h for r in ROOTS
+                  for h in glob.glob(f"{r}/**/{pattern}",
+                                     recursive=True)
+                  if Path(h).is_file())
     if not hits:
         raise SystemExit(f"missing {pattern}; "
                          f"mounted={os.listdir('/kaggle/input')}")
@@ -66,8 +75,8 @@ def find_one(pattern: str) -> Path:
 
 
 def find_dir(name: str) -> Path:
-    hits = sorted(p for p in glob.glob("/kaggle/input/**",
-                                       recursive=True)
+    hits = sorted(p for r in ROOTS
+                  for p in glob.glob(f"{r}/**", recursive=True)
                   if Path(p).name == name and Path(p).is_dir())
     if not hits:
         raise SystemExit(f"missing dir {name}")
@@ -75,6 +84,13 @@ def find_dir(name: str) -> Path:
 
 
 packed = find_dir("corpus.packed")
+_missing = [f for f in ("seq_ids.txt", "seqs.u8", "seq_offsets.npy",
+                        "labels.tsv", "meta.json")
+            if not (packed / f).exists()]
+if _missing:
+    raise SystemExit(f"corpus.packed incomplete at {packed}: "
+                     f"missing {_missing}; "
+                     f"present={os.listdir(packed)}")
 fna = find_one("fragments_screened.fna")
 lab = find_one("labels_screened.tsv")
 
