@@ -30,14 +30,18 @@ os.environ.setdefault("OMP_NUM_THREADS", "4")
 subprocess.run(["git", "clone", "--depth", "1", REPO,
                 str(WORK / "omniphyl")], check=True)
 
-VEUPATH = Path("/kaggle/input/datasets/daniellecallan/"
-               "omniphyl-refiner-veupath")
+import glob
+_veup = sorted(glob.glob("/kaggle/input/**/pfalciparum.fna",
+                         recursive=True))
 argv = [sys.executable,
         str(WORK / "omniphyl/scripts/build_refiner_panel.py"),
         "--out", str(WORK / "refiner_panel"),
         "--dl", str(WORK / "_panel_dl")]
-if VEUPATH.is_dir():
-    argv += ["--veupath-dir", str(VEUPATH)]
+if _veup:
+    argv += ["--veupath-dir", str(Path(_veup[0]).parent)]
+    print(f"veupath overrides: {_veup[0].parent}")
+else:
+    print("no veupath mount found -- all entries via NCBI")
 subprocess.run(argv, check=True)
 
 print("done -> /kaggle/working/refiner_panel/")

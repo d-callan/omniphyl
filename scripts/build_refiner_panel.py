@@ -81,8 +81,9 @@ PANEL = [
     # GCF_016699485.2 = GRCg7b VGP (GRCg6a suppressed)
     ("ggallus",    "GCF_016699485.2",  "largest", "vertebrate", None,
      "heldout", 30_000_000),
+    # chr22 first ~14.7 Mb is centromeric Ns; 30 Mb cap reaches chr22q
     ("hsapiens",   "GCF_000001405.40", "NC_000022", "vertebrate", None,
-     "heldout", 10_000_000),
+     "heldout", 30_000_000),
     ("hsap_chrm",  "GCF_000001405.40", "NC_012920", "vertebrate", 2,
      "heldout", 0),
     # alt-code taxa for gate S2-C
@@ -168,7 +169,8 @@ def pick_seq(seqs, seqmatch):
     for cand in cands:
         if cand in ("scaffold", "largest"):
             if seqs:
-                return max(seqs, key=lambda x: len(x[1]))
+                h, s = max(seqs, key=lambda x: len(x[1]))
+                return (h.split()[0], s)
             continue
         for h, s in seqs:
             if cand in h.split()[0] or cand in h:
