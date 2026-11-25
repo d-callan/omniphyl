@@ -75,7 +75,7 @@ def find_one(pattern: str) -> Path:
 
 
 def find_dirs(name: str) -> list[Path]:
-    return sorted(p for r in ROOTS
+    return sorted(Path(p) for r in ROOTS
                   for p in glob.glob(f"{r}/**", recursive=True)
                   if Path(p).name == name and Path(p).is_dir())
 
