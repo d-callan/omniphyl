@@ -41,6 +41,12 @@ os.environ.setdefault("OMP_NUM_THREADS", "4")
 subprocess.run(["git", "clone", "--depth", "1", REPO,
                 str(WORK / "omniphyl")], check=True)
 
+# zip-mode dataset uploads mount as archives, not extracted files
+import zipfile
+for z in Path("/kaggle/input").rglob("*.zip"):
+    with zipfile.ZipFile(z) as zf:
+        zf.extractall(z.parent)
+
 
 def find_one(pattern: str) -> Path:
     hits = sorted(glob.glob(f"/kaggle/input/**/{pattern}",
