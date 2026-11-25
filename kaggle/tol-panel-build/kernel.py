@@ -39,7 +39,7 @@ argv = [sys.executable,
         "--dl", str(WORK / "_panel_dl")]
 if _veup:
     argv += ["--veupath-dir", str(Path(_veup[0]).parent)]
-    print(f"veupath overrides: {_veup[0].parent}")
+    print(f"veupath overrides: {Path(_veup[0]).parent}")
 else:
     print("no veupath mount found -- all entries via NCBI")
 subprocess.run(argv, check=True)
