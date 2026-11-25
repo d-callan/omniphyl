@@ -34,7 +34,9 @@ PANEL = [
      "train", 3_000_000),
     ("scerevisiae", "GCF_000146045.2", "NC_001136", "fungi", None,
      "train", 2_000_000),
-    ("pfalciparum", "GCF_000002765.2", "Pf3D7_14", "apicomplexa",
+    # GCF_000002765.6 = Pf3D7 v3 (v2 suppressed); chr14 is the
+    # largest chr -> 'largest' keeps continuity w/ ablation panel
+    ("pfalciparum", "GCF_000002765.6", "largest", "apicomplexa",
      None, "train", 4_000_000),
     ("athaliana",  "GCF_000001735.4",  "NC_003070", "plant", None,
      "train", 30_000_000),
@@ -42,7 +44,8 @@ PANEL = [
      None, "train", 16_000_000),
     ("dmelanogaster", "GCF_000001215.4", "NT_033779", "arthropod",
      None, "train", 24_000_000),
-    ("drerio",     "GCF_000002035.6",  "NC_007112", "vertebrate", None,
+    # GCF_052040795.2 = GRCz13ab (GRCz11 suppressed)
+    ("drerio",     "GCF_052040795.2",  "largest", "vertebrate", None,
      "train", 30_000_000),
     ("mmusculus",  "GCF_000001635.27", "NC_000085", "vertebrate", None,
      "train", 30_000_000),
@@ -59,13 +62,17 @@ PANEL = [
     # ---- held-out decode species ----
     ("bsubtilis",  "GCF_000009045.1",  "NC_000964", "bacteria", None,
      "heldout", 5_000_000),
-    ("pvivax",     "GCF_000002415.2",  "PvP01_12", "apicomplexa",
+    # NC_009917 = PvP01_12 (chr12) -- same chr as the ablation panel
+    ("pvivax",     "GCF_000002415.2",  "NC_009917", "apicomplexa",
      None, "heldout", 4_000_000),
-    ("osativa",    "GCF_001433935.1",  "NC_029256", "plant", None,
+    # GCF_034140825.1 = AGIS-1.0 Nipponbare T2T (IRGSP suppressed)
+    ("osativa",    "GCF_034140825.1",  "largest", "plant", None,
      "heldout", 30_000_000),
-    ("agambiae",   "GCF_000005575.2",  "NT_078266", "arthropod",
+    # GCF_943734735.2 = idAnoGambNW_F1_1 Sanger ToL (AgamP3 suppressed)
+    ("agambiae",   "GCF_943734735.2",  "largest", "arthropod",
      None, "heldout", 24_000_000),
-    ("ggallus",    "GCF_000002315.6",  "NC_006093", "vertebrate", None,
+    # GCF_016699485.2 = GRCg7b VGP (GRCg6a suppressed)
+    ("ggallus",    "GCF_016699485.2",  "largest", "vertebrate", None,
      "heldout", 30_000_000),
     ("hsapiens",   "GCF_000001405.40", "NC_000022", "vertebrate", None,
      "heldout", 10_000_000),
@@ -79,29 +86,41 @@ PANEL = [
 ]
 
 
+_FNA_SUF = (".fna", ".fa", ".fasta")
+_GFF_SUF = (".gff", ".gff3")
+
+
+def _fasta(p: Path) -> bool:
+    n = p.name.lower()
+    return (p.suffix.lower() in _FNA_SUF
+            and "rna" not in n and "cds" not in n)
+
+
 def fetch_asm(acc: str, dl: Path) -> tuple[Path, Path]:
     """-> (genomic.fna, genomic.gff) for an assembly accession."""
-    fna_hits = sorted(dl.glob(f"{acc}/**/[!r]*genomic.fna")) or \
-        sorted(dl.glob(f"{acc}/**/*.fna"))
-    gff_hits = sorted(dl.glob(f"{acc}/**/*.gff"))
-    if fna_hits and gff_hits:
-        return fna_hits[0], gff_hits[0]
     zpath = dl / f"{acc}.zip"
-    if not zpath.exists():
+    if not zpath.exists() and not (dl / acc).is_dir():
         print(f"  download {acc}", flush=True)
         req = urllib.request.Request(
             NCBI_DL.format(acc=acc),
             headers={"User-Agent": "omniphyl-refiner-panel"})
         with urllib.request.urlopen(req, timeout=600) as r:
             zpath.write_bytes(r.read())
-    with zipfile.ZipFile(zpath) as z:
-        z.extractall(dl / acc)
-    fna_hits = sorted(p for p in dl.glob(f"{acc}/**/*.fna")
-                      if "rna" not in p.name
-                      and "cds" not in p.name.lower())
-    gff_hits = sorted(dl.glob(f"{acc}/**/*.gff"))
+    if zpath.exists() and not (dl / acc).is_dir():
+        with zipfile.ZipFile(zpath) as z:
+            z.extractall(dl / acc)
+    fna_hits = sorted(p for p in dl.glob(f"{acc}/**/*")
+                      if p.is_file() and _fasta(p)
+                      and "genomic" in p.name.lower()) or \
+        sorted(p for p in dl.glob(f"{acc}/**/*")
+               if p.is_file() and _fasta(p))
+    gff_hits = sorted(p for p in dl.glob(f"{acc}/**/*")
+                      if p.is_file() and p.suffix.lower() in _GFF_SUF)
     if not fna_hits or not gff_hits:
-        raise SystemExit(f"{acc}: no fasta/gff inside zip")
+        listing = sorted(str(p) for p in (dl / acc).rglob("*")
+                         if p.is_file())
+        raise RuntimeError(f"{acc}: no fasta/gff inside zip; "
+                           f"contents={listing[:25]}")
     return fna_hits[0], gff_hits[0]
 
 
