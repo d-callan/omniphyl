@@ -342,7 +342,15 @@ def main():
                      region_head=bool(train_args.get("region_head")),
                      struct_head=bool(train_args.get("struct_head")),
                      domain_k=len(ckpt.get("domain_vocab", {})),
-                     annot_ctx=bool(train_args.get("annot_ctx")))
+                     annot_ctx=bool(train_args.get("annot_ctx")),
+                     head_bottleneck=int(
+                         train_args.get("head_bottleneck", 0)),
+                     bottleneck_min_classes=int(
+                         train_args.get("bottleneck_min_classes", 8192)),
+                     replicon_head=bool(
+                         train_args.get("replicon_head")),
+                     dna_stats=bool(train_args.get("dna_stats")),
+                     aa_extra_v2=bool(train_args.get("aa_extra_v2")))
     model.load_state_dict(ckpt["model"])
     # The tree head is trained so softmax(logits + tau*log nu) = P(y);
     # evaluating at that same tau restores the posterior the model was
@@ -455,6 +463,9 @@ def main():
                          eval_paired=args.eval_paired_len,
                          aa_frame=bool(train_args.get("struct_head")),
                          annot=annot,
+                         dna_stats=bool(train_args.get("dna_stats")),
+                         aa_extra_v2=bool(
+                             train_args.get("aa_extra_v2")),
                          cache_seqs=args.cache_seqs)
     loader = torch.utils.data.DataLoader(
         ds, args.batch_size, shuffle=False,
