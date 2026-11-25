@@ -112,16 +112,27 @@ def bottleneck_probe(n_classes: int, bottleneck: int, batch_size: int,
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
-    for _ in range(steps):
-        with torch.autocast("cuda", dtype=dt,
-                            enabled=autocast):
-            logits = m(x)[1]["species"]
-            loss = torch.nn.functional.cross_entropy(logits, y)
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-    if device == "cuda":
-        torch.cuda.synchronize()
+    try:
+        for _ in range(steps):
+            with torch.autocast("cuda", dtype=dt,
+                                enabled=autocast):
+                logits = m(x)[1]["species"]
+                loss = torch.nn.functional.cross_entropy(logits, y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        if device == "cuda":
+            torch.cuda.synchronize()
+    except torch.cuda.OutOfMemoryError:
+        # VRAM probe hit the device ceiling -- report it as data, not a
+        # crash, so stage1's gate report still lands after long arms.
+        del m, opt, x, y
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        return {"n_classes": n_classes + 1, "bottleneck": bottleneck,
+                "batch_size": batch_size, "oom": True,
+                "peak_vram_gb": None,
+                "ms_per_step": None}
     dt_ms = (time.time() - t0) * 1000 / steps
     n_par = sum(p.numel() for p in m.parameters())
     head_par = sum(p.numel() for n, p in m.named_parameters()
@@ -222,9 +233,9 @@ def gate_s1b(n_classes: int, batch: int, device: str,
              amp: str) -> dict:
     """VRAM probe at synthetic C_species; gate = <16 GB bottlenecked."""
     bott = bottleneck_probe(n_classes, 256, batch, 20, device, 96, amp)
-    row = {"pass": (bott["peak_vram_gb"] is not None
-                    and bott["peak_vram_gb"] < 16.0)
-           or bott["peak_vram_gb"] is None,
+    row = {"pass": (bott["peak_vram_gb"] < 16.0
+                    if bott["peak_vram_gb"] is not None
+                    else not bott.get("oom", False)),
            "bottlenecked": bott}
     # full-head arm for contrast (kept small: same steps, params only
     # when it would obviously blow the budget is fine — head is the
@@ -233,7 +244,9 @@ def gate_s1b(n_classes: int, batch: int, device: str,
     row["full_head"] = full
     row["delta_gb"] = (round(full["peak_vram_gb"]
                            - bott["peak_vram_gb"], 2)
-                       if device == "cuda" else None)
+                       if full["peak_vram_gb"] is not None
+                       and bott["peak_vram_gb"] is not None
+                       else None)
     return row
 
 
