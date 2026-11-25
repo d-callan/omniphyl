@@ -74,23 +74,26 @@ def find_one(pattern: str) -> Path:
     return Path(hits[0])
 
 
-def find_dir(name: str) -> Path:
-    hits = sorted(p for r in ROOTS
+def find_dirs(name: str) -> list[Path]:
+    return sorted(p for r in ROOTS
                   for p in glob.glob(f"{r}/**", recursive=True)
                   if Path(p).name == name and Path(p).is_dir())
-    if not hits:
-        raise SystemExit(f"missing dir {name}")
-    return Path(hits[0])
 
 
-packed = find_dir("corpus.packed")
-_missing = [f for f in ("seq_ids.txt", "seqs.u8", "seq_offsets.npy",
-                        "labels.tsv", "meta.json")
-            if not (packed / f).exists()]
-if _missing:
-    raise SystemExit(f"corpus.packed incomplete at {packed}: "
-                     f"missing {_missing}; "
-                     f"present={os.listdir(packed)}")
+# Kaggle auto-extracts dataset zips into a dir named after the archive,
+# so corpus.packed.zip can appear as corpus.packed/corpus.packed/{files}
+# -- pick the hit that actually holds the packed store.
+REQ = ("seq_ids.txt", "seqs.u8", "seq_offsets.npy",
+       "labels.tsv", "meta.json")
+packed = None
+for h in find_dirs("corpus.packed"):
+    if all((h / f).exists() for f in REQ):
+        packed = h
+        break
+if packed is None:
+    raise SystemExit(
+        "no complete corpus.packed found; "
+        f"hits={find_dirs('corpus.packed')}")
 fna = find_one("fragments_screened.fna")
 lab = find_one("labels_screened.tsv")
 
