@@ -1,0 +1,13 @@
+{
+  "id": "daniellecallan/omniphyl-tol-corpus-finalize",
+  "title": "omniphyl-tol-corpus-finalize",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": ["daniellecallan/omniphyl-tol-mini-partial"],
+  "competition_sources": [],
+  "kernel_sources": []
+}

@@ -36,11 +36,20 @@ os.environ.setdefault("PYTHONUNBUFFERED", "1")
 subprocess.run(["git", "clone", "--depth", "1", REPO,
                 str(WORK / "omniphyl")], check=True)
 
-DS = Path("/kaggle/input/omniphyl-tol-mini-partial")
+# zip-mode dataset uploads mount as archives, not extracted files
+import zipfile
+for z in Path("/kaggle/input").rglob("*.zip"):
+    with zipfile.ZipFile(z) as zf:
+        zf.extractall(z.parent)
+
+lab_src = next(Path("/kaggle/input").rglob("labels.tsv"), None)
+if lab_src is None:
+    raise SystemExit("labels.tsv not found under /kaggle/input: "
+                     f"{[str(p) for p in Path('/kaggle/input').rglob('*')]}")
 CORP = WORK / "corpus"
 CORP.mkdir(exist_ok=True)
 (CORP / "_ncbi_cache").mkdir(exist_ok=True)
-shutil.copy2(DS / "labels.tsv", CORP / "labels.tsv")
+shutil.copy2(lab_src, CORP / "labels.tsv")
 
 MAP = next((p for p in (
         Path(__file__).resolve().parent / "reannotate_map.tsv",
