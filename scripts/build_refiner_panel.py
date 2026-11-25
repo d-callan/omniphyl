@@ -10,6 +10,12 @@ length, keeps the CDS rows inside the cap, and writes fna + gff3.
 ``gcode`` entries (chrM code 2, tetrahymena code 6, mycoplasma code 4)
 feed gate S2-C's alternate-code check.
 
+--veupath-dir: optional dir of name-keyed overrides (<name>.fna|.fasta
++ <name>.gff|.gff3). VEuPathDB annotations (PlasmoDB/TriTrypDB/ToxoDB/
+VectorBase) are community-curated and generally better than the RefSeq
+propagation for those organisms, so a matching file pair replaces the
+NCBI fetch for that entry.
+
     python build_refiner_panel.py --out refiner_panel [--dl /tmp/panel_dl]
 """
 
@@ -36,8 +42,8 @@ PANEL = [
      "train", 2_000_000),
     # GCF_000002765.6 = Pf3D7 v3 (v2 suppressed); chr14 is the
     # largest chr -> 'largest' keeps continuity w/ ablation panel
-    ("pfalciparum", "GCF_000002765.6", "largest", "apicomplexa",
-     None, "train", 4_000_000),
+    ("pfalciparum", "GCF_000002765.6", ("Pf3D7_14", "largest"),
+     "apicomplexa", None, "train", 4_000_000),
     ("athaliana",  "GCF_000001735.4",  "NC_003070", "plant", None,
      "train", 30_000_000),
     ("celegans",   "GCF_000002985.6",  "NC_003279", "invertebrate",
@@ -62,9 +68,10 @@ PANEL = [
     # ---- held-out decode species ----
     ("bsubtilis",  "GCF_000009045.1",  "NC_000964", "bacteria", None,
      "heldout", 5_000_000),
-    # NC_009917 = PvP01_12 (chr12) -- same chr as the ablation panel
-    ("pvivax",     "GCF_000002415.2",  "NC_009917", "apicomplexa",
-     None, "heldout", 4_000_000),
+    # PvP01_12 = chr12 -- same chr as the ablation panel
+    # (NC_009917 is the NCBI-accession spelling of it)
+    ("pvivax",     "GCF_000002415.2",  ("PvP01_12", "NC_009917"),
+     "apicomplexa", None, "heldout", 4_000_000),
     # GCF_034140825.1 = AGIS-1.0 Nipponbare T2T (IRGSP suppressed)
     ("osativa",    "GCF_034140825.1",  "largest", "plant", None,
      "heldout", 30_000_000),
@@ -138,20 +145,47 @@ def read_fna(path: Path) -> list:
     return seqs
 
 
+_VEUP_FNA = (".fna", ".fasta")
+_VEUP_GFF = (".gff", ".gff3")
+
+
+def veupath_pair(name: str, veupath_dir: Path | None
+                 ) -> tuple[Path, Path] | None:
+    """-> (fna, gff) from <dir>/<name>.* if a matching pair exists."""
+    if veupath_dir is None:
+        return None
+    fna = next((p for p in sorted(veupath_dir.glob(f"{name}.*"))
+                if p.suffix.lower() in _VEUP_FNA), None)
+    gff = next((p for p in sorted(veupath_dir.glob(f"{name}.*"))
+                if p.suffix.lower() in _VEUP_GFF), None)
+    return (fna, gff) if fna and gff else None
+
+
+def pick_seq(seqs, seqmatch):
+    """seqmatch: str or tuple of candidates tried in order; the literal
+    candidates 'scaffold'/'largest' pick the longest sequence."""
+    cands = (seqmatch,) if isinstance(seqmatch, str) else seqmatch
+    for cand in cands:
+        if cand in ("scaffold", "largest"):
+            if seqs:
+                return max(seqs, key=lambda x: len(x[1]))
+            continue
+        for h, s in seqs:
+            if cand in h.split()[0] or cand in h:
+                return (h.split()[0], s)
+    return None
+
+
 def write_panel(name, acc, seqmatch, clade, gcode, role, cap,
-                panel_dir: Path, dl: Path, manifest: dict):
-    fna, gff = fetch_asm(acc, dl)
-    target = None
-    for h, s in read_fna(fna):
-        sid = h.split()[0]
-        if seqmatch in sid or seqmatch in h:
-            target = (sid, s)
-            break
-    if target is None and seqmatch in ("scaffold", "largest"):
-        # tetrahymena-style / NC-id-unknown assemblies: largest seq
-        target = max(read_fna(fna), key=lambda x: len(x[1]))
+                panel_dir: Path, dl: Path, manifest: dict,
+                veupath_dir: Path | None = None):
+    pair = veupath_pair(name, veupath_dir)
+    src = "veupathdb" if pair else "ncbi"
+    fna, gff = pair if pair else fetch_asm(acc, dl)
+    target = pick_seq(read_fna(fna), seqmatch)
     if target is None:
-        print(f"  {name}: seqid *{seqmatch}* not in {acc}, skipped")
+        print(f"  {name}: seqid *{seqmatch}* not in {acc} ({src}), "
+              f"skipped")
         return
     sid, seq = target
     if cap and len(seq) > cap:
@@ -194,6 +228,9 @@ def main() -> None:
     ap.add_argument("--dl", type=Path, default=None,
                     help="scratch dir for NCBI zips (default "
                          "<out>/../_panel_dl)")
+    ap.add_argument("--veupath-dir", type=Path, default=None,
+                    help="dir of <name>.fna/.gff VEuPathDB overrides "
+                         "(preferred over NCBI when a pair exists)")
     args = ap.parse_args()
     panel_dir = args.out
     dl = args.dl or panel_dir.parent / "_panel_dl"
@@ -203,7 +240,8 @@ def main() -> None:
     manifest = {}
     for i, spec in enumerate(PANEL):
         try:
-            write_panel(*spec, panel_dir, dl, manifest)
+            write_panel(*spec, panel_dir, dl, manifest,
+                        args.veupath_dir)
         except Exception as ex:
             print(f"  {spec[0]}: FAILED ({ex}) -- skipping", flush=True)
         acc = spec[1]

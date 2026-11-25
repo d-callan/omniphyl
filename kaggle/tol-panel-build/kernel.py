@@ -30,9 +30,14 @@ os.environ.setdefault("OMP_NUM_THREADS", "4")
 subprocess.run(["git", "clone", "--depth", "1", REPO,
                 str(WORK / "omniphyl")], check=True)
 
-subprocess.run([sys.executable,
-                str(WORK / "omniphyl/scripts/build_refiner_panel.py"),
-                "--out", str(WORK / "refiner_panel"),
-                "--dl", str(WORK / "_panel_dl")], check=True)
+VEUPATH = Path("/kaggle/input/datasets/daniellecallan/"
+               "omniphyl-refiner-veupath")
+argv = [sys.executable,
+        str(WORK / "omniphyl/scripts/build_refiner_panel.py"),
+        "--out", str(WORK / "refiner_panel"),
+        "--dl", str(WORK / "_panel_dl")]
+if VEUPATH.is_dir():
+    argv += ["--veupath-dir", str(VEUPATH)]
+subprocess.run(argv, check=True)
 
 print("done -> /kaggle/working/refiner_panel/")
