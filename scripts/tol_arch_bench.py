@@ -361,10 +361,15 @@ def _panel_pairs(d: Path) -> list[tuple[str, Path, Path]]:
 
 
 def _stage1_caches(pairs, model: Path, cache_dir: Path,
-                   dev: str) -> dict:
-    """res.pkl per panel genome via train_refiner's cached splitter."""
+                   dev: str, stride: int = 500) -> dict:
+    """res.pkl per panel genome via train_refiner's cached splitter.
+
+    stride: stage-1 track stride in bp. 100 gives 5 votes/bin but
+    costs ~6h per 30Mb genome on T4; 500 (non-overlapping) keeps
+    every bin covered at 1 vote at ~5x less GPU time -- needed to
+    stay under Kaggle's ~12h kernel cap for a 22-genome panel."""
     import train_refiner as tr
-    ns = types.SimpleNamespace(window=500, stride=100, bin_width=0,
+    ns = types.SimpleNamespace(window=500, stride=stride, bin_width=0,
                                stage1_batch=256, device=dev)
     pks = {}
     for name, fna, _gff in pairs:
@@ -434,7 +439,8 @@ def cmd_refiner(a) -> None:
                          "(<name>.fna + <name>.gff3 pairs)")
     print(f"panel: {len(train)} train, {len(held)} held-out genomes")
 
-    pks = _stage1_caches(train + held, a.stage1_model, cache, dev)
+    pks = _stage1_caches(train + held, a.stage1_model, cache, dev,
+                         stride=a.track_stride)
     print(f"stage-1 caches: {len(pks)}/{len(train) + len(held)}")
 
     def train_cmd(arm: str, extra: list) -> Path:
@@ -565,6 +571,10 @@ def main() -> None:
     p.add_argument("--stage1-model", required=True, type=Path)
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--cache-dir", type=Path, default=None)
+    p.add_argument("--track-stride", type=int, default=500,
+                   help="stage-1 track stride in bp (100 = 5 votes/bin "
+                        "but ~6h per 30Mb genome on T4; 500 = 1 vote/bin, "
+                        "~5x faster, fits Kaggle's 12h cap)")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--cond-mode", default="reduced")

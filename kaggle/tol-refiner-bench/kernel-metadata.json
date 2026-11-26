@@ -9,7 +9,8 @@
   "enable_internet": true,
   "dataset_sources": [
     "daniellecallan/omniphyl-tol-mini",
-    "daniellecallan/omniphyl-tol-stage1"
+    "daniellecallan/omniphyl-tol-stage1",
+    "daniellecallan/omniphyl-stage1-cache"
   ],
   "competition_sources": [],
   "kernel_sources": []
