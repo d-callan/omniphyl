@@ -10,7 +10,8 @@
   "dataset_sources": [
     "daniellecallan/omniphyl-tol-mini",
     "daniellecallan/omniphyl-tol-stage1",
-    "daniellecallan/omniphyl-stage1-cache"
+    "daniellecallan/omniphyl-stage1-cache",
+    "daniellecallan/omniphyl-refiner-ckpts"
   ],
   "competition_sources": [],
   "kernel_sources": []

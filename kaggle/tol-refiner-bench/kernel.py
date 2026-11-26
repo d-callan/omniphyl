@@ -74,12 +74,17 @@ for pk in glob.glob("/kaggle/input/**/*.res.pkl", recursive=True):
 print(f"stage-1 cache mounted: {len(list(cache.glob('*.res.pkl')))} "
       f"genomes")
 
+# pretrained refiner ckpts from tol-refiner-train -> eval only
+v2 = find_one("refiner_v2.pt")
+v1 = find_one("refiner_v1.pt")
+
 argv = [sys.executable,
         str(WORK / "omniphyl/scripts/tol_arch_bench.py"), "refiner",
         "--panel-dir", str(panel), "--stage1-model", str(s1),
         "--out", str(WORK / "refiner"),
         "--cache-dir", str(cache),
         "--track-stride", "500",
+        "--v2-ckpt", str(v2), "--v1-ckpt", str(v1),
         "--epochs", os.environ.get("EPOCHS", "10"),
         "--batch-size", "4", "--cond-mode", "reduced",
         "--amp", "fp16", "--device", "cuda"]

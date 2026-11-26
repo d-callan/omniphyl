@@ -445,7 +445,10 @@ def refiner_loss(sl, tl, pl, y_state, y_site, y_phase,
     L_pair = _phase_loss(tl, y_site, min_intron, max_intron)
     L_peak = _peak_loss(tl, y_site)
     L = L_state + L_site + 0.5 * L_pair + L_peak
-    if pl is not None:
+    # skip the term when the chunk carries no phase targets at all:
+    # CE over an all-ignored batch returns NaN (pure-intergenic chunks
+    # are common, and AMP's scaler silently drops the whole update)
+    if pl is not None and (y_phase != -100).any():
         L = L + 0.5 * F.cross_entropy(
             pl, y_phase, ignore_index=-100)
     return L
