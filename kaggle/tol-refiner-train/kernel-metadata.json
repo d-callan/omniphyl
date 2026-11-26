@@ -1,0 +1,17 @@
+{
+  "id": "daniellecallan/omniphyl-tol-refiner-train",
+  "title": "omniphyl-tol-refiner-train",
+  "code_file": "kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "daniellecallan/omniphyl-tol-mini",
+    "daniellecallan/omniphyl-tol-stage1",
+    "daniellecallan/omniphyl-stage1-cache"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

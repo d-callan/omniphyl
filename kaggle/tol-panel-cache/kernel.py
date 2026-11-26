@@ -18,7 +18,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-SUBSET = "train"          # "train" | "heldout" -- set per kernel push
+SUBSET = "heldout"        # "train" | "heldout" -- set per kernel push
 STRIDE = 500              # stage-1 track stride (bp): 100 = 5 votes/bin
                           # but ~6h per 30Mb genome; 500 = 1 vote, fits
                           # the ~12h kernel cap
